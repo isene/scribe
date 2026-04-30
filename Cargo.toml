@@ -1,0 +1,20 @@
+[package]
+name = "scribe"
+version = "0.1.0"
+edition = "2021"
+authors = ["Geir Isene <g@isene.com>"]
+description = "Modal text editor for writers — vim-like core, Claude integration, single binary. Part of the Fe2O3 Rust terminal suite."
+license = "Unlicense"
+repository = "https://github.com/isene/scribe"
+
+[dependencies]
+crust = { version = "0.1", path = "../crust", package = "fe2o3-crust" }
+ropey = "1.6"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
