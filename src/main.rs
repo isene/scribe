@@ -149,34 +149,55 @@ impl App {
     }
 
     fn render_footer(&mut self) {
+        // SGR-aware: each style::fg / style::bg helper closes with \x1b[0m,
+        // which resets BACKGROUND to terminal default. After every styled
+        // segment we re-assert the pane's bg so the gap spaces don't render
+        // as black streaks. The whole line ends with one final \x1b[0m.
+        const BG: u8 = 236;
+        let bg_on = format!("\x1b[48;5;{}m", BG);
+
         let mode_label = style::bg(&style::fg(self.mode.label(), 0), self.mode.color());
         let pos = format!(" {}:{} ", self.cur_line + 1, self.cur_col + 1);
         let right = format!("scribe v{} ", VERSION);
 
-        let middle: String = if self.mode == Mode::Command {
+        let middle_plain: String = if self.mode == Mode::Command {
             format!(" :{}", self.cmdline)
-        } else if let Some((ref msg, c)) = self.status {
-            style::fg(msg, c)
+        } else if let Some((ref msg, _c)) = self.status {
+            // Width-only — color is applied via style::fg inline below.
+            msg.clone()
         } else {
             String::new()
         };
 
-        // Build a status line that EXACTLY fills `cols` display columns, so
-        // the bg of the footer pane covers the full bottom row even when
-        // text content is short.
-        let cols = self.cols as usize;
-        let left_w = crust::display_width(&mode_label) + crust::display_width(&middle);
-        let right_w = crust::display_width(&pos) + crust::display_width(&right);
-        let line = if left_w + right_w <= cols {
-            let gap = cols - left_w - right_w;
-            format!("{}{}{}{}{}", mode_label, middle, " ".repeat(gap), pos, right)
+        let middle_styled: String = if self.mode == Mode::Command {
+            format!(" :{}", self.cmdline)
+        } else if let Some((ref msg, c)) = self.status {
+            // Reset to pane bg AFTER fg-styling so the trailing \x1b[0m from
+            // style::fg doesn't drop us to terminal-default bg.
+            format!("{}{}", style::fg(msg, c), bg_on)
         } else {
-            // Tight terminal: drop right-side scribe-version, keep mode + msg
-            // and pad to full width.
-            let visible = format!("{}{}", mode_label, middle);
-            let visible_w = crust::display_width(&visible);
+            String::new()
+        };
+
+        let cols = self.cols as usize;
+        let mode_w = crust::display_width(&mode_label);
+        let middle_w = crust::display_width(&middle_plain);
+        let pos_w = crust::display_width(&pos);
+        let right_w = crust::display_width(&right);
+
+        let total = mode_w + middle_w + pos_w + right_w;
+        let line = if total <= cols {
+            let gap = cols - total;
+            // Order: badge (its own bg) → bg_on → middle_styled → spaces →
+            // pos → right → final reset. bg_on after every helper that
+            // ends in [0m. spaces inherit bg_on so the gap fills.
+            format!("{}{}{}{}{}{}\x1b[0m",
+                mode_label, bg_on, middle_styled, " ".repeat(gap), pos, right)
+        } else {
+            let visible = format!("{}{}{}", mode_label, bg_on, middle_styled);
+            let visible_w = mode_w + middle_w;
             let pad = cols.saturating_sub(visible_w);
-            format!("{}{}", visible, " ".repeat(pad))
+            format!("{}{}\x1b[0m", visible, " ".repeat(pad))
         };
         self.footer.say(&line);
     }
