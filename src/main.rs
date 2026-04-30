@@ -150,7 +150,7 @@ impl App {
 
     fn render_footer(&mut self) {
         let mode_label = style::bg(&style::fg(self.mode.label(), 0), self.mode.color());
-        let pos = format!(" {}:{}", self.cur_line + 1, self.cur_col + 1);
+        let pos = format!(" {}:{} ", self.cur_line + 1, self.cur_col + 1);
         let right = format!("scribe v{} ", VERSION);
 
         let middle: String = if self.mode == Mode::Command {
@@ -161,14 +161,22 @@ impl App {
             String::new()
         };
 
+        // Build a status line that EXACTLY fills `cols` display columns, so
+        // the bg of the footer pane covers the full bottom row even when
+        // text content is short.
         let cols = self.cols as usize;
         let left_w = crust::display_width(&mode_label) + crust::display_width(&middle);
-        let right_w = crust::display_width(&right) + crust::display_width(&pos) + 1;
-        let line = if left_w + right_w + 1 <= cols {
+        let right_w = crust::display_width(&pos) + crust::display_width(&right);
+        let line = if left_w + right_w <= cols {
             let gap = cols - left_w - right_w;
-            format!("{}{}{}{}{}", mode_label, middle, " ".repeat(gap), pos, format!(" {}", right))
+            format!("{}{}{}{}{}", mode_label, middle, " ".repeat(gap), pos, right)
         } else {
-            format!("{}{}", mode_label, middle)
+            // Tight terminal: drop right-side scribe-version, keep mode + msg
+            // and pad to full width.
+            let visible = format!("{}{}", mode_label, middle);
+            let visible_w = crust::display_width(&visible);
+            let pad = cols.saturating_sub(visible_w);
+            format!("{}{}", visible, " ".repeat(pad))
         };
         self.footer.say(&line);
     }
@@ -180,10 +188,16 @@ impl App {
         self.buf.line(self.cur_line).len()
     }
 
+    /// Maximum legal cursor column on the current line. In Insert mode the
+    /// cursor can sit just past the last char (so Backspace and append work);
+    /// in Normal mode it can't (so `x` always deletes a real char).
+    fn col_cap(&self) -> usize {
+        let len = self.current_line_len();
+        if self.mode == Mode::Insert { len } else { len.saturating_sub(1) }
+    }
+
     fn clamp_col_to_line(&mut self) {
-        let max = self.current_line_len();
-        let cap = if self.mode == Mode::Insert { max } else { max.saturating_sub(0).max(1) - 1 };
-        let cap = if max == 0 { 0 } else if self.mode == Mode::Insert { max } else { max - 1 };
+        let cap = self.col_cap();
         if self.cur_col > cap { self.cur_col = cap; }
     }
 
@@ -191,51 +205,90 @@ impl App {
         self.buf.line_byte_offset(self.cur_line) + self.cur_col
     }
 
+    /// Move cursor to absolute byte offset (used by undo/redo to land where
+    /// the edit happened). Clamps to legal cap for current mode.
+    fn cursor_to_byte(&mut self, byte: usize) {
+        let total = self.buf.rope.len_bytes();
+        let byte = byte.min(total);
+        let (line, col) = self.buf.byte_to_line_col(byte);
+        self.cur_line = line;
+        self.cur_col = col;
+        self.clamp_col_to_line();
+        self.want_col = self.cur_col;
+    }
+
+    // ── Wrapping motion ────────────────────────────────────────────────
+    /// Move one char left, wrapping to end of previous line when at column 0.
+    fn move_left_wrap(&mut self) {
+        if self.cur_col > 0 {
+            self.cur_col -= 1;
+        } else if self.cur_line > 0 {
+            self.cur_line -= 1;
+            self.cur_col = self.col_cap();
+        }
+        self.want_col = self.cur_col;
+    }
+
+    /// Move one char right, wrapping to start of next line when at line end.
+    fn move_right_wrap(&mut self) {
+        let cap = self.col_cap();
+        if self.cur_col < cap {
+            self.cur_col += 1;
+        } else if self.cur_line + 1 < self.buf.line_count() {
+            self.cur_line += 1;
+            self.cur_col = 0;
+        }
+        self.want_col = self.cur_col;
+    }
+
+    fn move_up(&mut self) {
+        if self.cur_line > 0 {
+            self.cur_line -= 1;
+            self.cur_col = self.want_col.min(self.col_cap());
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.cur_line + 1 < self.buf.line_count() {
+            self.cur_line += 1;
+            self.cur_col = self.want_col.min(self.col_cap());
+        }
+    }
+
     // ── Normal mode ────────────────────────────────────────────────────
     fn handle_normal(&mut self, key: &str) -> bool {
         self.status = None;
         match key {
-            // Motion
-            "h" | "LEFT"  => { if self.cur_col > 0 { self.cur_col -= 1; } self.want_col = self.cur_col; }
-            "l" | "RIGHT" => {
-                let max = self.current_line_len().saturating_sub(1);
-                if self.cur_col < max { self.cur_col += 1; }
-                self.want_col = self.cur_col;
-            }
-            "j" | "DOWN" => {
-                if self.cur_line + 1 < self.buf.line_count() {
-                    self.cur_line += 1;
-                    self.cur_col = self.want_col.min(self.current_line_len().saturating_sub(1).max(0));
-                }
-            }
-            "k" | "UP" => {
-                if self.cur_line > 0 {
-                    self.cur_line -= 1;
-                    self.cur_col = self.want_col.min(self.current_line_len().saturating_sub(1).max(0));
-                }
-            }
+            // Motion — h/l and arrows wrap across line boundaries (vim's
+            // whichwrap=h,l,<,>,[,] convention).
+            "h" | "LEFT"  => self.move_left_wrap(),
+            "l" | "RIGHT" => self.move_right_wrap(),
+            "j" | "DOWN"  => self.move_down(),
+            "k" | "UP"    => self.move_up(),
             "0" | "HOME" => { self.cur_col = 0; self.want_col = 0; }
             "$" | "END"  => {
-                self.cur_col = self.current_line_len().saturating_sub(1).max(0);
+                self.cur_col = self.col_cap();
                 self.want_col = self.cur_col;
             }
             "g" => {
-                // crude `gg` for now: peek next key
                 if let Some(k2) = Input::getchr(Some(20)) {
-                    if k2 == "g" { self.cur_line = 0; self.cur_col = 0; }
+                    if k2 == "g" { self.cur_line = 0; self.cur_col = 0; self.want_col = 0; }
                 }
             }
             "G" => {
                 self.cur_line = self.buf.line_count().saturating_sub(1);
                 self.cur_col = 0;
+                self.want_col = 0;
             }
             "PgDOWN" | "C-D" => {
                 let step = (self.main_p.h as usize) / 2;
                 self.cur_line = (self.cur_line + step).min(self.buf.line_count().saturating_sub(1));
+                self.clamp_col_to_line();
             }
             "PgUP" | "C-U" => {
                 let step = (self.main_p.h as usize) / 2;
                 self.cur_line = self.cur_line.saturating_sub(step);
+                self.clamp_col_to_line();
             }
 
             // Enter Insert
@@ -270,14 +323,19 @@ impl App {
                     while e < line.len() && !line.is_char_boundary(e) { e += 1; }
                     let abs_end = self.buf.line_byte_offset(self.cur_line) + e;
                     self.buf.apply(off, abs_end, "");
-                    let max = self.current_line_len().saturating_sub(1).max(0);
-                    if self.cur_col > max { self.cur_col = max; }
+                    self.clamp_col_to_line();
                 }
             }
 
-            // Undo / redo
-            "u"   => { self.buf.undo(); self.clamp_col_to_line(); self.set_status(" undo", 244); }
-            "C-R" => { self.buf.redo(); self.clamp_col_to_line(); self.set_status(" redo", 244); }
+            // Undo / redo — cursor follows the edit site.
+            "u" => match self.buf.undo() {
+                Some(byte) => { self.cursor_to_byte(byte); self.set_status(" undo", 244); }
+                None       => self.set_status(" already at oldest change", 244),
+            },
+            "C-R" => match self.buf.redo() {
+                Some(byte) => { self.cursor_to_byte(byte); self.set_status(" redo", 244); }
+                None       => self.set_status(" already at newest change", 244),
+            },
 
             // Enter Command
             ":" => { self.cmdline.clear(); self.mode = Mode::Command; }
@@ -296,9 +354,16 @@ impl App {
         match key {
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
-                let max = self.current_line_len().saturating_sub(1).max(0);
-                if self.cur_col > max { self.cur_col = max; }
+                self.clamp_col_to_line();
             }
+            // Arrow keys + HOME/END work in Insert mode too. LEFT/RIGHT wrap
+            // across line boundaries; UP/DOWN preserve want_col.
+            "LEFT"  => self.move_left_wrap(),
+            "RIGHT" => self.move_right_wrap(),
+            "UP"    => self.move_up(),
+            "DOWN"  => self.move_down(),
+            "HOME"  => { self.cur_col = 0; self.want_col = 0; }
+            "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
             "BACKSPACE" | "C-H" => {
                 let off = self.cursor_byte();
                 if off > 0 {
@@ -310,6 +375,7 @@ impl App {
                     let (line, col) = self.buf.byte_to_line_col(start);
                     self.cur_line = line;
                     self.cur_col = col;
+                    self.want_col = self.cur_col;
                 }
             }
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
@@ -317,11 +383,13 @@ impl App {
                 self.buf.apply(off, off, "\n");
                 self.cur_line += 1;
                 self.cur_col = 0;
+                self.want_col = 0;
             }
             "TAB" | "\t" => {
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, "\t");
                 self.cur_col += 1;
+                self.want_col = self.cur_col;
             }
             other => {
                 // Ordinary printable: getchr returns the literal string.
@@ -331,6 +399,7 @@ impl App {
                         let off = self.cursor_byte();
                         self.buf.apply(off, off, other);
                         self.cur_col += other.len();
+                        self.want_col = self.cur_col;
                     }
                 }
             }

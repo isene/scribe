@@ -86,9 +86,11 @@ impl Buffer {
         self.head = Some(idx);
     }
 
-    /// Undo the current head's edit. Returns true if anything was undone.
-    pub fn undo(&mut self) -> bool {
-        let Some(head) = self.head else { return false };
+    /// Undo the current head's edit. Returns the byte offset where the cursor
+    /// should land (start of the restored original text), or None if nothing
+    /// to undo.
+    pub fn undo(&mut self) -> Option<usize> {
+        let head = self.head?;
         let node = self.nodes[head].clone();
         // Reverse the edit.
         let new_end = node.edit.start + node.edit.replacement.len();
@@ -98,17 +100,18 @@ impl Buffer {
         self.rope.insert(start_char, &node.edit.original);
         self.head = node.parent;
         self.dirty = true;
-        true
+        Some(node.edit.start)
     }
 
-    /// Redo: walk to the most-recently-added child of head. Returns true on
-    /// success.
-    pub fn redo(&mut self) -> bool {
+    /// Redo: walk to the most-recently-added child of head. Returns the byte
+    /// offset where the cursor should land (just after the re-applied edit),
+    /// or None if no redo branch.
+    pub fn redo(&mut self) -> Option<usize> {
         let target = match self.head {
             Some(h) => self.nodes[h].children.last().copied(),
             None => self.nodes.iter().enumerate().find(|(_, n)| n.parent.is_none()).map(|(i, _)| i),
         };
-        let Some(target) = target else { return false };
+        let target = target?;
         let node = self.nodes[target].clone();
         let start_char = self.rope.byte_to_char(node.edit.start);
         let end_char = self.rope.byte_to_char(node.edit.end);
@@ -116,7 +119,7 @@ impl Buffer {
         self.rope.insert(start_char, &node.edit.replacement);
         self.head = Some(target);
         self.dirty = true;
-        true
+        Some(node.edit.start + node.edit.replacement.len())
     }
 
     pub fn line_count(&self) -> usize { self.rope.len_lines() }
