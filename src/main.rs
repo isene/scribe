@@ -1039,8 +1039,11 @@ impl App {
         let l2 = self.visual_anchor_line.max(self.cur_line);
         let c1 = self.visual_anchor_col.min(self.cur_col);
         let c2 = self.visual_anchor_col.max(self.cur_col);
-        // Walk lines from bottom up so earlier byte offsets remain valid.
+        // Group all per-line edits into one undo node so a single `u`
+        // reverses the entire block op.
+        if op != 'y' { self.buf.begin_compound(); }
         let mut yanked: Vec<String> = Vec::new();
+        // Walk lines from bottom up so earlier byte offsets remain valid.
         for line in (l1..=l2).rev() {
             let line_text = self.buf.line(line);
             if c1 >= line_text.len() { yanked.push(String::new()); continue; }
@@ -1062,6 +1065,7 @@ impl App {
             'y' => self.regs.yank(self.pending.register, combined, YankKind::Block),
             _   => self.regs.cut(self.pending.register, combined, YankKind::Block),
         }
+        if op != 'y' { self.buf.end_compound(); }
         self.cur_line = l1;
         self.cur_col = c1;
         self.want_col = c1;
@@ -1197,6 +1201,7 @@ impl App {
         // consecutive buffer lines, padding short lines with spaces. Append
         // a new buffer line if we run out.
         if yank.kind == YankKind::Block {
+            self.buf.begin_compound();
             let lines: Vec<&str> = yank.text.split('\n').collect();
             let target_col = if after { self.cur_col + 1 } else { self.cur_col };
             for (i, chunk) in lines.iter().enumerate() {
@@ -1229,6 +1234,7 @@ impl App {
             // Cursor lands at the start of the inserted block.
             self.cur_col = target_col;
             self.want_col = target_col;
+            self.buf.end_compound();
             return;
         }
         let mut text = String::new();

@@ -23,7 +23,10 @@ pub struct Edit {
 
 #[derive(Clone, Debug)]
 struct UndoNode {
-    edit: Edit,
+    /// Multiple edits per node so multi-step operations (block paste, block
+    /// delete, etc.) undo as one atomic action. Most nodes hold a single
+    /// edit; compound nodes hold one per micro-edit.
+    edits: Vec<Edit>,
     parent: Option<usize>,
     children: Vec<usize>,
 }
@@ -33,8 +36,12 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     pub dirty: bool,
     nodes: Vec<UndoNode>,
-    /// Index of the node that represents the current state. None = pristine.
     head: Option<usize>,
+    /// When > 0, `apply()` accumulates edits into `pending_compound` instead
+    /// of finalising one node per call. `end_compound()` (when the depth
+    /// reaches 0) commits the accumulated edits as a single node.
+    compound_depth: usize,
+    pending_compound: Vec<Edit>,
 }
 
 impl Buffer {
@@ -43,6 +50,7 @@ impl Buffer {
             rope: Rope::new(),
             path: None, dirty: false,
             nodes: Vec::new(), head: None,
+            compound_depth: 0, pending_compound: Vec::new(),
         }
     }
 
@@ -52,7 +60,27 @@ impl Buffer {
             rope: Rope::from_str(&s),
             path: Some(path), dirty: false,
             nodes: Vec::new(), head: None,
+            compound_depth: 0, pending_compound: Vec::new(),
         })
+    }
+
+    /// Begin grouping subsequent `apply()` calls into a single undo node.
+    /// Calls nest; only the outermost `end_compound` finalises.
+    pub fn begin_compound(&mut self) { self.compound_depth += 1; }
+
+    /// Commit the pending compound edits as one undo node. No-op if outside
+    /// a compound or no edits accumulated.
+    pub fn end_compound(&mut self) {
+        if self.compound_depth == 0 { return; }
+        self.compound_depth -= 1;
+        if self.compound_depth == 0 && !self.pending_compound.is_empty() {
+            let edits = std::mem::take(&mut self.pending_compound);
+            let node = UndoNode { edits, parent: self.head, children: Vec::new() };
+            let idx = self.nodes.len();
+            self.nodes.push(node);
+            if let Some(p) = self.head { self.nodes[p].children.push(idx); }
+            self.head = Some(idx);
+        }
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -66,46 +94,50 @@ impl Buffer {
         Ok(())
     }
 
-    /// Apply an edit and record it on the undo tree.
+    /// Apply an edit and record it on the undo tree. When inside a compound
+    /// (`begin_compound` has been called), accumulate into pending_compound
+    /// instead of creating a node per call.
     pub fn apply(&mut self, start: usize, end: usize, replacement: &str) {
         let original: String = self.rope.byte_slice(start..end).to_string();
         let edit = Edit { start, end, replacement: replacement.into(), original };
-        // Apply to rope.
         let start_char = self.rope.byte_to_char(start);
         let end_char = self.rope.byte_to_char(end);
         self.rope.remove(start_char..end_char);
         self.rope.insert(start_char, replacement);
         self.dirty = true;
-        // Record.
-        let node = UndoNode { edit, parent: self.head, children: Vec::new() };
-        let idx = self.nodes.len();
-        self.nodes.push(node);
-        if let Some(p) = self.head {
-            self.nodes[p].children.push(idx);
+        if self.compound_depth > 0 {
+            self.pending_compound.push(edit);
+        } else {
+            let node = UndoNode { edits: vec![edit], parent: self.head, children: Vec::new() };
+            let idx = self.nodes.len();
+            self.nodes.push(node);
+            if let Some(p) = self.head { self.nodes[p].children.push(idx); }
+            self.head = Some(idx);
         }
-        self.head = Some(idx);
     }
 
-    /// Undo the current head's edit. Returns the byte offset where the cursor
-    /// should land (start of the restored original text), or None if nothing
+    /// Undo the current head's edits (reverse-order across the node's edits
+    /// for compound undo). Returns the byte offset where the cursor should
+    /// land (start of the first edit's restored region), or None if nothing
     /// to undo.
     pub fn undo(&mut self) -> Option<usize> {
         let head = self.head?;
         let node = self.nodes[head].clone();
-        // Reverse the edit.
-        let new_end = node.edit.start + node.edit.replacement.len();
-        let start_char = self.rope.byte_to_char(node.edit.start);
-        let end_char = self.rope.byte_to_char(new_end);
-        self.rope.remove(start_char..end_char);
-        self.rope.insert(start_char, &node.edit.original);
+        for e in node.edits.iter().rev() {
+            let new_end = e.start + e.replacement.len();
+            let start_char = self.rope.byte_to_char(e.start);
+            let end_char = self.rope.byte_to_char(new_end);
+            self.rope.remove(start_char..end_char);
+            self.rope.insert(start_char, &e.original);
+        }
         self.head = node.parent;
         self.dirty = true;
-        Some(node.edit.start)
+        Some(node.edits.first().map(|e| e.start).unwrap_or(0))
     }
 
-    /// Redo: walk to the most-recently-added child of head. Returns the byte
-    /// offset where the cursor should land (just after the re-applied edit),
-    /// or None if no redo branch.
+    /// Redo: walk to the most-recently-added child of head. Re-applies all
+    /// edits in original order. Returns the byte offset where the cursor
+    /// should land, or None if no redo branch.
     pub fn redo(&mut self) -> Option<usize> {
         let target = match self.head {
             Some(h) => self.nodes[h].children.last().copied(),
@@ -113,13 +145,15 @@ impl Buffer {
         };
         let target = target?;
         let node = self.nodes[target].clone();
-        let start_char = self.rope.byte_to_char(node.edit.start);
-        let end_char = self.rope.byte_to_char(node.edit.end);
-        self.rope.remove(start_char..end_char);
-        self.rope.insert(start_char, &node.edit.replacement);
+        for e in &node.edits {
+            let start_char = self.rope.byte_to_char(e.start);
+            let end_char = self.rope.byte_to_char(e.end);
+            self.rope.remove(start_char..end_char);
+            self.rope.insert(start_char, &e.replacement);
+        }
         self.head = Some(target);
         self.dirty = true;
-        Some(node.edit.start + node.edit.replacement.len())
+        Some(node.edits.last().map(|e| e.start + e.replacement.len()).unwrap_or(0))
     }
 
     pub fn line_count(&self) -> usize { self.rope.len_lines() }
