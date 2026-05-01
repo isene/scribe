@@ -13,6 +13,7 @@ mod mode;
 mod motion;
 mod register;
 mod search;
+mod spell;
 mod textobj;
 
 use buffer::{Buffer, FileKind};
@@ -42,6 +43,14 @@ fn main() {
 
     Crust::init();
     Crust::set_app_identity("Scribe");
+    // Bracketed paste: terminal wraps the pasted blob in `CSI 200~ ... 201~`
+    // and crossterm parses that into a single Event::Paste. Without it each
+    // pasted byte travels through the keystroke pipeline (buf.apply + new
+    // undo node + render_all per char), so a 1KB paste = 1000 undo nodes
+    // and 1000 renders.
+    use std::io::Write;
+    print!("\x1b[?2004h");
+    let _ = std::io::stdout().flush();
 
     let mut app = App::new(path);
     if let Some(n) = start_line {
@@ -61,6 +70,14 @@ fn main() {
             app.render_all();
             continue;
         }
+        // Bracketed paste: insert the whole payload as one compound undo node
+        // regardless of mode. Don't let it run through the per-char Insert
+        // handler (would make 1 undo node per char + 1 render per char).
+        if let Some(text) = key.strip_prefix("PASTE\x00") {
+            app.handle_paste(text);
+            app.render_all();
+            continue;
+        }
         let quit = match app.mode {
             Mode::Normal      => app.handle_normal(&key),
             Mode::Insert      => app.handle_insert(&key),
@@ -73,6 +90,8 @@ fn main() {
         app.render_all();
     }
 
+    print!("\x1b[?2004l");
+    let _ = std::io::stdout().flush();
     Crust::cleanup();
     Crust::clear_screen();
 }
@@ -156,6 +175,16 @@ struct App {
     /// change-op for dot-repeat replay.
     capturing_insert: bool,
     captured_insert: String,
+    /// `z` prefix: next key is a spell action (`z=`, `zg`).
+    z_prefix: bool,
+    /// `]` or `[` prefix: next key is a bracket motion (`]s`, `[s`, …).
+    bracket_prefix: Option<char>,
+    /// Spellcheck — None until first enabled (or auto-on for email). When
+    /// hunspell is missing, stays None and we set a status message.
+    spell: Option<spell::Spell>,
+    spell_enabled: bool,
+    /// Sorted by start byte, recomputed on Insert→Normal and on `:set spell`.
+    misspellings: Vec<spell::MisspellRange>,
 }
 
 impl App {
@@ -163,7 +192,7 @@ impl App {
         let (cols, rows) = Crust::terminal_size();
         let mut header = Pane::new(1, 1, cols, 1, 255, 236);
         header.wrap = false; header.scroll = false;
-        let mut main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 252, 0);
+        let mut main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 231, 0);
         main_p.wrap = true;
         let mut footer = Pane::new(1, rows, cols, 1, 255, 236);
         footer.wrap = false; footer.scroll = false;
@@ -173,7 +202,8 @@ impl App {
             None    => Buffer::empty(),
         };
 
-        Self {
+        let auto_spell = buf.kind == FileKind::Email;
+        let mut app = Self {
             buf, mode: Mode::Normal,
             cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
             cmdline: String::new(), status: None,
@@ -187,8 +217,208 @@ impl App {
             last_change: None,
             capturing_insert: false,
             captured_insert: String::new(),
+            z_prefix: false,
+            bracket_prefix: None,
+            spell: None,
+            spell_enabled: false,
+            misspellings: Vec::new(),
+        };
+        if auto_spell { app.spell_enable(); }
+        app
+    }
+
+    // ── Spellcheck ─────────────────────────────────────────────────────
+    /// Spawn hunspell, load personal dict, mark enabled, run a first scan.
+    fn spell_enable(&mut self) {
+        if self.spell.is_none() {
+            match spell::Spell::spawn("en_US") {
+                Some(mut sp) => {
+                    sp.load_personal(load_personal_dict());
+                    self.spell = Some(sp);
+                }
+                None => {
+                    self.set_status(" spell: hunspell not found", 196);
+                    return;
+                }
+            }
+        }
+        self.spell_enabled = true;
+        self.recheck_spell();
+    }
+
+    fn spell_disable(&mut self) {
+        self.spell_enabled = false;
+        self.misspellings.clear();
+    }
+
+    /// Re-scan the buffer. Skips email headers and quoted-reply lines so we
+    /// don't flag the user on text they didn't write. Cheap enough to run on
+    /// every Insert→Normal transition for typical mail bodies; for large
+    /// buffers this should be debounced (out of scope for v1).
+    fn recheck_spell(&mut self) {
+        self.misspellings.clear();
+        if !self.spell_enabled { return; }
+        let Some(sp) = self.spell.as_mut() else { return };
+        let kind = self.buf.kind;
+        // For email, locate the header/body boundary (first blank line) the
+        // same way render_main does, so we can skip header lines.
+        let header_end: Option<usize> = if kind == FileKind::Email {
+            (0..self.buf.line_count()).find(|i| self.buf.line(*i).is_empty())
+        } else { None };
+
+        let total = self.buf.line_count();
+        let mut to_check: Vec<(String, usize)> = Vec::with_capacity(total);
+        for i in 0..total {
+            // Skip header block.
+            if let Some(end) = header_end {
+                if i < end { continue; }
+            }
+            let line = self.buf.line(i);
+            // Skip quoted-reply lines (any leading `>`) — that's not user text.
+            if line.trim_start().starts_with('>') { continue; }
+            // Skip the "On <date>... wrote:" attribution line that mutt and
+            // most clients prepend before quoted text.
+            let trimmed = line.trim();
+            if trimmed.starts_with("On ") && trimmed.ends_with("wrote:") { continue; }
+            let base = self.buf.line_byte_offset(i);
+            to_check.push((line, base));
+        }
+        let mut found = sp.check_lines(&to_check);
+        found.sort_by_key(|m| m.start);
+        self.misspellings = found;
+    }
+
+    /// Append `word` to the personal dict file and add to the in-memory set.
+    /// File: `~/.config/scribe/spell.add` (one word per line).
+    fn spell_add_word(&mut self, word: &str) {
+        let trimmed = word.trim();
+        if trimmed.is_empty() { return; }
+        if let Some(sp) = self.spell.as_mut() {
+            sp.add_personal(trimmed);
+        }
+        let path = personal_dict_path();
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write as _;
+            let _ = writeln!(f, "{}", trimmed);
+        }
+        self.recheck_spell();
+        self.set_status(&format!(" added '{}' to personal dict", trimmed), 244);
+    }
+
+    /// Find the misspelling the cursor is on (if any). Used by `z=` and `zg`.
+    fn misspelling_at_cursor(&self) -> Option<spell::MisspellRange> {
+        let cur = self.cursor_byte();
+        self.misspellings.iter()
+            .find(|m| cur >= m.start && cur <= m.end)
+            .cloned()
+    }
+
+    /// Word at cursor — used by `zg` (which works whether or not the word is
+    /// flagged as misspelled). Falls back to nothing if cursor isn't on a
+    /// wordlike char.
+    fn word_at_cursor(&self) -> Option<String> {
+        // Prefer the misspelling range if cursor is on one (it's already the
+        // exact word hunspell flagged).
+        if let Some(m) = self.misspelling_at_cursor() {
+            return Some(m.word);
+        }
+        let line = self.buf.line(self.cur_line);
+        if line.is_empty() { return None; }
+        let bytes = line.as_bytes();
+        let cur = self.cur_col.min(bytes.len());
+        let mut s = cur;
+        while s > 0 {
+            let prev = bytes[s - 1];
+            if !is_wordchar(prev) { break; }
+            s -= 1;
+        }
+        let mut e = cur;
+        while e < bytes.len() && is_wordchar(bytes[e]) { e += 1; }
+        if s >= e { return None; }
+        // Snap to char boundaries (multi-byte chars).
+        while s > 0 && !line.is_char_boundary(s) { s -= 1; }
+        while e < bytes.len() && !line.is_char_boundary(e) { e += 1; }
+        Some(line[s..e].to_string())
+    }
+
+    fn jump_next_misspelling(&mut self) {
+        let cur = self.cursor_byte();
+        let target = self.misspellings.iter().find(|m| m.start > cur).map(|m| m.start);
+        match target {
+            Some(b) => self.cursor_to_byte(b),
+            None    => self.set_status(" no more misspellings", 244),
         }
     }
+    fn jump_prev_misspelling(&mut self) {
+        let cur = self.cursor_byte();
+        let target = self.misspellings.iter().rev().find(|m| m.start < cur).map(|m| m.start);
+        match target {
+            Some(b) => self.cursor_to_byte(b),
+            None    => self.set_status(" no previous misspellings", 244),
+        }
+    }
+
+    /// `z=` — show numbered suggestions for the word at cursor, accept 1-9 to
+    /// replace. Esc / any other key cancels.
+    fn spell_suggest_at_cursor(&mut self) {
+        let Some(m) = self.misspelling_at_cursor() else {
+            self.set_status(" no misspelling at cursor", 244);
+            return;
+        };
+        if m.suggestions.is_empty() {
+            self.set_status(&format!(" no suggestions for '{}'", m.word), 244);
+            return;
+        }
+        // Render up to 9 suggestions in the footer; numbered 1-9.
+        let max = m.suggestions.len().min(9);
+        let mut prompt = format!(" '{}' →", m.word);
+        for (i, s) in m.suggestions.iter().take(max).enumerate() {
+            prompt.push_str(&format!(" {}:{}", i + 1, s));
+        }
+        self.set_status(&prompt, 244);
+        self.render_footer();
+        // Wait for a single key.
+        let key = Input::getchr(None).unwrap_or_default();
+        let pick = key.chars().next()
+            .and_then(|c| c.to_digit(10))
+            .and_then(|d| {
+                let idx = d as usize;
+                if idx >= 1 && idx <= max { Some(idx - 1) } else { None }
+            });
+        if let Some(idx) = pick {
+            let replacement = m.suggestions[idx].clone();
+            self.buf.apply(m.start, m.end, &replacement);
+            self.cursor_to_byte(m.start);
+            self.recheck_spell();
+            self.set_status(&format!(" → {}", replacement), 46);
+        } else {
+            self.status = None;
+        }
+    }
+}
+
+/// Hunspell flags ASCII word boundaries (Latin script). Use the same notion
+/// for `word_at_cursor` so `zg` picks up the same span hunspell would.
+fn is_wordchar(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'\'' || b >= 0x80
+}
+
+
+/// `~/.config/scribe/spell.add` — append-only personal dictionary.
+fn personal_dict_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/spell.add")
+}
+
+fn load_personal_dict() -> Vec<String> {
+    let path = personal_dict_path();
+    std::fs::read_to_string(&path)
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+impl App {
 
     // ── Rendering ──────────────────────────────────────────────────────
     fn render_all(&mut self) {
@@ -273,11 +503,13 @@ impl App {
         };
 
         // Email-mode pre-pass: locate the boundary between header block and
-        // body (first blank line). Used by line_color_email() so quote-level
-        // colors only apply in the body, header-key colors only in the
-        // header block.
+        // body (first blank line), and the signature delimiter (`-- `). Both
+        // are passed to line_color_email() so per-line lookups stay O(1).
         let header_end: Option<usize> = if self.buf.kind == FileKind::Email {
             (0..self.buf.line_count()).find(|&i| self.buf.line(i).trim().is_empty())
+        } else { None };
+        let sig_start: Option<usize> = if self.buf.kind == FileKind::Email {
+            find_sig_start(&self.buf, header_end)
         } else { None };
 
         let mut out = String::new();
@@ -287,9 +519,16 @@ impl App {
                 let line = self.buf.line(line_idx);
                 let line_byte_off = self.buf.line_byte_offset(line_idx);
                 // Per-line fg color when email mode says so. None → default.
-                let line_color: Option<u8> = if self.buf.kind == FileKind::Email {
-                    line_color_email(&line, line_idx, header_end)
-                } else { None };
+                let line_style = if self.buf.kind == FileKind::Email {
+                    line_style_email(&line, line_idx, header_end, sig_start)
+                } else { EmailLineStyle::None };
+                // Resolve the base fg + KEY-bold extent for the unified line
+                // emitter. HeaderBold(c): line in c, KEY (up to colon+1) bold.
+                let (base_fg, bold_until): (Option<u8>, Option<usize>) = match line_style {
+                    EmailLineStyle::None        => (None, None),
+                    EmailLineStyle::Solid(c)    => (Some(c), None),
+                    EmailLineStyle::HeaderBold(c) => (Some(c), line.find(':').map(|p| p + 1)),
+                };
                 // Fast path: when no selection touches this line, we can
                 // emit the whole line in one styled span instead of doing
                 // per-char ANSI emit.
@@ -306,12 +545,21 @@ impl App {
                     _ => false,
                 };
                 if !line_in_sel {
-                    // Plain whole-line emit with optional fg color.
-                    if let Some(c) = line_color {
-                        out.push_str(&style::fg(&line, c));
-                    } else {
-                        out.push_str(&line);
-                    }
+                    // Unified emit: base_fg + KEY-bold + inline tokens
+                    // (addresses → magenta 201, URLs → blue 4 + OSC 8) +
+                    // misspelling overlay. Single function handles all
+                    // attribute combinations and minimises SGR transitions.
+                    let line_end_byte = line_byte_off + line.len();
+                    let miss_ranges: Vec<(usize, usize)> = self.misspellings.iter()
+                        .filter(|m| m.end > line_byte_off && m.start < line_end_byte)
+                        .map(|m| {
+                            let s = m.start.saturating_sub(line_byte_off).min(line.len());
+                            let e = m.end.saturating_sub(line_byte_off).min(line.len());
+                            (s, e)
+                        })
+                        .collect();
+                    let tokens = inline_tokens(&line);
+                    emit_email_line(&mut out, &line, base_fg, bold_until, &tokens, &miss_ranges);
                     if i + 1 < pane_h { out.push('\n'); }
                     continue;
                 }
@@ -496,9 +744,64 @@ impl App {
         }
     }
 
+    // ── Bracketed paste ────────────────────────────────────────────────
+    /// Insert the entire pasted payload as a single compound undo node and
+    /// advance the cursor to the end of what was inserted. Strips terminal
+    /// `\r` so CRLF clipboards don't double-line. Works in any mode; mode
+    /// is left unchanged.
+    fn handle_paste(&mut self, raw: &str) {
+        if raw.is_empty() { return; }
+        let cleaned: String = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let off = self.cursor_byte();
+        // One apply = one undo node + one render. Per-char trickle-in is what
+        // made paste feel laggy and produced thousands of undo nodes.
+        self.buf.apply(off, off, &cleaned);
+        let new_off = off + cleaned.len();
+        self.cursor_to_byte(new_off);
+        if self.mode == Mode::Insert && self.capturing_insert {
+            self.captured_insert.push_str(&cleaned);
+        }
+    }
+
     // ── Normal mode (pending state machine) ────────────────────────────
     fn handle_normal(&mut self, key: &str) -> bool {
         self.status = None;
+
+        // `z` prefix: spell actions. Only `z=` (suggest) and `zg` (add to
+        // personal dict) for now; all other z-commands would land here.
+        if self.z_prefix {
+            self.z_prefix = false;
+            match key {
+                "=" => self.spell_suggest_at_cursor(),
+                "g" => {
+                    if let Some(word) = self.word_at_cursor() {
+                        self.spell_add_word(&word);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if key == "z" && self.pending.operator.is_none() && self.pending.count1.is_none() {
+            self.z_prefix = true;
+            return false;
+        }
+
+        // `]` / `[` prefix: dispatch on the follow-up key.
+        if let Some(open) = self.bracket_prefix.take() {
+            match (open, key) {
+                (']', "s") => self.jump_next_misspelling(),
+                ('[', "s") => self.jump_prev_misspelling(),
+                _ => {}
+            }
+            return false;
+        }
+        if (key == "]" || key == "[") && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            self.bracket_prefix = Some(key.chars().next().unwrap());
+            return false;
+        }
 
         // Text-object resolution: after operator + 'i' or 'a', the next key
         // selects the object (w / W / " / ' / ( / [ / { / p / b / B).
@@ -528,7 +831,16 @@ impl App {
                 _ => None,
             };
             if let (Some((start, end)), Some(opc)) = (range_opt, self.pending.operator) {
-                self.execute_op_charwise(opc, start, end);
+                if matches!(opc, 'Q' | '>' | '<') {
+                    // Linewise: derive [from..to] line range from object span.
+                    let (l1, _) = self.buf.byte_to_line_col(start);
+                    let (l2, _) = self.buf.byte_to_line_col(end.saturating_sub(1).max(start));
+                    let (lo, hi) = if l1 <= l2 { (l1, l2) } else { (l2, l1) };
+                    let extra = hi - lo;
+                    self.execute_op_linewise(lo, extra);
+                } else {
+                    self.execute_op_charwise(opc, start, end);
+                }
                 self.last_change = Some(LastChange::Op {
                     op: opc,
                     motion: ChangeMotion::TextObject { kind, target },
@@ -606,16 +918,39 @@ impl App {
                     } else {
                         self.cursor_to_byte(target);
                     }
+                    self.pending.clear();
                 }
-                _ => {}
+                "q" => {
+                    // Enter `gq` operator-pending. Don't clear pending — count
+                    // and register survive into the next motion / `q` shortcut.
+                    self.pending.operator = Some('Q');
+                }
+                _ => { self.pending.clear(); }
             }
-            self.pending.clear();
             return false;
         }
         if key == "g" { self.pending.g_prefix = true; return false; }
 
-        // Operator handling: `d`, `c`, `y` — doubled = linewise on count1 lines.
-        if matches!(key, "d" | "c" | "y") {
+        // gqq shortcut — current line gq. Must precede the q-quit fallback in
+        // handle_normal_action; only fires when gq operator is pending.
+        if key == "q" && self.pending.operator == Some('Q') {
+            let n = self.pending.count1.unwrap_or(1);
+            let extra = n.saturating_sub(1);
+            self.execute_op_linewise(self.cur_line, extra);
+            self.last_change = Some(LastChange::Op {
+                op: 'Q',
+                motion: ChangeMotion::Linewise { extra },
+                count: n,
+                register: None,
+                insert_text: String::new(),
+            });
+            self.pending.clear();
+            return false;
+        }
+
+        // Operator handling: `d`, `c`, `y`, `>`, `<` — doubled = linewise on
+        // count1 lines. (`gq` doubles via the `gqq` shortcut handled above.)
+        if matches!(key, "d" | "c" | "y" | ">" | "<") {
             let opc = key.chars().next().unwrap();
             if self.pending.operator == Some(opc) {
                 let n = self.pending.count1.unwrap_or(1);
@@ -683,16 +1018,33 @@ impl App {
         if let Some(target_byte) = self.parse_motion(key, count) {
             if let Some(opc) = op {
                 let from = self.cursor_byte();
-                let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
                 let cap_reg = self.pending.register;
-                self.execute_op_charwise(opc, start, end);
-                self.last_change = Some(LastChange::Op {
-                    op: opc,
-                    motion: ChangeMotion::Key(key.to_string()),
-                    count,
-                    register: cap_reg,
-                    insert_text: String::new(),
-                });
+                if matches!(opc, 'Q' | '>' | '<') {
+                    // Linewise operators: snap motion target to whole-line
+                    // range and dispatch via execute_op_linewise.
+                    let (l1, _) = self.buf.byte_to_line_col(from);
+                    let (l2, _) = self.buf.byte_to_line_col(target_byte);
+                    let (lo, hi) = if l1 <= l2 { (l1, l2) } else { (l2, l1) };
+                    let extra = hi - lo;
+                    self.execute_op_linewise(lo, extra);
+                    self.last_change = Some(LastChange::Op {
+                        op: opc,
+                        motion: ChangeMotion::Linewise { extra },
+                        count,
+                        register: cap_reg,
+                        insert_text: String::new(),
+                    });
+                } else {
+                    let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
+                    self.execute_op_charwise(opc, start, end);
+                    self.last_change = Some(LastChange::Op {
+                        op: opc,
+                        motion: ChangeMotion::Key(key.to_string()),
+                        count,
+                        register: cap_reg,
+                        insert_text: String::new(),
+                    });
+                }
             } else {
                 self.cursor_to_byte(target_byte);
             }
@@ -878,6 +1230,45 @@ impl App {
                     self.want_col = s;
                 }
             },
+            // s — substitute `count` chars at cursor (vim equiv. of `cl` with
+            // count). Delete the chars then enter Insert. Last_change recorded
+            // so dot replays.
+            "s" => {
+                let from = self.cursor_byte();
+                let line = self.buf.line(self.cur_line);
+                let mut e = self.cur_col;
+                let mut taken = 0;
+                while taken < count && e < line.len() {
+                    e += 1;
+                    while e < line.len() && !line.is_char_boundary(e) { e += 1; }
+                    taken += 1;
+                }
+                let abs_end = self.buf.line_byte_offset(self.cur_line) + e;
+                self.last_change = Some(LastChange::Op {
+                    op: 'c',
+                    motion: ChangeMotion::Key("l".to_string()),
+                    count: taken.max(1),
+                    register: None,
+                    insert_text: String::new(),
+                });
+                self.execute_op_charwise('c', from, abs_end);
+            }
+            // S — substitute `count` lines (vim equiv. of `cc`). Replace the
+            // line(s) with one empty line and enter Insert.
+            "S" => {
+                let extra = count.saturating_sub(1);
+                self.last_change = Some(LastChange::Op {
+                    op: 'c',
+                    motion: ChangeMotion::Linewise { extra },
+                    count,
+                    register: None,
+                    insert_text: String::new(),
+                });
+                let saved_op = self.pending.operator;
+                self.pending.operator = Some('c');
+                self.execute_op_linewise(self.cur_line, extra);
+                self.pending.operator = saved_op;
+            }
             "D" => {
                 let from = self.cursor_byte();
                 let end = motion::line_end(&self.buf, from);
@@ -990,7 +1381,7 @@ impl App {
         // reset for the new geometry.
         self.header = Pane::new(1, 1, cols, 1, 255, 236);
         self.header.wrap = false; self.header.scroll = false;
-        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 252, 0);
+        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 231, 0);
         self.main_p.wrap = true;
         self.footer = Pane::new(1, rows, cols, 1, 255, 236);
         self.footer.wrap = false; self.footer.scroll = false;
@@ -1235,6 +1626,47 @@ impl App {
             'y' => {
                 self.regs.yank(reg_name, text, YankKind::Linewise);
             }
+            'Q' => {
+                // gq: paragraph reformat. Width 72 in email mode (RFC 5322
+                // soft limit + room for `> ` indenting on reply); plain mode
+                // also gets 72 — adjust later via :set textwidth.
+                let width = 72usize;
+                let reformatted = reformat_paragraphs(&text, width);
+                if reformatted != text {
+                    self.buf.apply(start, end, &reformatted);
+                }
+                self.cur_line = from;
+                self.cur_col = 0;
+                self.want_col = 0;
+            }
+            '>' | '<' => {
+                let dir = if op == '>' { 1 } else { -1 };
+                let kind = self.buf.kind;
+                let mut new_text = String::new();
+                for raw in text.split_inclusive('\n') {
+                    let (body, nl) = match raw.strip_suffix('\n') {
+                        Some(s) => (s, "\n"),
+                        None    => (raw, ""),
+                    };
+                    let shifted = if dir > 0 {
+                        shift_right(body, kind)
+                    } else {
+                        shift_left(body, kind)
+                    };
+                    new_text.push_str(&shifted);
+                    new_text.push_str(nl);
+                }
+                if new_text != text {
+                    self.buf.apply(start, end, &new_text);
+                }
+                // Land cursor at first non-whitespace col of first line, like
+                // vim's `>>` behavior.
+                self.cur_line = from;
+                let new_first = self.buf.line(from);
+                let col = new_first.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+                self.cur_col = col;
+                self.want_col = col;
+            }
             _ => {}
         }
     }
@@ -1471,6 +1903,9 @@ impl App {
                         });
                     }
                 }
+                // Recheck spelling on Insert→Normal: cheap for typical mail
+                // bodies, gives instant feedback the moment the user pauses.
+                if self.spell_enabled { self.recheck_spell(); }
             }
             // Arrow keys + HOME/END work in Insert mode too. LEFT/RIGHT wrap
             // across line boundaries; UP/DOWN preserve want_col.
@@ -1548,8 +1983,16 @@ impl App {
                     ChangeMotion::Key(k) => {
                         if let Some(target_byte) = self.parse_motion(&k, count) {
                             let from = self.cursor_byte();
-                            let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
-                            self.execute_op_charwise(op, start, end);
+                            if matches!(op, 'Q' | '>' | '<') {
+                                let (l1, _) = self.buf.byte_to_line_col(from);
+                                let (l2, _) = self.buf.byte_to_line_col(target_byte);
+                                let (lo, hi) = if l1 <= l2 { (l1, l2) } else { (l2, l1) };
+                                let extra = hi - lo;
+                                self.execute_op_linewise(lo, extra);
+                            } else {
+                                let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
+                                self.execute_op_charwise(op, start, end);
+                            }
                         }
                     }
                     ChangeMotion::TextObject { kind, target } => {
@@ -1571,7 +2014,17 @@ impl App {
                             ('a', 'p') => textobj::around_paragraph(&self.buf, cur),
                             _ => None,
                         };
-                        if let Some((s, e)) = r { self.execute_op_charwise(op, s, e); }
+                        if let Some((s, e)) = r {
+                            if matches!(op, 'Q' | '>' | '<') {
+                                let (l1, _) = self.buf.byte_to_line_col(s);
+                                let (l2, _) = self.buf.byte_to_line_col(e.saturating_sub(1).max(s));
+                                let (lo, hi) = if l1 <= l2 { (l1, l2) } else { (l2, l1) };
+                                let extra = hi - lo;
+                                self.execute_op_linewise(lo, extra);
+                            } else {
+                                self.execute_op_charwise(op, s, e);
+                            }
+                        }
                     }
                     ChangeMotion::Linewise { extra } => {
                         self.execute_op_linewise(self.cur_line, extra);
@@ -1664,6 +2117,18 @@ impl App {
                 }
                 false
             }
+            "set spell" => {
+                self.spell_enable();
+                if self.spell_enabled {
+                    self.set_status(&format!(" spell on ({} words)", self.misspellings.len()), 244);
+                }
+                false
+            }
+            "set nospell" => {
+                self.spell_disable();
+                self.set_status(" spell off", 244);
+                false
+            }
             other => {
                 self.set_status(&format!(" unknown: {}", other), 196);
                 false
@@ -1672,33 +2137,308 @@ impl App {
     }
 }
 
-/// Email mode per-line foreground color. Header block (lines before the
-/// first blank): RFC 822 header lines (`From:`, `To:`, `Subject:`, …)
-/// colored red. Body block: leading `>` count determines quote color so
-/// reply levels are visually nested. Returns None for plain body text.
-fn line_color_email(line: &str, line_idx: usize, header_end: Option<usize>) -> Option<u8> {
+/// Per-line email styling. Block colors mirror kastrup's right-pane render
+/// 1-for-1 (same palette indices), so reading a message in kastrup and
+/// composing a reply in scribe shows identical colors. Header KEYs are
+/// rendered bold (same color as the value, just bold) — cheap visual
+/// distinction without burning a color slot.
+///
+/// Inline tokens (email addresses → magenta, URLs → blue+underline) are
+/// applied on top by the renderer, regardless of which block the line is
+/// in. They override the base fg for their span only.
+#[derive(Copy, Clone)]
+enum EmailLineStyle {
+    /// Default fg (no styling).
+    None,
+    /// Single foreground color across the whole line.
+    Solid(u8),
+    /// Header line: whole line in `fg`, with the KEY portion (up through
+    /// first `:`) additionally bolded.
+    HeaderBold(u8),
+}
+
+fn line_style_email(
+    line: &str,
+    line_idx: usize,
+    header_end: Option<usize>,
+    sig_start: Option<usize>,
+) -> EmailLineStyle {
     if let Some(end) = header_end {
         if line_idx < end {
             let trimmed = line.trim_start();
-            for key in ["From:", "To:", "Cc:", "Bcc:", "Subject:", "Reply-To:",
-                        "Date:", "Message-ID:", "In-Reply-To:", "References:", "Attach:"] {
-                if trimmed.starts_with(key) { return Some(196); }
+            // From/To/Cc/Bcc/Reply-To → kastrup theme_colors.header_from = 2.
+            for key in ["From:", "To:", "Cc:", "Bcc:", "Reply-To:"] {
+                if trimmed.starts_with(key) { return EmailLineStyle::HeaderBold(2); }
             }
-            return None;
+            // Subject → kastrup theme_colors.header_subj = 1.
+            if trimmed.starts_with("Subject:") {
+                return EmailLineStyle::HeaderBold(1);
+            }
+            // Date / Message-ID / In-Reply-To / References → header_date = 240.
+            for key in ["Date:", "Message-ID:", "In-Reply-To:", "References:"] {
+                if trimmed.starts_with(key) { return EmailLineStyle::HeaderBold(240); }
+            }
+            // Attach: not in kastrup's right pane; reuse attachment color (208).
+            if trimmed.starts_with("Attach:") {
+                return EmailLineStyle::HeaderBold(208);
+            }
+            return EmailLineStyle::None;
         }
     }
-    // Body: count leading `>` (allowing interleaved whitespace).
-    let mut depth = 0usize;
-    for c in line.chars() {
-        if c == '>' { depth += 1; }
-        else if c == ' ' || c == '\t' { /* allowed between markers */ }
-        else { break; }
+    // Signature: kastrup theme_colors.sig = 242.
+    if let Some(start) = sig_start {
+        if line_idx >= start { return EmailLineStyle::Solid(242); }
     }
-    match depth {
-        0 => None,
-        1 => Some(45),    // bright cyan
-        2 => Some(33),    // blue
-        3 => Some(165),   // magenta
-        _ => Some(245),   // dim gray for level 4+
+    // Quote levels: kastrup theme_colors.quote{1..4} = 114/180/139/109.
+    if line.starts_with(">>>>") { return EmailLineStyle::Solid(109); }
+    if line.starts_with(">>>")  { return EmailLineStyle::Solid(139); }
+    if line.starts_with(">>")   { return EmailLineStyle::Solid(180); }
+    if line.starts_with('>')    { return EmailLineStyle::Solid(114); }
+    EmailLineStyle::None
+}
+
+/// Inline token within an email body line — email address or URL — to be
+/// overlaid on top of the line's base color. Ranges are byte offsets within
+/// the line (not absolute buffer offsets).
+#[derive(Clone)]
+struct InlineToken {
+    start: usize,
+    end: usize,
+    /// Override fg for this span. URLs → 4 (kastrup `link`). Email addresses
+    /// → 177 (light purple — visible against every block color in the email
+    /// scheme, including the gray signature and the green quote1).
+    fg: u8,
+    /// SGR underline (for URLs, in addition to OSC 8 wrap).
+    underline: bool,
+    /// If Some, wrap this span in OSC 8 hyperlink so the host terminal can
+    /// click through (kitty/wezterm/foot/glass).
+    osc8_url: Option<String>,
+}
+
+/// Find email + URL tokens on a single line. Returns sorted non-overlapping
+/// ranges. URL match wins if a URL contains an email (e.g. `mailto:`).
+fn inline_tokens(line: &str) -> Vec<InlineToken> {
+    use std::sync::OnceLock;
+    static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static EMAIL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let url_re = URL_RE.get_or_init(|| {
+        // Match http(s):// up to the next whitespace / bracket / quote, then
+        // strip trailing punct (.,;:!?'") that's almost certainly sentence
+        // terminator rather than part of the URL.
+        regex::Regex::new(r#"https?://[^\s<>()\[\]{}'"]+[^\s<>()\[\]{}.,;:!?'"]"#).unwrap()
+    });
+    let email_re = EMAIL_RE.get_or_init(|| {
+        regex::Regex::new(r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#).unwrap()
+    });
+
+    let mut tokens: Vec<InlineToken> = Vec::new();
+    for m in url_re.find_iter(line) {
+        tokens.push(InlineToken {
+            start: m.start(), end: m.end(),
+            fg: 4, underline: true,
+            osc8_url: Some(m.as_str().to_string()),
+        });
+    }
+    for m in email_re.find_iter(line) {
+        // Drop emails that overlap an existing URL token.
+        if tokens.iter().any(|t| m.start() < t.end && m.end() > t.start) { continue; }
+        tokens.push(InlineToken {
+            start: m.start(), end: m.end(),
+            fg: 177, underline: false, osc8_url: None,
+        });
+    }
+    tokens.sort_by_key(|t| t.start);
+    tokens
+}
+
+/// Emit one line's worth of styled output into `out`. Composes:
+///   * `base_fg`     — the line's block color (None / quote / sig / header).
+///   * `bold_until`  — bold the chunk up to this byte offset (header KEY).
+///   * `tokens`      — inline overrides (addresses, URLs).
+///   * `miss_ranges` — line-relative misspelling spans (curly red underline).
+///
+/// Walks change-points so SGR opens/closes happen exactly at boundaries —
+/// no styling carries over to the next chunk. Uses `\x1b[39m` / `\x1b[22m` /
+/// `\x1b[24;59m` (selective resets) instead of `\x1b[0m` so the pane bg is
+/// never disturbed mid-line.
+fn emit_email_line(
+    out: &mut String,
+    line: &str,
+    base_fg: Option<u8>,
+    bold_until: Option<usize>,
+    tokens: &[InlineToken],
+    miss_ranges: &[(usize, usize)],
+) {
+    if line.is_empty() { return; }
+    let mut pos = 0usize;
+    while pos < line.len() {
+        // Compute current attributes at `pos`.
+        let bold = bold_until.map_or(false, |k| pos < k);
+        let tok = tokens.iter().find(|t| pos >= t.start && pos < t.end);
+        let miss = miss_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+        let fg = tok.map(|t| t.fg).or(base_fg);
+        let url = tok.and_then(|t| t.osc8_url.clone());
+        let underline = tok.map_or(false, |t| t.underline);
+
+        // Find next boundary so this chunk has stable attributes.
+        let mut next = line.len();
+        let consider = |x: usize, n: &mut usize| { if x > pos && x < *n { *n = x; } };
+        if let Some(k) = bold_until { consider(k, &mut next); }
+        for t in tokens {
+            consider(t.start, &mut next);
+            consider(t.end,   &mut next);
+        }
+        for (s, e) in miss_ranges {
+            consider(*s, &mut next);
+            consider(*e, &mut next);
+        }
+        // Snap to char boundary.
+        while next < line.len() && !line.is_char_boundary(next) { next += 1; }
+
+        // Open SGR + OSC 8.
+        if let Some(u) = &url {
+            out.push_str("\x1b]8;;");
+            out.push_str(u);
+            out.push_str("\x1b\\");
+        }
+        let mut sgr = String::from("\x1b[");
+        let mut sep = "";
+        if let Some(c) = fg { sgr.push_str(&format!("{}38;5;{}", sep, c)); sep = ";"; }
+        if bold { sgr.push_str(&format!("{}1", sep)); sep = ";"; }
+        if underline { sgr.push_str(&format!("{}4", sep)); sep = ";"; }
+        if miss { sgr.push_str(&format!("{}4:3;58:5:196", sep)); }
+        if sgr.len() > 2 { sgr.push('m'); out.push_str(&sgr); }
+
+        out.push_str(&line[pos..next]);
+
+        // Close in reverse order.
+        if miss || underline { out.push_str("\x1b[24;59m"); }
+        if bold { out.push_str("\x1b[22m"); }
+        if fg.is_some() { out.push_str("\x1b[39m"); }
+        if url.is_some() { out.push_str("\x1b]8;;\x1b\\"); }
+
+        pos = next;
+    }
+}
+
+/// Scan for the signature delimiter (`-- ` or `--`) within the body block.
+/// Returns the line index of the delimiter so the renderer can color it and
+/// every subsequent line as signature. None if no delimiter present.
+fn find_sig_start(buf: &Buffer, header_end: Option<usize>) -> Option<usize> {
+    let body_start = header_end.unwrap_or(0);
+    let total = buf.line_count();
+    for i in body_start..total {
+        let line = buf.line(i);
+        if line == "-- " || line == "--" { return Some(i); }
+    }
+    None
+}
+
+/// Detect a leading quote prefix on a line. Returns (prefix, body) where
+/// prefix is the leading `>`+whitespace block (e.g. `> `, `> > `, `>>>`)
+/// and body is the rest. Used for `gq` reformat (preserves prefix per line)
+/// and `>>` / `<<` indent-as-quote in email mode.
+fn split_quote_prefix(line: &str) -> (String, &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut last_gt = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'>' => { i += 1; last_gt = i; }
+            b' ' | b'\t' => { i += 1; }
+            _ => break,
+        }
+    }
+    if last_gt == 0 { return (String::new(), line); }
+    // Include trailing single space after the final `>` if present.
+    let mut end = last_gt;
+    if end < bytes.len() && bytes[end] == b' ' { end += 1; }
+    (line[..end].to_string(), &line[end..])
+}
+
+/// Rewrap text into paragraphs at `width`. A paragraph = consecutive non-blank
+/// lines sharing the same quote prefix. Blank lines separate paragraphs and
+/// are preserved verbatim. Each paragraph is joined and rewrapped at
+/// (width - prefix_len) so quoted reply levels stay readable.
+fn reformat_paragraphs(text: &str, width: usize) -> String {
+    let trailing_nl = text.ends_with('\n');
+    let body = if trailing_nl { &text[..text.len()-1] } else { text };
+    let lines: Vec<&str> = body.split('\n').collect();
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        let (prefix, _) = split_quote_prefix(line);
+        // Greedy collect: lines with same prefix and non-empty body form one paragraph.
+        let mut joined = String::new();
+        let mut j = i;
+        while j < lines.len() {
+            let l = lines[j];
+            if l.trim().is_empty() { break; }
+            let (p, b) = split_quote_prefix(l);
+            if p != prefix { break; }
+            if !joined.is_empty() { joined.push(' '); }
+            joined.push_str(b.trim());
+            j += 1;
+        }
+        let body_width = width.saturating_sub(prefix.chars().count()).max(20);
+        let mut current = String::new();
+        for w in joined.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(w);
+            } else if current.chars().count() + 1 + w.chars().count() <= body_width {
+                current.push(' ');
+                current.push_str(w);
+            } else {
+                out.push_str(&prefix);
+                out.push_str(&current);
+                out.push('\n');
+                current = w.to_string();
+            }
+        }
+        if !current.is_empty() {
+            out.push_str(&prefix);
+            out.push_str(&current);
+            out.push('\n');
+        }
+        i = j;
+    }
+    if !trailing_nl && out.ends_with('\n') { out.pop(); }
+    out
+}
+
+/// `>>` shift-right one line. In email mode adds a `> ` quote level; in plain
+/// mode prepends a tab.
+fn shift_right(line: &str, kind: FileKind) -> String {
+    if kind == FileKind::Email {
+        // Add one quote level. Empty lines also get `>` so quoted blank lines
+        // stay visually attached to their paragraph.
+        if line.is_empty() { return ">".to_string(); }
+        format!("> {}", line)
+    } else {
+        format!("\t{}", line)
+    }
+}
+
+/// `<<` shift-left one line. In email mode strips one `> ` (or bare `>`); in
+/// plain mode strips one leading tab or up to 4 leading spaces. Returns the
+/// line unchanged if there's nothing to strip.
+fn shift_left(line: &str, kind: FileKind) -> String {
+    if kind == FileKind::Email {
+        if let Some(rest) = line.strip_prefix("> ") { return rest.to_string(); }
+        if let Some(rest) = line.strip_prefix(">")  { return rest.to_string(); }
+        line.to_string()
+    } else {
+        if let Some(rest) = line.strip_prefix('\t') { return rest.to_string(); }
+        let n_spaces = line.bytes().take(4).take_while(|&b| b == b' ').count();
+        if n_spaces > 0 { return line[n_spaces..].to_string(); }
+        line.to_string()
     }
 }
