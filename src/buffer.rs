@@ -11,9 +11,10 @@
 use ropey::Rope;
 use std::path::PathBuf;
 
-/// Pick a file kind from path / content. `.eml` extension OR a kastrup
-/// compose tempfile path (`/tmp/kastrup_compose_*`) OR a content first line
-/// looking like an RFC 822 header → Email.
+/// Pick a file kind from path / content. Email beats source detection so
+/// that `.eml` and kastrup compose tempfiles get the email pane treatment
+/// (header colors, quote levels, signature) instead of e.g. trying to
+/// parse the body as some random language.
 fn detect_kind(path: &PathBuf, content: &str) -> FileKind {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.ends_with(".eml") || name.starts_with("kastrup_compose_") || name.starts_with("kastrup_body_") {
@@ -22,6 +23,16 @@ fn detect_kind(path: &PathBuf, content: &str) -> FileKind {
     let first = content.lines().find(|l| !l.is_empty()).unwrap_or("");
     if first.starts_with("From:") || first.starts_with("To:") || first.starts_with("Subject:") {
         return FileKind::Email;
+    }
+    // Source detection: ask the highlight crate whether the extension is
+    // known. The String stored in FileKind::Source is the lowercased
+    // extension — the renderer passes it back to highlight::highlight()
+    // to dispatch on language.
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_lowercase();
+        if highlight::lang_known(&lower).is_some() {
+            return FileKind::Source(lower);
+        }
     }
     FileKind::Plain
 }
@@ -46,13 +57,17 @@ struct UndoNode {
     children: Vec<usize>,
 }
 
-/// Detected file kind. Used by the renderer to apply per-syntax styling.
-/// Phase 3 will replace this with full syntect; for now it covers the
-/// kastrup-compose case (RFC 822 headers + quoted reply levels).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Detected file kind. The renderer dispatches per variant:
+/// * `Plain`   — no styling beyond the pane default
+/// * `Email`   — header / quote / signature coloring + inline tokens
+/// * `Source`  — syntect-based syntax highlighting; the inner String is
+///   the syntax name (e.g. "Rust", "Markdown", "Bash") that
+///   `highlight::find_syntax_by_name` resolves at render time.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileKind {
     Plain,
     Email,
+    Source(String),
 }
 
 pub struct Buffer {

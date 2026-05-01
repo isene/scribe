@@ -202,7 +202,7 @@ impl App {
             None    => Buffer::empty(),
         };
 
-        let auto_spell = buf.kind == FileKind::Email;
+        let auto_spell = matches!(buf.kind, FileKind::Email);
         let mut app = Self {
             buf, mode: Mode::Normal,
             cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
@@ -259,10 +259,9 @@ impl App {
         self.misspellings.clear();
         if !self.spell_enabled { return; }
         let Some(sp) = self.spell.as_mut() else { return };
-        let kind = self.buf.kind;
         // For email, locate the header/body boundary (first blank line) the
         // same way render_main does, so we can skip header lines.
-        let header_end: Option<usize> = if kind == FileKind::Email {
+        let header_end: Option<usize> = if matches!(self.buf.kind, FileKind::Email) {
             (0..self.buf.line_count()).find(|i| self.buf.line(*i).is_empty())
         } else { None };
 
@@ -505,12 +504,37 @@ impl App {
         // Email-mode pre-pass: locate the boundary between header block and
         // body (first blank line), and the signature delimiter (`-- `). Both
         // are passed to line_color_email() so per-line lookups stay O(1).
-        let header_end: Option<usize> = if self.buf.kind == FileKind::Email {
+        let is_email = matches!(self.buf.kind, FileKind::Email);
+        let header_end: Option<usize> = if is_email {
             (0..self.buf.line_count()).find(|&i| self.buf.line(i).trim().is_empty())
         } else { None };
-        let sig_start: Option<usize> = if self.buf.kind == FileKind::Email {
-            find_sig_start(&self.buf, header_end)
+        let sig_start: Option<usize> = if is_email {
+            let body_start = header_end.unwrap_or(0);
+            let line_count = self.buf.line_count();
+            highlight::find_sig_start(line_count, body_start, |i| self.buf.line(i))
         } else { None };
+        // Source mode: render the whole buffer through highlight crate, then
+        // slice the visible window. Pointer's hand-rolled highlighter is
+        // line-stateless, so this is line-count work — fast enough for the
+        // file sizes a writer's editor sees. A future per-line cache
+        // invalidated on edit would let big repos stay snappy.
+        let source_lines: Vec<String> = match &self.buf.kind {
+            FileKind::Source(ext) => {
+                let line_count = self.buf.line_count();
+                let mut all = String::new();
+                for i in 0..line_count {
+                    all.push_str(&self.buf.line(i));
+                    all.push('\n');
+                }
+                let rendered = highlight::highlight(&all, ext, line_count + 1);
+                rendered.split('\n')
+                    .skip(self.scroll)
+                    .take(pane_h)
+                    .map(str::to_string)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
 
         let mut out = String::new();
         for i in 0..pane_h {
@@ -519,15 +543,15 @@ impl App {
                 let line = self.buf.line(line_idx);
                 let line_byte_off = self.buf.line_byte_offset(line_idx);
                 // Per-line fg color when email mode says so. None → default.
-                let line_style = if self.buf.kind == FileKind::Email {
-                    line_style_email(&line, line_idx, header_end, sig_start)
-                } else { EmailLineStyle::None };
+                let line_style = if is_email {
+                    highlight::line_style_email(&line, line_idx, header_end, sig_start)
+                } else { highlight::EmailLineStyle::None };
                 // Resolve the base fg + KEY-bold extent for the unified line
                 // emitter. HeaderBold(c): line in c, KEY (up to colon+1) bold.
                 let (base_fg, bold_until): (Option<u8>, Option<usize>) = match line_style {
-                    EmailLineStyle::None        => (None, None),
-                    EmailLineStyle::Solid(c)    => (Some(c), None),
-                    EmailLineStyle::HeaderBold(c) => (Some(c), line.find(':').map(|p| p + 1)),
+                    highlight::EmailLineStyle::None        => (None, None),
+                    highlight::EmailLineStyle::Solid(c)    => (Some(c), None),
+                    highlight::EmailLineStyle::HeaderBold(c) => (Some(c), line.find(':').map(|p| p + 1)),
                 };
                 // Fast path: when no selection touches this line, we can
                 // emit the whole line in one styled span instead of doing
@@ -545,6 +569,18 @@ impl App {
                     _ => false,
                 };
                 if !line_in_sel {
+                    // Source mode: emit the syntect-styled line straight
+                    // from the pre-built `source_lines` buffer. Selection
+                    // / spell / token overlay don't compose with syntect
+                    // colors yet — when those are needed the line falls
+                    // through to the per-char selection path below.
+                    if !source_lines.is_empty() {
+                        if let Some(styled) = source_lines.get(i) {
+                            out.push_str(styled);
+                            if i + 1 < pane_h { out.push('\n'); }
+                            continue;
+                        }
+                    }
                     // Unified emit: base_fg + KEY-bold + inline tokens
                     // (addresses → magenta 201, URLs → blue 4 + OSC 8) +
                     // misspelling overlay. Single function handles all
@@ -558,8 +594,8 @@ impl App {
                             (s, e)
                         })
                         .collect();
-                    let tokens = inline_tokens(&line);
-                    emit_email_line(&mut out, &line, base_fg, bold_until, &tokens, &miss_ranges);
+                    let tokens = highlight::inline_tokens(&line);
+                    highlight::emit_email_line(&mut out, &line, base_fg, bold_until, &tokens, &miss_ranges);
                     if i + 1 < pane_h { out.push('\n'); }
                     continue;
                 }
@@ -1641,7 +1677,7 @@ impl App {
             }
             '>' | '<' => {
                 let dir = if op == '>' { 1 } else { -1 };
-                let kind = self.buf.kind;
+                let kind = self.buf.kind.clone();
                 let mut new_text = String::new();
                 for raw in text.split_inclusive('\n') {
                     let (body, nl) = match raw.strip_suffix('\n') {
@@ -1649,9 +1685,9 @@ impl App {
                         None    => (raw, ""),
                     };
                     let shifted = if dir > 0 {
-                        shift_right(body, kind)
+                        shift_right(body, &kind)
                     } else {
-                        shift_left(body, kind)
+                        shift_left(body, &kind)
                     };
                     new_text.push_str(&shifted);
                     new_text.push_str(nl);
@@ -2137,202 +2173,10 @@ impl App {
     }
 }
 
-/// Per-line email styling. Block colors mirror kastrup's right-pane render
-/// 1-for-1 (same palette indices), so reading a message in kastrup and
-/// composing a reply in scribe shows identical colors. Header KEYs are
-/// rendered bold (same color as the value, just bold) — cheap visual
-/// distinction without burning a color slot.
-///
-/// Inline tokens (email addresses → magenta, URLs → blue+underline) are
-/// applied on top by the renderer, regardless of which block the line is
-/// in. They override the base fg for their span only.
-#[derive(Copy, Clone)]
-enum EmailLineStyle {
-    /// Default fg (no styling).
-    None,
-    /// Single foreground color across the whole line.
-    Solid(u8),
-    /// Header line: whole line in `fg`, with the KEY portion (up through
-    /// first `:`) additionally bolded.
-    HeaderBold(u8),
-}
-
-fn line_style_email(
-    line: &str,
-    line_idx: usize,
-    header_end: Option<usize>,
-    sig_start: Option<usize>,
-) -> EmailLineStyle {
-    if let Some(end) = header_end {
-        if line_idx < end {
-            let trimmed = line.trim_start();
-            // From/To/Cc/Bcc/Reply-To → kastrup theme_colors.header_from = 2.
-            for key in ["From:", "To:", "Cc:", "Bcc:", "Reply-To:"] {
-                if trimmed.starts_with(key) { return EmailLineStyle::HeaderBold(2); }
-            }
-            // Subject → kastrup theme_colors.header_subj = 1.
-            if trimmed.starts_with("Subject:") {
-                return EmailLineStyle::HeaderBold(1);
-            }
-            // Date / Message-ID / In-Reply-To / References → header_date = 240.
-            for key in ["Date:", "Message-ID:", "In-Reply-To:", "References:"] {
-                if trimmed.starts_with(key) { return EmailLineStyle::HeaderBold(240); }
-            }
-            // Attach: not in kastrup's right pane; reuse attachment color (208).
-            if trimmed.starts_with("Attach:") {
-                return EmailLineStyle::HeaderBold(208);
-            }
-            return EmailLineStyle::None;
-        }
-    }
-    // Signature: kastrup theme_colors.sig = 242.
-    if let Some(start) = sig_start {
-        if line_idx >= start { return EmailLineStyle::Solid(242); }
-    }
-    // Quote levels: kastrup theme_colors.quote{1..4} = 114/180/139/109.
-    if line.starts_with(">>>>") { return EmailLineStyle::Solid(109); }
-    if line.starts_with(">>>")  { return EmailLineStyle::Solid(139); }
-    if line.starts_with(">>")   { return EmailLineStyle::Solid(180); }
-    if line.starts_with('>')    { return EmailLineStyle::Solid(114); }
-    EmailLineStyle::None
-}
-
-/// Inline token within an email body line — email address or URL — to be
-/// overlaid on top of the line's base color. Ranges are byte offsets within
-/// the line (not absolute buffer offsets).
-#[derive(Clone)]
-struct InlineToken {
-    start: usize,
-    end: usize,
-    /// Override fg for this span. URLs → 4 (kastrup `link`). Email addresses
-    /// → 177 (light purple — visible against every block color in the email
-    /// scheme, including the gray signature and the green quote1).
-    fg: u8,
-    /// SGR underline (for URLs, in addition to OSC 8 wrap).
-    underline: bool,
-    /// If Some, wrap this span in OSC 8 hyperlink so the host terminal can
-    /// click through (kitty/wezterm/foot/glass).
-    osc8_url: Option<String>,
-}
-
-/// Find email + URL tokens on a single line. Returns sorted non-overlapping
-/// ranges. URL match wins if a URL contains an email (e.g. `mailto:`).
-fn inline_tokens(line: &str) -> Vec<InlineToken> {
-    use std::sync::OnceLock;
-    static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static EMAIL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let url_re = URL_RE.get_or_init(|| {
-        // Match http(s):// up to the next whitespace / bracket / quote, then
-        // strip trailing punct (.,;:!?'") that's almost certainly sentence
-        // terminator rather than part of the URL.
-        regex::Regex::new(r#"https?://[^\s<>()\[\]{}'"]+[^\s<>()\[\]{}.,;:!?'"]"#).unwrap()
-    });
-    let email_re = EMAIL_RE.get_or_init(|| {
-        regex::Regex::new(r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#).unwrap()
-    });
-
-    let mut tokens: Vec<InlineToken> = Vec::new();
-    for m in url_re.find_iter(line) {
-        tokens.push(InlineToken {
-            start: m.start(), end: m.end(),
-            fg: 4, underline: true,
-            osc8_url: Some(m.as_str().to_string()),
-        });
-    }
-    for m in email_re.find_iter(line) {
-        // Drop emails that overlap an existing URL token.
-        if tokens.iter().any(|t| m.start() < t.end && m.end() > t.start) { continue; }
-        tokens.push(InlineToken {
-            start: m.start(), end: m.end(),
-            fg: 177, underline: false, osc8_url: None,
-        });
-    }
-    tokens.sort_by_key(|t| t.start);
-    tokens
-}
-
-/// Emit one line's worth of styled output into `out`. Composes:
-///   * `base_fg`     — the line's block color (None / quote / sig / header).
-///   * `bold_until`  — bold the chunk up to this byte offset (header KEY).
-///   * `tokens`      — inline overrides (addresses, URLs).
-///   * `miss_ranges` — line-relative misspelling spans (curly red underline).
-///
-/// Walks change-points so SGR opens/closes happen exactly at boundaries —
-/// no styling carries over to the next chunk. Uses `\x1b[39m` / `\x1b[22m` /
-/// `\x1b[24;59m` (selective resets) instead of `\x1b[0m` so the pane bg is
-/// never disturbed mid-line.
-fn emit_email_line(
-    out: &mut String,
-    line: &str,
-    base_fg: Option<u8>,
-    bold_until: Option<usize>,
-    tokens: &[InlineToken],
-    miss_ranges: &[(usize, usize)],
-) {
-    if line.is_empty() { return; }
-    let mut pos = 0usize;
-    while pos < line.len() {
-        // Compute current attributes at `pos`.
-        let bold = bold_until.map_or(false, |k| pos < k);
-        let tok = tokens.iter().find(|t| pos >= t.start && pos < t.end);
-        let miss = miss_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
-        let fg = tok.map(|t| t.fg).or(base_fg);
-        let url = tok.and_then(|t| t.osc8_url.clone());
-        let underline = tok.map_or(false, |t| t.underline);
-
-        // Find next boundary so this chunk has stable attributes.
-        let mut next = line.len();
-        let consider = |x: usize, n: &mut usize| { if x > pos && x < *n { *n = x; } };
-        if let Some(k) = bold_until { consider(k, &mut next); }
-        for t in tokens {
-            consider(t.start, &mut next);
-            consider(t.end,   &mut next);
-        }
-        for (s, e) in miss_ranges {
-            consider(*s, &mut next);
-            consider(*e, &mut next);
-        }
-        // Snap to char boundary.
-        while next < line.len() && !line.is_char_boundary(next) { next += 1; }
-
-        // Open SGR + OSC 8.
-        if let Some(u) = &url {
-            out.push_str("\x1b]8;;");
-            out.push_str(u);
-            out.push_str("\x1b\\");
-        }
-        let mut sgr = String::from("\x1b[");
-        let mut sep = "";
-        if let Some(c) = fg { sgr.push_str(&format!("{}38;5;{}", sep, c)); sep = ";"; }
-        if bold { sgr.push_str(&format!("{}1", sep)); sep = ";"; }
-        if underline { sgr.push_str(&format!("{}4", sep)); sep = ";"; }
-        if miss { sgr.push_str(&format!("{}4:3;58:5:196", sep)); }
-        if sgr.len() > 2 { sgr.push('m'); out.push_str(&sgr); }
-
-        out.push_str(&line[pos..next]);
-
-        // Close in reverse order.
-        if miss || underline { out.push_str("\x1b[24;59m"); }
-        if bold { out.push_str("\x1b[22m"); }
-        if fg.is_some() { out.push_str("\x1b[39m"); }
-        if url.is_some() { out.push_str("\x1b]8;;\x1b\\"); }
-
-        pos = next;
-    }
-}
-
-/// Scan for the signature delimiter (`-- ` or `--`) within the body block.
-/// Returns the line index of the delimiter so the renderer can color it and
-/// every subsequent line as signature. None if no delimiter present.
-fn find_sig_start(buf: &Buffer, header_end: Option<usize>) -> Option<usize> {
-    let body_start = header_end.unwrap_or(0);
-    let total = buf.line_count();
-    for i in body_start..total {
-        let line = buf.line(i);
-        if line == "-- " || line == "--" { return Some(i); }
-    }
-    None
-}
+// EmailLineStyle, line_style_email, find_sig_start, InlineToken,
+// inline_tokens, emit_email_line are now provided by the `highlight`
+// crate and re-exported via `use highlight::*` at the top of this file.
+// See highlight/src/email.rs for the implementations.
 
 /// Detect a leading quote prefix on a line. Returns (prefix, body) where
 /// prefix is the leading `>`+whitespace block (e.g. `> `, `> > `, `>>>`)
@@ -2416,8 +2260,8 @@ fn reformat_paragraphs(text: &str, width: usize) -> String {
 
 /// `>>` shift-right one line. In email mode adds a `> ` quote level; in plain
 /// mode prepends a tab.
-fn shift_right(line: &str, kind: FileKind) -> String {
-    if kind == FileKind::Email {
+fn shift_right(line: &str, kind: &FileKind) -> String {
+    if matches!(kind, FileKind::Email) {
         // Add one quote level. Empty lines also get `>` so quoted blank lines
         // stay visually attached to their paragraph.
         if line.is_empty() { return ">".to_string(); }
@@ -2430,8 +2274,8 @@ fn shift_right(line: &str, kind: FileKind) -> String {
 /// `<<` shift-left one line. In email mode strips one `> ` (or bare `>`); in
 /// plain mode strips one leading tab or up to 4 leading spaces. Returns the
 /// line unchanged if there's nothing to strip.
-fn shift_left(line: &str, kind: FileKind) -> String {
-    if kind == FileKind::Email {
+fn shift_left(line: &str, kind: &FileKind) -> String {
+    if matches!(kind, FileKind::Email) {
         if let Some(rest) = line.strip_prefix("> ") { return rest.to_string(); }
         if let Some(rest) = line.strip_prefix(">")  { return rest.to_string(); }
         line.to_string()

@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.1.10"
+version = "0.1.12"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Modal text editor for writers — vim-like core, Claude integration, single binary. Part of the Fe2O3 Rust terminal suite."
@@ -9,6 +9,7 @@ repository = "https://github.com/isene/scribe"
 
 [dependencies]
 crust = { version = "0.1", path = "../crust", package = "fe2o3-crust" }
+highlight = { version = "0.1", path = "../highlight", package = "fe2o3-highlight" }
 ropey = "1.6"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
