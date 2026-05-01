@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#0a0a14"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f74c00"/>
+      <stop offset="100%" style="stop-color:#b7410e"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3a7aff"/>
+      <stop offset="100%" style="stop-color:#1a3aaa"/>
+    </linearGradient>
+  </defs>
+  <style>
+    @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0.2; } }
+    .cursor { animation: blink 1.1s steps(1) infinite; }
+  </style>
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="url(#rust)" stroke-width="3"/>
+
+  <!-- Three "lines of prose" with monospace texture -->
+  <!-- Top line: complete -->
+  <line x1="40" y1="68" x2="200" y2="68" stroke="#cfe8ff" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Middle line: cursor on it (the working line) -->
+  <line x1="40" y1="100" x2="148" y2="100" stroke="#cfe8ff" stroke-width="3" stroke-linecap="round"/>
+  <!-- Block cursor in normal mode -->
+  <rect class="cursor" x="150" y="92" width="14" height="16" fill="#f74c00" rx="1"/>
+  <!-- Trailing portion (lighter — what's after cursor) -->
+  <line x1="166" y1="100" x2="216" y2="100" stroke="#cfe8ff" stroke-width="3" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Wrapped line: long line continues at column 0 next row -->
+  <line x1="40" y1="132" x2="216" y2="132" stroke="#cfe8ff" stroke-width="3" stroke-linecap="round"/>
+  <line x1="40" y1="156" x2="120" y2="156" stroke="#cfe8ff" stroke-width="3" stroke-linecap="round"/>
+  <!-- Soft-wrap glyph: small bent arrow indicator at the wrap point -->
+  <path d="M 222 132 Q 230 132 230 144 Q 230 156 222 156" stroke="#46ff46" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <polyline points="218,152 222,156 226,152" stroke="#46ff46" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Quill nib (writer's tool) overlapping bottom-right -->
+  <g transform="translate(168, 168) rotate(35)">
+    <!-- Nib slit -->
+    <line x1="0" y1="-32" x2="0" y2="0" stroke="#0a0a14" stroke-width="1.2"/>
+    <!-- Nib body — diamond shape -->
+    <polygon points="0,-36 -10,0 0,12 10,0" fill="url(#ink)" stroke="#cfe8ff" stroke-width="1.5"/>
+    <!-- Pen barrel -->
+    <line x1="0" y1="-36" x2="0" y2="-72" stroke="url(#rust)" stroke-width="6" stroke-linecap="round"/>
+    <!-- Ink dot below nib -->
+    <circle cx="0" cy="20" r="4" fill="url(#ink)" opacity="0.7"/>
+  </g>
+
+  <!-- Mode badge: NORMAL bottom-left -->
+  <rect x="38" y="190" width="56" height="20" rx="2" fill="#3a7aff"/>
+  <text x="42" y="205" fill="#ffffff" font-family="monospace" font-size="12" font-weight="bold">NORMAL</text>
+</svg>
