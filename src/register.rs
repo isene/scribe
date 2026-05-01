@@ -11,7 +11,14 @@
 use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum YankKind { Charwise, Linewise }
+pub enum YankKind {
+    Charwise,
+    Linewise,
+    /// Visual-block yank. `text` is `\n`-joined lines, each representing the
+    /// row's column range. Paste lays each row at the same column on
+    /// consecutive buffer lines, NOT inline.
+    Block,
+}
 
 #[derive(Clone)]
 pub struct Yank {

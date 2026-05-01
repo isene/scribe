@@ -171,6 +171,34 @@ impl App {
         self.render_header();
         self.render_main();
         self.render_footer();
+        self.position_cursor();
+    }
+
+    /// Show the host terminal's native cursor at the buffer cursor location
+    /// and pick the shape for the current mode. Glass (and other terminals)
+    /// render the cursor in the user-configured cursor color, so we get
+    /// that for free instead of painting a fake one ourselves.
+    ///
+    /// CSI codes:
+    ///   `\x1b[?25h`     show cursor
+    ///   `\x1b[N q`      shape: 2=block, 4=underline, 6=bar
+    ///   `\x1b[r;cH`     position (1-based)
+    fn position_cursor(&self) {
+        let pane_top = self.main_p.y;
+        let row_in_pane = (self.cur_line.saturating_sub(self.scroll)) as u16;
+        let row = pane_top + row_in_pane;
+        let col = (self.cur_col as u16) + self.main_p.x;
+        let shape = match self.mode {
+            Mode::Insert      => 6,   // bar
+            Mode::VisualBlock => 2,   // block
+            Mode::Visual
+            | Mode::VisualLine => 2,
+            Mode::Normal      => 2,   // block
+            Mode::Command     => 6,   // bar in :cmdline
+        };
+        print!("\x1b[?25h\x1b[{} q\x1b[{};{}H", shape, row, col);
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
     }
 
     fn render_header(&mut self) {
@@ -236,21 +264,12 @@ impl App {
                         }
                         _ => false,
                     };
-                    let is_cursor = line_idx == self.cur_line && col == self.cur_col;
-                    if is_cursor {
-                        out.push_str(&style::bg(glyph, 240));
-                    } else if in_sel {
-                        out.push_str(&style::bg(glyph, 53));   // dark magenta-ish
+                    if in_sel {
+                        out.push_str(&style::bg(glyph, 238));  // subtle gray
                     } else {
                         out.push_str(glyph);
                     }
                     col = ce;
-                }
-                // Cursor at end-of-line (Insert mode position past last char).
-                if line_idx == self.cur_line && self.cur_col >= line.len() {
-                    out.push_str(&style::bg(" ", 240));
-                } else if line_idx == self.cur_line && line.is_empty() {
-                    out.push_str(&style::bg(" ", 240));
                 }
                 // VisualLine extends selection past line end visually.
                 if sel_kind == Some(Mode::VisualLine) {
@@ -259,7 +278,7 @@ impl App {
                     if line_idx >= l1 && line_idx <= l2 {
                         let pad_w = (self.cols as usize).saturating_sub(line.chars().count());
                         if pad_w > 0 {
-                            out.push_str(&style::bg(&" ".repeat(pad_w), 53));
+                            out.push_str(&style::bg(&" ".repeat(pad_w), 238));
                         }
                     }
                 }
@@ -557,6 +576,15 @@ impl App {
             }
         }
 
+        // Find-on-line: f/F/t/T expect a follow-up char. Set awaiting_char
+        // BEFORE parse_motion so the pending state survives and the next
+        // key triggers the find. (Previously this was inside parse_motion
+        // which returned None and let pending.clear() wipe the await flag.)
+        if matches!(key, "f" | "F" | "t" | "T") {
+            self.pending.awaiting_char = Some(key.chars().next().unwrap());
+            return false;
+        }
+
         // Dot-repeat.
         if key == "." && self.pending.operator.is_none() {
             self.repeat_last_change();
@@ -703,10 +731,6 @@ impl App {
                     self.buf.line_count().saturating_sub(1)
                 };
                 Some(self.buf.line_byte_offset(target_line))
-            }
-            "f" | "F" | "t" | "T" => {
-                self.pending.awaiting_char = Some(key.chars().next().unwrap());
-                None  // not really a motion result; the second key triggers action
             }
             "n" => self.search_next(false),
             "N" => self.search_next(true),
@@ -1015,15 +1039,13 @@ impl App {
         let l2 = self.visual_anchor_line.max(self.cur_line);
         let c1 = self.visual_anchor_col.min(self.cur_col);
         let c2 = self.visual_anchor_col.max(self.cur_col);
-        // Walk lines from bottom up so byte offsets earlier remain valid.
+        // Walk lines from bottom up so earlier byte offsets remain valid.
         let mut yanked: Vec<String> = Vec::new();
         for line in (l1..=l2).rev() {
             let line_text = self.buf.line(line);
             if c1 >= line_text.len() { yanked.push(String::new()); continue; }
             let start_col = c1;
             let mut end_col = (c2 + 1).min(line_text.len());
-            // Snap to char boundaries.
-            while start_col < line_text.len() && !line_text.is_char_boundary(start_col) {}
             while end_col < line_text.len() && !line_text.is_char_boundary(end_col) { end_col += 1; }
             let chunk = line_text[start_col..end_col].to_string();
             yanked.push(chunk.clone());
@@ -1034,9 +1056,11 @@ impl App {
         }
         yanked.reverse();
         let combined = yanked.join("\n");
+        // Block-aware register: paste later overlays at column instead of
+        // splicing newlines inline.
         match op {
-            'y' => self.regs.yank(self.pending.register, combined, YankKind::Charwise),
-            _   => self.regs.cut(self.pending.register, combined, YankKind::Charwise),
+            'y' => self.regs.yank(self.pending.register, combined, YankKind::Block),
+            _   => self.regs.cut(self.pending.register, combined, YankKind::Block),
         }
         self.cur_line = l1;
         self.cur_col = c1;
@@ -1169,9 +1193,48 @@ impl App {
             Some(y) => y.clone(),
             None    => { self.set_status(" register empty", 244); return; }
         };
+        // Block paste: lay each line of the yank at the cursor column on
+        // consecutive buffer lines, padding short lines with spaces. Append
+        // a new buffer line if we run out.
+        if yank.kind == YankKind::Block {
+            let lines: Vec<&str> = yank.text.split('\n').collect();
+            let target_col = if after { self.cur_col + 1 } else { self.cur_col };
+            for (i, chunk) in lines.iter().enumerate() {
+                // Repeat per count.
+                let mut chunk_n = String::new();
+                for _ in 0..count.max(1) { chunk_n.push_str(chunk); }
+                let bl = self.cur_line + i;
+                if bl >= self.buf.line_count() {
+                    let end = self.buf.rope.len_bytes();
+                    let mut payload = String::new();
+                    if !self.buf.rope.to_string().ends_with('\n') { payload.push('\n'); }
+                    for _ in 0..target_col { payload.push(' '); }
+                    payload.push_str(&chunk_n);
+                    self.buf.apply(end, end, &payload);
+                    continue;
+                }
+                let line_text = self.buf.line(bl);
+                let line_off = self.buf.line_byte_offset(bl);
+                if target_col > line_text.len() {
+                    let pad = target_col - line_text.len();
+                    let mut payload = " ".repeat(pad);
+                    payload.push_str(&chunk_n);
+                    let end_byte = line_off + line_text.len();
+                    self.buf.apply(end_byte, end_byte, &payload);
+                } else {
+                    let insert_at = line_off + target_col;
+                    self.buf.apply(insert_at, insert_at, &chunk_n);
+                }
+            }
+            // Cursor lands at the start of the inserted block.
+            self.cur_col = target_col;
+            self.want_col = target_col;
+            return;
+        }
         let mut text = String::new();
         for _ in 0..count.max(1) { text.push_str(&yank.text); }
         match yank.kind {
+            YankKind::Block => unreachable!(), // handled above
             YankKind::Charwise => {
                 let cur = self.cursor_byte();
                 let off = if after && self.cur_col < self.current_line_len() {
