@@ -13,6 +13,7 @@ mod mode;
 mod motion;
 mod register;
 mod search;
+mod textobj;
 
 use buffer::Buffer;
 use crust::{Crust, Input, Pane};
@@ -37,9 +38,12 @@ fn main() {
     loop {
         let Some(key) = Input::getchr(None) else { continue };
         let quit = match app.mode {
-            Mode::Normal  => app.handle_normal(&key),
-            Mode::Insert  => app.handle_insert(&key),
-            Mode::Command => app.handle_command(&key),
+            Mode::Normal      => app.handle_normal(&key),
+            Mode::Insert      => app.handle_insert(&key),
+            Mode::Command     => app.handle_command(&key),
+            Mode::Visual      |
+            Mode::VisualLine  |
+            Mode::VisualBlock => app.handle_visual(&key),
         };
         if quit { break; }
         app.render_all();
@@ -52,20 +56,42 @@ fn main() {
 /// Pending Normal-mode command being assembled key-by-key.
 #[derive(Default, Clone)]
 struct Pending {
-    /// Count typed BEFORE the operator (or before a standalone motion).
     count1: Option<usize>,
-    /// Count typed AFTER the operator (`d3w` → count2=3).
     count2: Option<usize>,
-    /// Active operator awaiting a motion / text-object.
     operator: Option<char>,
-    /// Active register selection (`"a` → 'a').
     register: Option<char>,
-    /// Awaiting a single char for `r`, `f`, `F`, `t`, `T`.
-    awaiting_char: Option<char>,   // the operator char itself (e.g. 'r')
-    /// `g` was pressed; awaiting second char (`gg`, `gE`, etc.).
+    awaiting_char: Option<char>,
     g_prefix: bool,
-    /// `"` was pressed; awaiting register name.
     register_prefix: bool,
+    /// After operator + `i` or `a`, awaiting the text-object selector char.
+    text_object: Option<char>, // 'i' or 'a'
+}
+
+/// Captured "last change" for the `.` dot-repeat command. Replaying replays
+/// the operator + motion + (for change ops) the inserted text in one go.
+#[derive(Clone)]
+enum LastChange {
+    Op {
+        op: char,
+        motion: ChangeMotion,
+        count: usize,
+        register: Option<char>,
+        /// Text inserted while in Insert mode after `c`-style ops. Empty for d/y.
+        insert_text: String,
+    },
+    Replace { c: char, count: usize },
+    Insert { text: String, append: bool },
+    Paste { after: bool, count: usize, register: Option<char> },
+    SimpleAction { key: String, count: usize, register: Option<char> },
+}
+
+/// Motion descriptor stable enough to replay verbatim regardless of cursor
+/// position.
+#[derive(Clone)]
+enum ChangeMotion {
+    Key(String),                              // simple key like "w", "$", "gg" (encoded), etc.
+    TextObject { kind: char, target: char },  // ('i', 'w'), ('a', '"'), etc.
+    Linewise { extra: usize },                // dd / yy / cc — `extra` lines below cursor
 }
 
 impl Pending {
@@ -95,6 +121,17 @@ struct App {
     pending: Pending,
     regs: Registers,
     search: SearchState,
+    /// Anchor byte offset for Visual mode selection (Visual / VisualLine).
+    /// In VisualBlock the anchor is (line, col).
+    visual_anchor: usize,
+    visual_anchor_line: usize,
+    visual_anchor_col: usize,
+    /// Last completed change, for `.` repeat.
+    last_change: Option<LastChange>,
+    /// While true we're capturing keystrokes typed in Insert mode after a
+    /// change-op for dot-repeat replay.
+    capturing_insert: bool,
+    captured_insert: String,
 }
 
 impl App {
@@ -120,6 +157,12 @@ impl App {
             pending: Pending::default(),
             regs: Registers::new(),
             search: SearchState::new(),
+            visual_anchor: 0,
+            visual_anchor_line: 0,
+            visual_anchor_col: 0,
+            last_change: None,
+            capturing_insert: false,
+            captured_insert: String::new(),
         }
     }
 
@@ -142,35 +185,83 @@ impl App {
 
     fn render_main(&mut self) {
         let pane_h = self.main_p.h as usize;
-        // Keep cursor in view.
         if self.cur_line < self.scroll { self.scroll = self.cur_line; }
         if self.cur_line >= self.scroll + pane_h { self.scroll = self.cur_line + 1 - pane_h; }
+
+        // Compute selection range for visual modes.
+        let (sel_start, sel_end, sel_kind) = if self.mode.is_visual() {
+            let cur = self.cursor_byte();
+            let (lo, hi) = if cur < self.visual_anchor { (cur, self.visual_anchor) } else { (self.visual_anchor, cur) };
+            // Charwise: include cursor cell.
+            let s = self.buf.rope.to_string();
+            let mut hi2 = hi;
+            if hi2 < s.len() {
+                let mut p = hi2 + 1;
+                while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                hi2 = p;
+            }
+            (Some(lo), Some(hi2), Some(self.mode))
+        } else {
+            (None, None, None)
+        };
 
         let mut out = String::new();
         for i in 0..pane_h {
             let line_idx = self.scroll + i;
             if line_idx < self.buf.line_count() {
                 let line = self.buf.line(line_idx);
-                if line_idx == self.cur_line {
-                    // Highlight cursor cell. Compute byte → char cursor for
-                    // styling. Display cursor as inverse on the byte at
-                    // cur_col, or as a trailing block at line end.
-                    let col = self.cur_col.min(line.len());
-                    let (before, rest) = line.split_at(col);
-                    let (cell, after) = if rest.is_empty() {
-                        ("", "")
-                    } else {
-                        // Find next char boundary.
-                        let mut e = 1;
-                        while e < rest.len() && !rest.is_char_boundary(e) { e += 1; }
-                        (&rest[..e], &rest[e..])
+                let line_byte_off = self.buf.line_byte_offset(line_idx);
+                // Build the line char-by-char so we can apply selection bg
+                // and cursor-cell highlight in one pass.
+                let mut col = 0usize;
+                while col < line.len() {
+                    if !line.is_char_boundary(col) { col += 1; continue; }
+                    let mut ce = col + 1;
+                    while ce < line.len() && !line.is_char_boundary(ce) { ce += 1; }
+                    let glyph = &line[col..ce];
+                    let abs = line_byte_off + col;
+                    let in_sel = match (sel_start, sel_end, sel_kind) {
+                        (Some(s), Some(e), Some(Mode::Visual)) => abs >= s && abs < e,
+                        (_, _, Some(Mode::VisualLine)) => {
+                            let l1 = self.visual_anchor_line.min(self.cur_line);
+                            let l2 = self.visual_anchor_line.max(self.cur_line);
+                            line_idx >= l1 && line_idx <= l2
+                        }
+                        (_, _, Some(Mode::VisualBlock)) => {
+                            let l1 = self.visual_anchor_line.min(self.cur_line);
+                            let l2 = self.visual_anchor_line.max(self.cur_line);
+                            let c1 = self.visual_anchor_col.min(self.cur_col);
+                            let c2 = self.visual_anchor_col.max(self.cur_col);
+                            line_idx >= l1 && line_idx <= l2 && col >= c1 && col <= c2
+                        }
+                        _ => false,
                     };
-                    let cur_glyph = if cell.is_empty() { " " } else { cell };
-                    out.push_str(before);
-                    out.push_str(&style::bg(cur_glyph, 240));
-                    out.push_str(after);
-                } else {
-                    out.push_str(&line);
+                    let is_cursor = line_idx == self.cur_line && col == self.cur_col;
+                    if is_cursor {
+                        out.push_str(&style::bg(glyph, 240));
+                    } else if in_sel {
+                        out.push_str(&style::bg(glyph, 53));   // dark magenta-ish
+                    } else {
+                        out.push_str(glyph);
+                    }
+                    col = ce;
+                }
+                // Cursor at end-of-line (Insert mode position past last char).
+                if line_idx == self.cur_line && self.cur_col >= line.len() {
+                    out.push_str(&style::bg(" ", 240));
+                } else if line_idx == self.cur_line && line.is_empty() {
+                    out.push_str(&style::bg(" ", 240));
+                }
+                // VisualLine extends selection past line end visually.
+                if sel_kind == Some(Mode::VisualLine) {
+                    let l1 = self.visual_anchor_line.min(self.cur_line);
+                    let l2 = self.visual_anchor_line.max(self.cur_line);
+                    if line_idx >= l1 && line_idx <= l2 {
+                        let pad_w = (self.cols as usize).saturating_sub(line.chars().count());
+                        if pad_w > 0 {
+                            out.push_str(&style::bg(&" ".repeat(pad_w), 53));
+                        }
+                    }
                 }
             } else {
                 out.push_str(&style::fg("~", 244));
@@ -313,6 +404,47 @@ impl App {
     fn handle_normal(&mut self, key: &str) -> bool {
         self.status = None;
 
+        // Text-object resolution: after operator + 'i' or 'a', the next key
+        // selects the object (w / W / " / ' / ( / [ / { / p / b / B).
+        if let Some(kind) = self.pending.text_object.take() {
+            let target = match key.chars().next() { Some(c) => c, None => { self.pending.clear(); return false; } };
+            let cur = self.cursor_byte();
+            let range_opt: Option<(usize, usize)> = match (kind, target) {
+                ('i', 'w') => textobj::inner_word(&self.buf, cur),
+                ('a', 'w') | ('a', 'W') => textobj::around_word(&self.buf, cur),
+                ('i', 'W') => textobj::inner_word(&self.buf, cur),
+                ('i', '"') => textobj::inner_quote(&self.buf, cur, '"'),
+                ('a', '"') => textobj::around_quote(&self.buf, cur, '"'),
+                ('i', '\'') => textobj::inner_quote(&self.buf, cur, '\''),
+                ('a', '\'') => textobj::around_quote(&self.buf, cur, '\''),
+                ('i', '`') => textobj::inner_quote(&self.buf, cur, '`'),
+                ('a', '`') => textobj::around_quote(&self.buf, cur, '`'),
+                ('i', '(') | ('i', ')') | ('i', 'b') => textobj::inner_pair(&self.buf, cur, '(', ')'),
+                ('a', '(') | ('a', ')') | ('a', 'b') => textobj::around_pair(&self.buf, cur, '(', ')'),
+                ('i', '[') | ('i', ']') => textobj::inner_pair(&self.buf, cur, '[', ']'),
+                ('a', '[') | ('a', ']') => textobj::around_pair(&self.buf, cur, '[', ']'),
+                ('i', '{') | ('i', '}') | ('i', 'B') => textobj::inner_pair(&self.buf, cur, '{', '}'),
+                ('a', '{') | ('a', '}') | ('a', 'B') => textobj::around_pair(&self.buf, cur, '{', '}'),
+                ('i', '<') | ('i', '>') => textobj::inner_pair(&self.buf, cur, '<', '>'),
+                ('a', '<') | ('a', '>') => textobj::around_pair(&self.buf, cur, '<', '>'),
+                ('i', 'p') => textobj::inner_paragraph(&self.buf, cur),
+                ('a', 'p') => textobj::around_paragraph(&self.buf, cur),
+                _ => None,
+            };
+            if let (Some((start, end)), Some(opc)) = (range_opt, self.pending.operator) {
+                self.execute_op_charwise(opc, start, end);
+                self.last_change = Some(LastChange::Op {
+                    op: opc,
+                    motion: ChangeMotion::TextObject { kind, target },
+                    count: 1,
+                    register: self.pending.register,
+                    insert_text: String::new(),
+                });
+            }
+            self.pending.clear();
+            return false;
+        }
+
         // Awaiting a single character (for r, f, F, t, T)?
         if let Some(op) = self.pending.awaiting_char {
             self.pending.awaiting_char = None;
@@ -391,11 +523,44 @@ impl App {
             let opc = key.chars().next().unwrap();
             if self.pending.operator == Some(opc) {
                 let n = self.pending.count1.unwrap_or(1);
-                self.execute_op_linewise(self.cur_line, n.saturating_sub(1));
+                let extra = n.saturating_sub(1);
+                let cap_count = self.pending.count1.unwrap_or(1);
+                let cap_reg = self.pending.register;
+                self.execute_op_linewise(self.cur_line, extra);
+                self.last_change = Some(LastChange::Op {
+                    op: opc,
+                    motion: ChangeMotion::Linewise { extra },
+                    count: cap_count,
+                    register: cap_reg,
+                    insert_text: String::new(),
+                });
                 self.pending.clear();
                 return false;
             }
             self.pending.operator = Some(opc);
+            return false;
+        }
+
+        // Text-object trigger: `i` or `a` AFTER an operator selects a TO.
+        if (key == "i" || key == "a") && self.pending.operator.is_some() {
+            self.pending.text_object = Some(key.chars().next().unwrap());
+            return false;
+        }
+
+        // Visual mode entry.
+        if self.pending.operator.is_none() {
+            match key {
+                "v"   => { self.enter_visual(Mode::Visual); return false; }
+                "V"   => { self.enter_visual(Mode::VisualLine); return false; }
+                "C-V" => { self.enter_visual(Mode::VisualBlock); return false; }
+                _ => {}
+            }
+        }
+
+        // Dot-repeat.
+        if key == "." && self.pending.operator.is_none() {
+            self.repeat_last_change();
+            self.pending.clear();
             return false;
         }
 
@@ -414,7 +579,15 @@ impl App {
             if let Some(opc) = op {
                 let from = self.cursor_byte();
                 let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
+                let cap_reg = self.pending.register;
                 self.execute_op_charwise(opc, start, end);
+                self.last_change = Some(LastChange::Op {
+                    op: opc,
+                    motion: ChangeMotion::Key(key.to_string()),
+                    count,
+                    register: cap_reg,
+                    insert_text: String::new(),
+                });
             } else {
                 self.cursor_to_byte(target_byte);
             }
@@ -650,8 +823,14 @@ impl App {
             "r" => self.pending.awaiting_char = Some('r'),
 
             // Paste.
-            "p" => self.do_paste(true, count),
-            "P" => self.do_paste(false, count),
+            "p" => {
+                self.do_paste(true, count);
+                self.last_change = Some(LastChange::Paste { after: true, count, register: self.pending.register });
+            }
+            "P" => {
+                self.do_paste(false, count);
+                self.last_change = Some(LastChange::Paste { after: false, count, register: self.pending.register });
+            }
 
             // Search.
             "/" => self.search_prompt(Direction::Forward),
@@ -691,6 +870,178 @@ impl App {
 
     fn enter_insert(&mut self) {
         self.mode = Mode::Insert;
+        self.capturing_insert = true;
+        self.captured_insert.clear();
+    }
+
+    // ── Visual mode ────────────────────────────────────────────────────
+    fn enter_visual(&mut self, kind: Mode) {
+        self.mode = kind;
+        self.visual_anchor = self.cursor_byte();
+        self.visual_anchor_line = self.cur_line;
+        self.visual_anchor_col = self.cur_col;
+    }
+
+    fn visual_range(&self) -> (usize, usize) {
+        let cur = self.cursor_byte();
+        let (lo, hi) = if cur < self.visual_anchor { (cur, self.visual_anchor) } else { (self.visual_anchor, cur) };
+        // Charwise: include cursor cell.
+        let s = self.buf.rope.to_string();
+        let mut hi = hi;
+        if hi < s.len() {
+            let mut p = hi + 1;
+            while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+            hi = p;
+        }
+        (lo, hi)
+    }
+
+    fn visual_line_range(&self) -> (usize, usize) {
+        let l1 = self.visual_anchor_line.min(self.cur_line);
+        let l2 = self.visual_anchor_line.max(self.cur_line);
+        let start = self.buf.line_byte_offset(l1);
+        let end = if l2 + 1 >= self.buf.line_count() {
+            self.buf.rope.len_bytes()
+        } else {
+            self.buf.line_byte_offset(l2 + 1)
+        };
+        (start, end)
+    }
+
+    fn handle_visual(&mut self, key: &str) -> bool {
+        // Esc / v(in same kind) returns to Normal.
+        match (self.mode, key) {
+            (_, "ESC") | (_, "C-[")
+                | (Mode::Visual, "v")
+                | (Mode::VisualLine, "V")
+                | (Mode::VisualBlock, "C-V") => {
+                self.mode = Mode::Normal;
+                self.pending.clear();
+                return false;
+            }
+            (Mode::Visual, "V") => { self.mode = Mode::VisualLine; return false; }
+            (Mode::VisualLine, "v") => { self.mode = Mode::Visual; return false; }
+            _ => {}
+        }
+
+        // Operator (d/c/y) or shortcut (x/X/D/C/Y/~) acts on the selection.
+        match key {
+            "d" | "x" | "X" | "D" => {
+                self.apply_visual_op('d');
+                return false;
+            }
+            "c" | "C" | "s" => {
+                self.apply_visual_op('c');
+                return false;
+            }
+            "y" | "Y" => {
+                self.apply_visual_op('y');
+                return false;
+            }
+            "~" => {
+                self.apply_visual_case_toggle();
+                return false;
+            }
+            "p" | "P" => {
+                self.apply_visual_op('d');
+                self.do_paste(key == "p", 1);
+                return false;
+            }
+            ":" => { self.cmdline.clear(); self.mode = Mode::Command; return false; }
+            "\"" => { self.pending.register_prefix = true; return false; }
+            _ => {}
+        }
+        if self.pending.register_prefix {
+            self.pending.register_prefix = false;
+            if let Some(c) = key.chars().next() {
+                if c.is_ascii_alphanumeric() || c == '+' || c == '*' || c == '"' {
+                    self.pending.register = Some(c);
+                }
+            }
+            return false;
+        }
+
+        // Otherwise treat as motion to extend selection.
+        if let Some(target) = self.parse_motion(key, self.pending.count()) {
+            self.cursor_to_byte(target);
+        }
+        self.pending.clear();
+        false
+    }
+
+    fn apply_visual_op(&mut self, op: char) {
+        let was_visual = self.mode;
+        self.pending.operator = Some(op);
+        match was_visual {
+            Mode::Visual => {
+                let (s, e) = self.visual_range();
+                self.execute_op_charwise(op, s, e);
+            }
+            Mode::VisualLine => {
+                let l1 = self.visual_anchor_line.min(self.cur_line);
+                let l2 = self.visual_anchor_line.max(self.cur_line);
+                self.cur_line = l1;
+                self.execute_op_linewise(l1, l2 - l1);
+            }
+            Mode::VisualBlock => {
+                self.apply_visual_block_op(op);
+            }
+            _ => {}
+        }
+        if op != 'c' { self.mode = Mode::Normal; }
+        self.pending.clear();
+    }
+
+    fn apply_visual_case_toggle(&mut self) {
+        let (s, e) = match self.mode {
+            Mode::Visual => self.visual_range(),
+            Mode::VisualLine => self.visual_line_range(),
+            _ => return,
+        };
+        let text: String = self.buf.rope.byte_slice(s..e).to_string();
+        let toggled: String = text.chars().map(|c| {
+            if c.is_ascii_uppercase() { c.to_ascii_lowercase() }
+            else if c.is_ascii_lowercase() { c.to_ascii_uppercase() }
+            else { c }
+        }).collect();
+        self.buf.apply(s, e, &toggled);
+        self.cursor_to_byte(s);
+        self.mode = Mode::Normal;
+    }
+
+    /// Visual Block (Ctrl-v): apply op to each line at the same column range.
+    fn apply_visual_block_op(&mut self, op: char) {
+        let l1 = self.visual_anchor_line.min(self.cur_line);
+        let l2 = self.visual_anchor_line.max(self.cur_line);
+        let c1 = self.visual_anchor_col.min(self.cur_col);
+        let c2 = self.visual_anchor_col.max(self.cur_col);
+        // Walk lines from bottom up so byte offsets earlier remain valid.
+        let mut yanked: Vec<String> = Vec::new();
+        for line in (l1..=l2).rev() {
+            let line_text = self.buf.line(line);
+            if c1 >= line_text.len() { yanked.push(String::new()); continue; }
+            let start_col = c1;
+            let mut end_col = (c2 + 1).min(line_text.len());
+            // Snap to char boundaries.
+            while start_col < line_text.len() && !line_text.is_char_boundary(start_col) {}
+            while end_col < line_text.len() && !line_text.is_char_boundary(end_col) { end_col += 1; }
+            let chunk = line_text[start_col..end_col].to_string();
+            yanked.push(chunk.clone());
+            if op != 'y' {
+                let line_off = self.buf.line_byte_offset(line);
+                self.buf.apply(line_off + start_col, line_off + end_col, "");
+            }
+        }
+        yanked.reverse();
+        let combined = yanked.join("\n");
+        match op {
+            'y' => self.regs.yank(self.pending.register, combined, YankKind::Charwise),
+            _   => self.regs.cut(self.pending.register, combined, YankKind::Charwise),
+        }
+        self.cur_line = l1;
+        self.cur_col = c1;
+        self.want_col = c1;
+        if op == 'c' { self.enter_insert(); }
     }
 
     // ── Operators ──────────────────────────────────────────────────────
@@ -783,6 +1134,7 @@ impl App {
         while e < line.len() && !line.is_char_boundary(e) { e += 1; }
         let abs_end = self.buf.line_byte_offset(self.cur_line) + e;
         self.buf.apply(off, abs_end, &c.to_string());
+        self.last_change = Some(LastChange::Replace { c, count: 1 });
     }
 
     fn do_find_forward(&mut self, c: char, before: bool) {
@@ -935,6 +1287,21 @@ impl App {
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
                 self.clamp_col_to_line();
+                if self.capturing_insert {
+                    let captured = std::mem::take(&mut self.captured_insert);
+                    self.capturing_insert = false;
+                    // If a `c`-op preceded this insert, splice the text into
+                    // its captured LastChange so dot replays the full change.
+                    if let Some(LastChange::Op { ref mut insert_text, .. }) = self.last_change {
+                        *insert_text = captured.clone();
+                    } else if !captured.is_empty() {
+                        // Pure insert (i / a / o / O / I / A) — record on its own.
+                        self.last_change = Some(LastChange::Insert {
+                            text: captured,
+                            append: false,
+                        });
+                    }
+                }
             }
             // Arrow keys + HOME/END work in Insert mode too. LEFT/RIGHT wrap
             // across line boundaries; UP/DOWN preserve want_col.
@@ -975,15 +1342,16 @@ impl App {
                 self.cur_line += 1;
                 self.cur_col = 0;
                 self.want_col = 0;
+                if self.capturing_insert { self.captured_insert.push('\n'); }
             }
             "TAB" | "\t" => {
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, "\t");
                 self.cur_col += 1;
                 self.want_col = self.cur_col;
+                if self.capturing_insert { self.captured_insert.push('\t'); }
             }
             other => {
-                // Ordinary printable: getchr returns the literal string.
                 if other.chars().count() == 1 {
                     let c = other.chars().next().unwrap();
                     if !c.is_control() {
@@ -991,11 +1359,84 @@ impl App {
                         self.buf.apply(off, off, other);
                         self.cur_col += other.len();
                         self.want_col = self.cur_col;
+                        if self.capturing_insert { self.captured_insert.push_str(other); }
                     }
                 }
             }
         }
         false
+    }
+
+    // ── Dot-repeat replay ──────────────────────────────────────────────
+    fn repeat_last_change(&mut self) {
+        let Some(change) = self.last_change.clone() else { return };
+        match change {
+            LastChange::Op { op, motion, count, register, insert_text } => {
+                self.pending.operator = Some(op);
+                self.pending.register = register;
+                self.pending.count1 = Some(count);
+                match motion {
+                    ChangeMotion::Key(k) => {
+                        if let Some(target_byte) = self.parse_motion(&k, count) {
+                            let from = self.cursor_byte();
+                            let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
+                            self.execute_op_charwise(op, start, end);
+                        }
+                    }
+                    ChangeMotion::TextObject { kind, target } => {
+                        let cur = self.cursor_byte();
+                        let r: Option<(usize, usize)> = match (kind, target) {
+                            ('i', 'w') => textobj::inner_word(&self.buf, cur),
+                            ('a', 'w') => textobj::around_word(&self.buf, cur),
+                            ('i', '"') => textobj::inner_quote(&self.buf, cur, '"'),
+                            ('a', '"') => textobj::around_quote(&self.buf, cur, '"'),
+                            ('i', '\'') => textobj::inner_quote(&self.buf, cur, '\''),
+                            ('a', '\'') => textobj::around_quote(&self.buf, cur, '\''),
+                            ('i', '(') | ('i', ')') | ('i', 'b') => textobj::inner_pair(&self.buf, cur, '(', ')'),
+                            ('a', '(') | ('a', ')') | ('a', 'b') => textobj::around_pair(&self.buf, cur, '(', ')'),
+                            ('i', '[') | ('i', ']') => textobj::inner_pair(&self.buf, cur, '[', ']'),
+                            ('a', '[') | ('a', ']') => textobj::around_pair(&self.buf, cur, '[', ']'),
+                            ('i', '{') | ('i', '}') | ('i', 'B') => textobj::inner_pair(&self.buf, cur, '{', '}'),
+                            ('a', '{') | ('a', '}') | ('a', 'B') => textobj::around_pair(&self.buf, cur, '{', '}'),
+                            ('i', 'p') => textobj::inner_paragraph(&self.buf, cur),
+                            ('a', 'p') => textobj::around_paragraph(&self.buf, cur),
+                            _ => None,
+                        };
+                        if let Some((s, e)) = r { self.execute_op_charwise(op, s, e); }
+                    }
+                    ChangeMotion::Linewise { extra } => {
+                        self.execute_op_linewise(self.cur_line, extra);
+                    }
+                }
+                // Replay inserted text for `c` ops without entering Insert
+                // interactively — splice it directly.
+                if op == 'c' && !insert_text.is_empty() {
+                    let off = self.cursor_byte();
+                    self.buf.apply(off, off, &insert_text);
+                    self.cursor_to_byte(off + insert_text.len());
+                }
+                if op == 'c' {
+                    // Stay in Normal; we already applied the captured text.
+                    self.mode = Mode::Normal;
+                }
+                self.pending.clear();
+            }
+            LastChange::Insert { text, .. } => {
+                let off = self.cursor_byte();
+                self.buf.apply(off, off, &text);
+                self.cursor_to_byte(off + text.len());
+            }
+            LastChange::Replace { c, count } => {
+                for _ in 0..count { self.do_replace_char(c); self.move_right_wrap(); }
+            }
+            LastChange::Paste { after, count, register } => {
+                let saved = self.pending.register;
+                self.pending.register = register;
+                self.do_paste(after, count);
+                self.pending.register = saved;
+            }
+            LastChange::SimpleAction { .. } => {}
+        }
     }
 
     // ── Command mode ───────────────────────────────────────────────────
