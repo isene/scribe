@@ -37,6 +37,11 @@ fn main() {
 
     loop {
         let Some(key) = Input::getchr(None) else { continue };
+        if key == "RESIZE" {
+            app.handle_resize();
+            app.render_all();
+            continue;
+        }
         let quit = match app.mode {
             Mode::Normal      => app.handle_normal(&key),
             Mode::Insert      => app.handle_insert(&key),
@@ -911,6 +916,29 @@ impl App {
         self.mode = Mode::Insert;
         self.capturing_insert = true;
         self.captured_insert.clear();
+    }
+
+    /// Re-query terminal dimensions and resize the three panes. Triggered by
+    /// the `RESIZE` event from crust (SIGWINCH wrapper). Without this scribe
+    /// keeps drawing to the old pane width and the host terminal physically
+    /// truncates lines at the new edge → looks like wrap is broken.
+    fn handle_resize(&mut self) {
+        let (cols, rows) = Crust::terminal_size();
+        self.cols = cols;
+        self.rows = rows;
+        // Wipe screen so the previous frame's bg/border doesn't ghost.
+        Crust::clear_screen();
+        // Re-create panes at the new size. Cheaper than mutating each field
+        // and ensures all internal pane state (prev_frame, scroll, …) is
+        // reset for the new geometry.
+        self.header = Pane::new(1, 1, cols, 1, 255, 236);
+        self.header.wrap = false; self.header.scroll = false;
+        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 252, 0);
+        self.main_p.wrap = true;
+        self.footer = Pane::new(1, rows, cols, 1, 255, 236);
+        self.footer.wrap = false; self.footer.scroll = false;
+        // Keep cursor in view after resize.
+        self.scroll = self.cur_line.saturating_sub((self.main_p.h as usize) / 2);
     }
 
     // ── Visual mode ────────────────────────────────────────────────────
