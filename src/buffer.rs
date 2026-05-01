@@ -11,6 +11,21 @@
 use ropey::Rope;
 use std::path::PathBuf;
 
+/// Pick a file kind from path / content. `.eml` extension OR a kastrup
+/// compose tempfile path (`/tmp/kastrup_compose_*`) OR a content first line
+/// looking like an RFC 822 header → Email.
+fn detect_kind(path: &PathBuf, content: &str) -> FileKind {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".eml") || name.starts_with("kastrup_compose_") || name.starts_with("kastrup_body_") {
+        return FileKind::Email;
+    }
+    let first = content.lines().find(|l| !l.is_empty()).unwrap_or("");
+    if first.starts_with("From:") || first.starts_with("To:") || first.starts_with("Subject:") {
+        return FileKind::Email;
+    }
+    FileKind::Plain
+}
+
 /// A single edit: replace `range` bytes with `replacement`.
 #[derive(Clone, Debug)]
 pub struct Edit {
@@ -31,10 +46,20 @@ struct UndoNode {
     children: Vec<usize>,
 }
 
+/// Detected file kind. Used by the renderer to apply per-syntax styling.
+/// Phase 3 will replace this with full syntect; for now it covers the
+/// kastrup-compose case (RFC 822 headers + quoted reply levels).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    Plain,
+    Email,
+}
+
 pub struct Buffer {
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    pub kind: FileKind,
     nodes: Vec<UndoNode>,
     head: Option<usize>,
     /// When > 0, `apply()` accumulates edits into `pending_compound` instead
@@ -48,7 +73,7 @@ impl Buffer {
     pub fn empty() -> Self {
         Self {
             rope: Rope::new(),
-            path: None, dirty: false,
+            path: None, dirty: false, kind: FileKind::Plain,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
         }
@@ -56,9 +81,10 @@ impl Buffer {
 
     pub fn from_path(path: PathBuf) -> std::io::Result<Self> {
         let s = std::fs::read_to_string(&path).unwrap_or_default();
+        let kind = detect_kind(&path, &s);
         Ok(Self {
             rope: Rope::from_str(&s),
-            path: Some(path), dirty: false,
+            path: Some(path), dirty: false, kind,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
         })

@@ -15,7 +15,7 @@ mod register;
 mod search;
 mod textobj;
 
-use buffer::Buffer;
+use buffer::{Buffer, FileKind};
 use crust::{Crust, Input, Pane};
 use crust::style;
 use mode::Mode;
@@ -26,13 +26,32 @@ use std::path::PathBuf;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    // CLI: scribe [+N] [path]
+    // `+N` opens the file with the cursor on line N (vim convention; used
+    // by kastrup's compose flow to jump straight to the message body).
     let args: Vec<String> = std::env::args().collect();
-    let path: Option<PathBuf> = args.get(1).map(PathBuf::from);
+    let mut start_line: Option<usize> = None;
+    let mut path: Option<PathBuf> = None;
+    for arg in args.iter().skip(1) {
+        if let Some(rest) = arg.strip_prefix('+') {
+            if let Ok(n) = rest.parse::<usize>() { start_line = Some(n); }
+        } else if path.is_none() {
+            path = Some(PathBuf::from(arg));
+        }
+    }
 
     Crust::init();
     Crust::set_app_identity("Scribe");
 
     let mut app = App::new(path);
+    if let Some(n) = start_line {
+        if n > 0 {
+            let last = app.buf.line_count().saturating_sub(1);
+            app.cur_line = (n - 1).min(last);
+            app.cur_col = 0;
+            app.want_col = 0;
+        }
+    }
     app.render_all();
 
     loop {
@@ -253,14 +272,52 @@ impl App {
             (None, None, None)
         };
 
+        // Email-mode pre-pass: locate the boundary between header block and
+        // body (first blank line). Used by line_color_email() so quote-level
+        // colors only apply in the body, header-key colors only in the
+        // header block.
+        let header_end: Option<usize> = if self.buf.kind == FileKind::Email {
+            (0..self.buf.line_count()).find(|&i| self.buf.line(i).trim().is_empty())
+        } else { None };
+
         let mut out = String::new();
         for i in 0..pane_h {
             let line_idx = self.scroll + i;
             if line_idx < self.buf.line_count() {
                 let line = self.buf.line(line_idx);
                 let line_byte_off = self.buf.line_byte_offset(line_idx);
-                // Build the line char-by-char so we can apply selection bg
-                // and cursor-cell highlight in one pass.
+                // Per-line fg color when email mode says so. None → default.
+                let line_color: Option<u8> = if self.buf.kind == FileKind::Email {
+                    line_color_email(&line, line_idx, header_end)
+                } else { None };
+                // Fast path: when no selection touches this line, we can
+                // emit the whole line in one styled span instead of doing
+                // per-char ANSI emit.
+                let line_in_sel = match (sel_start, sel_end, sel_kind) {
+                    (Some(s), Some(e), Some(Mode::Visual)) => {
+                        let line_end = line_byte_off + line.len();
+                        e > line_byte_off && s < line_end
+                    }
+                    (_, _, Some(Mode::VisualLine)) | (_, _, Some(Mode::VisualBlock)) => {
+                        let l1 = self.visual_anchor_line.min(self.cur_line);
+                        let l2 = self.visual_anchor_line.max(self.cur_line);
+                        line_idx >= l1 && line_idx <= l2
+                    }
+                    _ => false,
+                };
+                if !line_in_sel {
+                    // Plain whole-line emit with optional fg color.
+                    if let Some(c) = line_color {
+                        out.push_str(&style::fg(&line, c));
+                    } else {
+                        out.push_str(&line);
+                    }
+                    if i + 1 < pane_h { out.push('\n'); }
+                    continue;
+                }
+                // Selection touches this line: char-by-char so we can apply
+                // selection bg precisely. (Email-mode fg is dropped on the
+                // selected slice — selection bg is the dominant signal.)
                 let mut col = 0usize;
                 while col < line.len() {
                     if !line.is_char_boundary(col) { col += 1; continue; }
@@ -1612,5 +1669,36 @@ impl App {
                 false
             }
         }
+    }
+}
+
+/// Email mode per-line foreground color. Header block (lines before the
+/// first blank): RFC 822 header lines (`From:`, `To:`, `Subject:`, …)
+/// colored red. Body block: leading `>` count determines quote color so
+/// reply levels are visually nested. Returns None for plain body text.
+fn line_color_email(line: &str, line_idx: usize, header_end: Option<usize>) -> Option<u8> {
+    if let Some(end) = header_end {
+        if line_idx < end {
+            let trimmed = line.trim_start();
+            for key in ["From:", "To:", "Cc:", "Bcc:", "Subject:", "Reply-To:",
+                        "Date:", "Message-ID:", "In-Reply-To:", "References:", "Attach:"] {
+                if trimmed.starts_with(key) { return Some(196); }
+            }
+            return None;
+        }
+    }
+    // Body: count leading `>` (allowing interleaved whitespace).
+    let mut depth = 0usize;
+    for c in line.chars() {
+        if c == '>' { depth += 1; }
+        else if c == ' ' || c == '\t' { /* allowed between markers */ }
+        else { break; }
+    }
+    match depth {
+        0 => None,
+        1 => Some(45),    // bright cyan
+        2 => Some(33),    // blue
+        3 => Some(165),   // magenta
+        _ => Some(245),   // dim gray for level 4+
     }
 }
