@@ -140,7 +140,7 @@ impl App {
         let mut header = Pane::new(1, 1, cols, 1, 255, 236);
         header.wrap = false; header.scroll = false;
         let mut main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 252, 0);
-        main_p.wrap = false;
+        main_p.wrap = true;
         let mut footer = Pane::new(1, rows, cols, 1, 255, 236);
         footer.wrap = false; footer.scroll = false;
 
@@ -184,17 +184,32 @@ impl App {
     ///   `\x1b[N q`      shape: 2=block, 4=underline, 6=bar
     ///   `\x1b[r;cH`     position (1-based)
     fn position_cursor(&self) {
-        let pane_top = self.main_p.y;
-        let row_in_pane = (self.cur_line.saturating_sub(self.scroll)) as u16;
-        let row = pane_top + row_in_pane;
-        let col = (self.cur_col as u16) + self.main_p.x;
+        let pane_x = self.main_p.x;
+        let pane_y = self.main_p.y;
+        let pane_w = self.main_p.w as usize;
+
+        // Walk through each visible logical line from scroll up to (and
+        // including) cur_line, summing visual rows. Soft-wrap rows for
+        // pre-cursor lines = ⌈line_w / pane_w⌉ (≥ 1). For cur_line the
+        // cursor sits on the row containing cur_col display position.
+        let mut visual_row: usize = 0;
+        for ln in self.scroll..self.cur_line {
+            if ln >= self.buf.line_count() { break; }
+            let w = self.buf.line(ln).chars().count().max(1);
+            visual_row += ((w - 1) / pane_w) + 1;
+        }
+        let cur_disp_col = self.buf.line(self.cur_line)[..self.cur_col.min(self.current_line_len())]
+            .chars().count();
+        let row_in_line = cur_disp_col / pane_w;
+        let col_in_row = cur_disp_col % pane_w;
+        visual_row += row_in_line;
+
+        let row = pane_y + visual_row as u16;
+        let col = pane_x + col_in_row as u16;
+
         let shape = match self.mode {
-            Mode::Insert      => 6,   // bar
-            Mode::VisualBlock => 2,   // block
-            Mode::Visual
-            | Mode::VisualLine => 2,
-            Mode::Normal      => 2,   // block
-            Mode::Command     => 6,   // bar in :cmdline
+            Mode::Insert | Mode::Command => 6,
+            _ => 2,
         };
         print!("\x1b[?25h\x1b[{} q\x1b[{};{}H", shape, row, col);
         use std::io::Write as _;
