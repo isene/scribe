@@ -10,11 +10,16 @@
 
 mod buffer;
 mod mode;
+mod motion;
+mod register;
+mod search;
 
 use buffer::Buffer;
 use crust::{Crust, Input, Pane};
 use crust::style;
 use mode::Mode;
+use register::{Registers, YankKind};
+use search::{Direction, SearchState};
 use std::path::PathBuf;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -44,27 +49,52 @@ fn main() {
     Crust::clear_screen();
 }
 
+/// Pending Normal-mode command being assembled key-by-key.
+#[derive(Default, Clone)]
+struct Pending {
+    /// Count typed BEFORE the operator (or before a standalone motion).
+    count1: Option<usize>,
+    /// Count typed AFTER the operator (`d3w` → count2=3).
+    count2: Option<usize>,
+    /// Active operator awaiting a motion / text-object.
+    operator: Option<char>,
+    /// Active register selection (`"a` → 'a').
+    register: Option<char>,
+    /// Awaiting a single char for `r`, `f`, `F`, `t`, `T`.
+    awaiting_char: Option<char>,   // the operator char itself (e.g. 'r')
+    /// `g` was pressed; awaiting second char (`gg`, `gE`, etc.).
+    g_prefix: bool,
+    /// `"` was pressed; awaiting register name.
+    register_prefix: bool,
+}
+
+impl Pending {
+    fn count(&self) -> usize {
+        let c1 = self.count1.unwrap_or(1);
+        let c2 = self.count2.unwrap_or(1);
+        (c1 * c2).max(1)
+    }
+    fn clear(&mut self) { *self = Pending::default(); }
+}
+
 struct App {
     buf: Buffer,
     mode: Mode,
     /// Cursor as (line, col) — col is byte offset within the line, NOT char.
-    /// Rendering converts to display column.
     cur_line: usize,
     cur_col: usize,
-    /// Sticky col for vertical motions: when moving j/k across short lines,
-    /// remember the column we *want* and snap back when lines are wide enough.
     want_col: usize,
-    /// Top-of-pane line index (vertical scroll).
     scroll: usize,
-    /// `:` command buffer.
     cmdline: String,
-    /// Status line message (transient; cleared on next key).
     status: Option<(String, u8)>,
     cols: u16,
     rows: u16,
     header: Pane,
     main_p: Pane,
     footer: Pane,
+    pending: Pending,
+    regs: Registers,
+    search: SearchState,
 }
 
 impl App {
@@ -87,6 +117,9 @@ impl App {
             cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
             cmdline: String::new(), status: None,
             cols, rows, header, main_p, footer,
+            pending: Pending::default(),
+            regs: Registers::new(),
+            search: SearchState::new(),
         }
     }
 
@@ -276,31 +309,243 @@ impl App {
         }
     }
 
-    // ── Normal mode ────────────────────────────────────────────────────
+    // ── Normal mode (pending state machine) ────────────────────────────
     fn handle_normal(&mut self, key: &str) -> bool {
         self.status = None;
-        match key {
-            // Motion — h/l and arrows wrap across line boundaries (vim's
-            // whichwrap=h,l,<,>,[,] convention).
-            "h" | "LEFT"  => self.move_left_wrap(),
-            "l" | "RIGHT" => self.move_right_wrap(),
-            "j" | "DOWN"  => self.move_down(),
-            "k" | "UP"    => self.move_up(),
-            "0" | "HOME" => { self.cur_col = 0; self.want_col = 0; }
-            "$" | "END"  => {
-                self.cur_col = self.col_cap();
-                self.want_col = self.cur_col;
+
+        // Awaiting a single character (for r, f, F, t, T)?
+        if let Some(op) = self.pending.awaiting_char {
+            self.pending.awaiting_char = None;
+            if key == "ESC" { self.pending.clear(); return false; }
+            let c = match key.chars().next() {
+                Some(ch) if !ch.is_control() => ch,
+                _ => { self.pending.clear(); return false; }
+            };
+            match op {
+                'r' => self.do_replace_char(c),
+                'f' => self.do_find_forward(c, false),
+                'F' => self.do_find_backward(c, false),
+                't' => self.do_find_forward(c, true),
+                'T' => self.do_find_backward(c, true),
+                _ => {}
             }
-            "g" => {
-                if let Some(k2) = Input::getchr(Some(20)) {
-                    if k2 == "g" { self.cur_line = 0; self.cur_col = 0; self.want_col = 0; }
+            self.pending.clear();
+            return false;
+        }
+
+        // Awaiting register name (after `"`)?
+        if self.pending.register_prefix {
+            self.pending.register_prefix = false;
+            if let Some(c) = key.chars().next() {
+                if c.is_ascii_alphanumeric() || c == '+' || c == '*' || c == '"' {
+                    self.pending.register = Some(c);
+                    return false;
                 }
             }
-            "G" => {
-                self.cur_line = self.buf.line_count().saturating_sub(1);
-                self.cur_col = 0;
-                self.want_col = 0;
+            self.pending.clear();
+            return false;
+        }
+
+        // ESC anywhere clears pending state.
+        if key == "ESC" { self.pending.clear(); return false; }
+
+        // Digit prefix (counts). '0' counts only when count is already in
+        // progress; otherwise it's a motion to line-start.
+        if let Some(d) = key.chars().next().and_then(|c| c.to_digit(10).map(|x| x as usize)) {
+            let count_in_progress = if self.pending.operator.is_none() {
+                self.pending.count1.is_some()
+            } else {
+                self.pending.count2.is_some()
+            };
+            if d != 0 || count_in_progress {
+                if self.pending.operator.is_none() {
+                    self.pending.count1 = Some(self.pending.count1.unwrap_or(0) * 10 + d);
+                } else {
+                    self.pending.count2 = Some(self.pending.count2.unwrap_or(0) * 10 + d);
+                }
+                return false;
             }
+        }
+
+        // `g` prefix.
+        if self.pending.g_prefix {
+            self.pending.g_prefix = false;
+            match key {
+                "g" => {
+                    let target = 0;
+                    if self.pending.operator.is_some() {
+                        self.execute_op_linewise(self.cur_line, 0);
+                    } else {
+                        self.cursor_to_byte(target);
+                    }
+                }
+                _ => {}
+            }
+            self.pending.clear();
+            return false;
+        }
+        if key == "g" { self.pending.g_prefix = true; return false; }
+
+        // Operator handling: `d`, `c`, `y` — doubled = linewise on count1 lines.
+        if matches!(key, "d" | "c" | "y") {
+            let opc = key.chars().next().unwrap();
+            if self.pending.operator == Some(opc) {
+                let n = self.pending.count1.unwrap_or(1);
+                self.execute_op_linewise(self.cur_line, n.saturating_sub(1));
+                self.pending.clear();
+                return false;
+            }
+            self.pending.operator = Some(opc);
+            return false;
+        }
+
+        // Register prefix.
+        if key == "\"" {
+            self.pending.register_prefix = true;
+            return false;
+        }
+
+        // Motion / action dispatch. With operator → range op; without → motion.
+        let count = self.pending.count();
+        let op = self.pending.operator;
+
+        // Try as motion first.
+        if let Some(target_byte) = self.parse_motion(key, count) {
+            if let Some(opc) = op {
+                let from = self.cursor_byte();
+                let (start, end) = if from <= target_byte { (from, target_byte) } else { (target_byte, from) };
+                self.execute_op_charwise(opc, start, end);
+            } else {
+                self.cursor_to_byte(target_byte);
+            }
+            self.pending.clear();
+            return false;
+        }
+
+        // Standalone actions.
+        let r = self.pending.register;
+        let n = count;
+        let quit = self.handle_normal_action(key, n, r);
+        self.pending.clear();
+        quit
+    }
+
+    /// Parse a motion key. Returns the destination byte offset, or None if
+    /// the key isn't a motion.
+    fn parse_motion(&mut self, key: &str, count: usize) -> Option<usize> {
+        let cur = self.cursor_byte();
+        match key {
+            "h" | "LEFT" => {
+                let mut b = cur;
+                for _ in 0..count {
+                    let s = self.buf.rope.to_string();
+                    if b == 0 { break; }
+                    let mut p = b - 1;
+                    while p > 0 && !s.is_char_boundary(p) { p -= 1; }
+                    let prev_line = self.buf.rope.byte_to_line(p);
+                    let cur_line = self.buf.rope.byte_to_line(b);
+                    if prev_line != cur_line { break; }
+                    b = p;
+                }
+                Some(b)
+            }
+            "l" | "RIGHT" => {
+                let mut b = cur;
+                let s = self.buf.rope.to_string();
+                for _ in 0..count {
+                    if b >= s.len() { break; }
+                    let mut p = b + 1;
+                    while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                    let next_line = if p < s.len() { self.buf.rope.byte_to_line(p) } else { self.buf.rope.byte_to_line(b) };
+                    let cur_line = self.buf.rope.byte_to_line(b);
+                    if next_line != cur_line { break; }
+                    b = p;
+                }
+                Some(b)
+            }
+            "j" | "DOWN" => {
+                let target_line = (self.cur_line + count).min(self.buf.line_count().saturating_sub(1));
+                let off = self.buf.line_byte_offset(target_line);
+                let len = self.buf.line(target_line).len();
+                Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
+            }
+            "k" | "UP" => {
+                let target_line = self.cur_line.saturating_sub(count);
+                let off = self.buf.line_byte_offset(target_line);
+                let len = self.buf.line(target_line).len();
+                Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
+            }
+            "0" | "HOME" => Some(motion::line_start(&self.buf, cur)),
+            "^"          => Some(motion::line_first_nonblank(&self.buf, cur)),
+            "$" | "END"  => {
+                let mut end = motion::line_end(&self.buf, cur);
+                // For motion (no operator), step back one char so we don't
+                // sit past last visible char — vim semantics.
+                if self.pending.operator.is_none() {
+                    end = end.saturating_sub(1);
+                    let line = self.buf.rope.byte_to_line(cur);
+                    let line_start = self.buf.line_byte_offset(line);
+                    if end < line_start { end = line_start; }
+                }
+                Some(end)
+            }
+            "w" => {
+                let mut b = cur;
+                for _ in 0..count { b = motion::word_forward(&self.buf, b); }
+                Some(b)
+            }
+            "b" => {
+                let mut b = cur;
+                for _ in 0..count { b = motion::word_backward(&self.buf, b); }
+                Some(b)
+            }
+            "e" => {
+                let mut b = cur;
+                for _ in 0..count { b = motion::word_end(&self.buf, b); }
+                // Operators on `e` include the end char → bump one.
+                if self.pending.operator.is_some() {
+                    let s = self.buf.rope.to_string();
+                    if b < s.len() {
+                        let mut p = b + 1;
+                        while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                        b = p;
+                    }
+                }
+                Some(b)
+            }
+            "W" => {
+                let mut b = cur;
+                for _ in 0..count { b = motion::big_word_forward(&self.buf, b); }
+                Some(b)
+            }
+            "B" => {
+                let mut b = cur;
+                for _ in 0..count { b = motion::big_word_backward(&self.buf, b); }
+                Some(b)
+            }
+            "G" => {
+                let target_line = if self.pending.count1.is_some() {
+                    count.saturating_sub(1).min(self.buf.line_count().saturating_sub(1))
+                } else {
+                    self.buf.line_count().saturating_sub(1)
+                };
+                Some(self.buf.line_byte_offset(target_line))
+            }
+            "f" | "F" | "t" | "T" => {
+                self.pending.awaiting_char = Some(key.chars().next().unwrap());
+                None  // not really a motion result; the second key triggers action
+            }
+            "n" => self.search_next(false),
+            "N" => self.search_next(true),
+            _ => None,
+        }
+    }
+
+    /// Standalone Normal-mode actions that aren't motions. Returns true to
+    /// quit.
+    fn handle_normal_action(&mut self, key: &str, count: usize, _reg: Option<char>) -> bool {
+        match key {
+            // Page motion (not currently used as motion-target for ops).
             "PgDOWN" | "C-D" => {
                 let step = (self.main_p.h as usize) / 2;
                 self.cur_line = (self.cur_line + step).min(self.buf.line_count().saturating_sub(1));
@@ -335,8 +580,8 @@ impl App {
                 self.enter_insert();
             }
 
-            // Delete a single character at cursor
-            "x" => {
+            // Edit primitives
+            "x" => for _ in 0..count {
                 let off = self.cursor_byte();
                 let line = self.buf.line(self.cur_line);
                 if self.cur_col < line.len() {
@@ -346,9 +591,75 @@ impl App {
                     self.buf.apply(off, abs_end, "");
                     self.clamp_col_to_line();
                 }
+            },
+            "X" => for _ in 0..count {
+                if self.cur_col > 0 {
+                    let line = self.buf.line(self.cur_line);
+                    let mut s = self.cur_col - 1;
+                    while s > 0 && !line.is_char_boundary(s) { s -= 1; }
+                    let abs_s = self.buf.line_byte_offset(self.cur_line) + s;
+                    let abs_e = self.buf.line_byte_offset(self.cur_line) + self.cur_col;
+                    self.buf.apply(abs_s, abs_e, "");
+                    self.cur_col = s;
+                    self.want_col = s;
+                }
+            },
+            "D" => {
+                let from = self.cursor_byte();
+                let end = motion::line_end(&self.buf, from);
+                self.execute_op_charwise('d', from, end);
+            }
+            "C" => {
+                let from = self.cursor_byte();
+                let end = motion::line_end(&self.buf, from);
+                self.execute_op_charwise('c', from, end);
+            }
+            "Y" => {
+                let n = count.saturating_sub(1);
+                self.execute_op_linewise_yank(self.cur_line, self.cur_line + n);
+            }
+            "J" => for _ in 0..count.max(1) {
+                if self.cur_line + 1 >= self.buf.line_count() { break; }
+                let line_end_byte = motion::line_end(&self.buf, self.cursor_byte());
+                let next_line_start = self.buf.line_byte_offset(self.cur_line + 1);
+                // Drop any leading whitespace on next line. Replace newline +
+                // ws with a single space.
+                let next_line = self.buf.line(self.cur_line + 1);
+                let trim_lead = next_line.chars().take_while(|c| c.is_whitespace()).map(|c| c.len_utf8()).sum::<usize>();
+                let separator = if next_line.trim().is_empty() { "" } else { " " };
+                self.buf.apply(line_end_byte, next_line_start + trim_lead, separator);
+                self.cur_col = line_end_byte - self.buf.line_byte_offset(self.cur_line);
+                self.want_col = self.cur_col;
+            },
+            "~" => {
+                let off = self.cursor_byte();
+                let line = self.buf.line(self.cur_line);
+                if self.cur_col < line.len() {
+                    let c = line[self.cur_col..].chars().next().unwrap();
+                    let toggled: String = if c.is_ascii_uppercase() { c.to_ascii_lowercase().to_string() }
+                                          else if c.is_ascii_lowercase() { c.to_ascii_uppercase().to_string() }
+                                          else { c.to_string() };
+                    let end = off + c.len_utf8();
+                    self.buf.apply(off, end, &toggled);
+                    self.cur_col += toggled.len();
+                    self.want_col = self.cur_col;
+                }
             }
 
-            // Undo / redo — cursor follows the edit site.
+            // Replace single char.
+            "r" => self.pending.awaiting_char = Some('r'),
+
+            // Paste.
+            "p" => self.do_paste(true, count),
+            "P" => self.do_paste(false, count),
+
+            // Search.
+            "/" => self.search_prompt(Direction::Forward),
+            "?" => self.search_prompt(Direction::Backward),
+            "*" => self.search_word_under_cursor(Direction::Forward),
+            "#" => self.search_word_under_cursor(Direction::Backward),
+
+            // Undo / redo
             "u" => match self.buf.undo() {
                 Some(byte) => { self.cursor_to_byte(byte); self.set_status(" undo", 244); }
                 None       => self.set_status(" already at oldest change", 244),
@@ -361,6 +672,18 @@ impl App {
             // Enter Command
             ":" => { self.cmdline.clear(); self.mode = Mode::Command; }
 
+            // Fe2O3 harmonized quit
+            "q" => {
+                if self.buf.dirty {
+                    if let Err(e) = self.buf.save() {
+                        self.set_status(&format!(" save failed: {}", e), 196);
+                        return false;
+                    }
+                }
+                return true;
+            }
+            "Q" => return true,
+
             _ => {}
         }
         false
@@ -368,6 +691,242 @@ impl App {
 
     fn enter_insert(&mut self) {
         self.mode = Mode::Insert;
+    }
+
+    // ── Operators ──────────────────────────────────────────────────────
+    /// Charwise operator on byte range [start, end). Stores the cut/copied
+    /// text in the active register.
+    fn execute_op_charwise(&mut self, op: char, start: usize, end: usize) {
+        if start >= end { return; }
+        let text: String = self.buf.rope.byte_slice(start..end).to_string();
+        let reg_name = self.pending.register;
+        match op {
+            'd' => {
+                self.regs.cut(reg_name, text, YankKind::Charwise);
+                self.buf.apply(start, end, "");
+                self.cursor_to_byte(start);
+            }
+            'c' => {
+                self.regs.cut(reg_name, text, YankKind::Charwise);
+                self.buf.apply(start, end, "");
+                self.cursor_to_byte(start);
+                self.enter_insert();
+            }
+            'y' => {
+                self.regs.yank(reg_name, text, YankKind::Charwise);
+                // Cursor doesn't move on yank.
+            }
+            _ => {}
+        }
+    }
+
+    /// Linewise operator on lines [from..=to].
+    fn execute_op_linewise(&mut self, from: usize, extra: usize) {
+        let op = match self.pending.operator { Some(o) => o, None => return };
+        let last = self.buf.line_count().saturating_sub(1);
+        let to = (from + extra).min(last);
+        let start = self.buf.line_byte_offset(from);
+        let end = if to + 1 >= self.buf.line_count() {
+            self.buf.rope.len_bytes()
+        } else {
+            self.buf.line_byte_offset(to + 1)
+        };
+        let mut text: String = self.buf.rope.byte_slice(start..end).to_string();
+        // Linewise text always ends with a newline so paste works correctly.
+        if !text.ends_with('\n') { text.push('\n'); }
+        let reg_name = self.pending.register;
+        match op {
+            'd' => {
+                self.regs.cut(reg_name, text, YankKind::Linewise);
+                self.buf.apply(start, end, "");
+                let new_line = from.min(self.buf.line_count().saturating_sub(1));
+                self.cur_line = new_line;
+                self.cur_col = 0;
+                self.want_col = 0;
+            }
+            'c' => {
+                self.regs.cut(reg_name, text, YankKind::Linewise);
+                // Replace the lines with one empty line so we can insert into it.
+                self.buf.apply(start, end, "\n");
+                self.cur_line = from;
+                self.cur_col = 0;
+                self.want_col = 0;
+                self.enter_insert();
+            }
+            'y' => {
+                self.regs.yank(reg_name, text, YankKind::Linewise);
+            }
+            _ => {}
+        }
+    }
+
+    /// Y — yank lines without an operator-doubling key.
+    fn execute_op_linewise_yank(&mut self, from: usize, to: usize) {
+        let last = self.buf.line_count().saturating_sub(1);
+        let to = to.min(last);
+        let start = self.buf.line_byte_offset(from);
+        let end = if to + 1 >= self.buf.line_count() {
+            self.buf.rope.len_bytes()
+        } else {
+            self.buf.line_byte_offset(to + 1)
+        };
+        let mut text: String = self.buf.rope.byte_slice(start..end).to_string();
+        if !text.ends_with('\n') { text.push('\n'); }
+        self.regs.yank(self.pending.register, text, YankKind::Linewise);
+    }
+
+    fn do_replace_char(&mut self, c: char) {
+        let line = self.buf.line(self.cur_line);
+        if self.cur_col >= line.len() { return; }
+        let off = self.cursor_byte();
+        let mut e = self.cur_col + 1;
+        while e < line.len() && !line.is_char_boundary(e) { e += 1; }
+        let abs_end = self.buf.line_byte_offset(self.cur_line) + e;
+        self.buf.apply(off, abs_end, &c.to_string());
+    }
+
+    fn do_find_forward(&mut self, c: char, before: bool) {
+        let cur = self.cursor_byte();
+        if let Some(byte) = motion::find_forward(&self.buf, cur, c) {
+            let target = if before {
+                let s = self.buf.rope.to_string();
+                let mut b = byte;
+                if b > 0 { b -= 1; while b > 0 && !s.is_char_boundary(b) { b -= 1; } }
+                b
+            } else { byte };
+            self.cursor_to_byte(target);
+        }
+    }
+
+    fn do_find_backward(&mut self, c: char, after: bool) {
+        let cur = self.cursor_byte();
+        if let Some(byte) = motion::find_backward(&self.buf, cur, c) {
+            let target = if after {
+                let s = self.buf.rope.to_string();
+                let mut b = byte + 1;
+                while b < s.len() && !s.is_char_boundary(b) { b += 1; }
+                b
+            } else { byte };
+            self.cursor_to_byte(target);
+        }
+    }
+
+    fn do_paste(&mut self, after: bool, count: usize) {
+        let reg = self.pending.register.unwrap_or('"');
+        let yank = match self.regs.get(reg) {
+            Some(y) => y.clone(),
+            None    => { self.set_status(" register empty", 244); return; }
+        };
+        let mut text = String::new();
+        for _ in 0..count.max(1) { text.push_str(&yank.text); }
+        match yank.kind {
+            YankKind::Charwise => {
+                let cur = self.cursor_byte();
+                let off = if after && self.cur_col < self.current_line_len() {
+                    let line = self.buf.line(self.cur_line);
+                    let mut e = self.cur_col + 1;
+                    while e < line.len() && !line.is_char_boundary(e) { e += 1; }
+                    self.buf.line_byte_offset(self.cur_line) + e
+                } else {
+                    cur
+                };
+                self.buf.apply(off, off, &text);
+                let final_byte = off + text.len();
+                let mut land = if final_byte > 0 {
+                    let s = self.buf.rope.to_string();
+                    let mut b = final_byte - 1;
+                    while b > 0 && !s.is_char_boundary(b) { b -= 1; }
+                    b
+                } else { 0 };
+                if land < off { land = off; }
+                self.cursor_to_byte(land);
+            }
+            YankKind::Linewise => {
+                let target_line = if after { self.cur_line + 1 } else { self.cur_line };
+                let off = if target_line >= self.buf.line_count() {
+                    // Paste below last line: append to end with newline.
+                    let end = self.buf.rope.len_bytes();
+                    let needs_nl = !self.buf.rope.to_string().ends_with('\n');
+                    let mut payload = if needs_nl { "\n".to_string() } else { String::new() };
+                    payload.push_str(&text);
+                    self.buf.apply(end, end, &payload);
+                    self.cur_line = self.buf.line_count().saturating_sub(1);
+                    self.cur_col = 0;
+                    self.want_col = 0;
+                    return;
+                } else {
+                    self.buf.line_byte_offset(target_line)
+                };
+                self.buf.apply(off, off, &text);
+                self.cur_line = target_line;
+                self.cur_col = 0;
+                self.want_col = 0;
+            }
+        }
+    }
+
+    // ── Search ─────────────────────────────────────────────────────────
+    fn search_prompt(&mut self, dir: Direction) {
+        let prompt = if dir == Direction::Forward { " /" } else { " ?" };
+        let pattern = self.footer.ask(prompt, "");
+        if pattern.is_empty() { return; }
+        self.search.set(&pattern, dir);
+        if let Some(byte) = self.search_next_at(self.cursor_byte(), dir) {
+            self.cursor_to_byte(byte);
+        } else {
+            self.set_status(&format!(" pattern not found: {}", pattern), 196);
+        }
+    }
+
+    fn search_next(&mut self, reverse: bool) -> Option<usize> {
+        let dir = if reverse {
+            match self.search.direction { Direction::Forward => Direction::Backward, Direction::Backward => Direction::Forward }
+        } else {
+            self.search.direction
+        };
+        // Start one char past current to avoid sticking.
+        let s = self.buf.rope.to_string();
+        let mut from = self.cursor_byte();
+        if dir == Direction::Forward && from < s.len() {
+            from += 1;
+            while from < s.len() && !s.is_char_boundary(from) { from += 1; }
+        }
+        self.search_next_at(from, dir)
+    }
+
+    fn search_next_at(&self, from: usize, dir: Direction) -> Option<usize> {
+        let s = self.buf.rope.to_string();
+        self.search.find(&s, from, dir).map(|(start, _)| start)
+    }
+
+    fn search_word_under_cursor(&mut self, dir: Direction) {
+        let cur = self.cursor_byte();
+        let s = self.buf.rope.to_string();
+        if cur >= s.len() { return; }
+        let line = self.buf.rope.byte_to_line(cur);
+        let line_start = self.buf.line_byte_offset(line);
+        let line_end = motion::line_end(&self.buf, cur);
+        let line_text = &s[line_start..line_end];
+        let pos_in_line = cur - line_start;
+        // Find word bounds.
+        let bytes = line_text.as_bytes();
+        let mut start = pos_in_line;
+        while start > 0 {
+            let prev_b = bytes[start - 1] as char;
+            if !(prev_b.is_alphanumeric() || prev_b == '_') { break; }
+            start -= 1;
+        }
+        let mut end = pos_in_line;
+        while end < line_text.len() {
+            let c = bytes[end] as char;
+            if !(c.is_alphanumeric() || c == '_') { break; }
+            end += 1;
+        }
+        if start == end { return; }
+        let word = &line_text[start..end];
+        let pattern = format!(r"\b{}\b", regex::escape(word));
+        self.search.set(&pattern, dir);
+        if let Some(byte) = self.search_next(false) { self.cursor_to_byte(byte); }
     }
 
     // ── Insert mode ────────────────────────────────────────────────────
@@ -385,7 +944,7 @@ impl App {
             "DOWN"  => self.move_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
             "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
-            "BACKSPACE" | "C-H" => {
+            "BACK" | "BACKSPACE" | "C-H" => {
                 let off = self.cursor_byte();
                 if off > 0 {
                     // Find prev char boundary in the rope's byte view.
@@ -397,6 +956,17 @@ impl App {
                     self.cur_line = line;
                     self.cur_col = col;
                     self.want_col = self.cur_col;
+                }
+            }
+            // Forward-delete: remove char at cursor.
+            "DEL" => {
+                let off = self.cursor_byte();
+                let total = self.buf.rope.len_bytes();
+                if off < total {
+                    let s = self.buf.rope.to_string();
+                    let mut end = off + 1;
+                    while end < s.len() && !s.is_char_boundary(end) { end += 1; }
+                    self.buf.apply(off, end, "");
                 }
             }
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
@@ -432,7 +1002,7 @@ impl App {
     fn handle_command(&mut self, key: &str) -> bool {
         match key {
             "ESC" | "C-[" | "C-C" => { self.cmdline.clear(); self.mode = Mode::Normal; false }
-            "BACKSPACE" | "C-H" => {
+            "BACK" | "BACKSPACE" | "C-H" => {
                 if self.cmdline.is_empty() { self.mode = Mode::Normal; }
                 else { self.cmdline.pop(); }
                 false

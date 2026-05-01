@@ -30,9 +30,14 @@ PATH="/usr/bin:$PATH" cargo build --release
   per-filetype config (`~/.scribe/ftplugin/<ext>.json`).
 - **Phase 5**: Claude Code integration via persistent `claude -p
   --session-id=…` (spell, grammar, gen, chat — all sharing context).
-- **Phase 6**: reading mode (Goyo-style centered narrow column), sticky
+- **Phase 6**: spellchecking via `hunspell` (offline, fast — primary)
+  and `aspell` fallback. Highlight misspelled words with squiggly
+  underline, `z=` to choose suggestion, `zg`/`zw` to add/remove from
+  personal dict (`~/.scribe/spell/<lang>.dic`). AI-grade "explain why"
+  defers to phase 5's claude path. Per-buffer language toggle.
+- **Phase 7**: reading mode (Goyo-style centered narrow column), sticky
   section header, word counter, swap-file recovery.
-- **Phase 7**: cross-session shared registers via Unix socket — yank in
+- **Phase 8**: cross-session shared registers via Unix socket — yank in
   one scribe, paste in another. Better than vim's `+`/`*`.
 
 ## Philosophy
