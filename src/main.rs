@@ -567,13 +567,16 @@ impl App {
         let row = pane_y + visual_row as u16;
         let col = pane_x + col_in_row as u16;
 
+        // Cursor shape per mode — handed to crust so the raw DECSCUSR / CUP
+        // escapes don't leak into scribe's source. Insert / Command get a
+        // bar (6); everything else gets a steady block (2).
         let shape = match self.mode {
             Mode::Insert | Mode::Command => 6,
             _ => 2,
         };
-        print!("\x1b[?25h\x1b[{} q\x1b[{};{}H", shape, row, col);
-        use std::io::Write as _;
-        std::io::stdout().flush().ok();
+        crust::Cursor::show();
+        crust::Cursor::shape(shape);
+        crust::Cursor::set(col, row);
     }
 
     fn render_header(&mut self) {
@@ -1493,8 +1496,12 @@ impl App {
                 None       => self.set_status(" already at newest change", 244),
             },
 
-            // Enter Command
-            ":" => { self.cmdline.clear(); self.mode = Mode::Command; }
+            // Enter Command — pointer-style: footer.ask handles the prompt
+            // line entirely (line editor, cursor placement, no flicker).
+            // execute_command runs once the user hits Enter.
+            ":" => {
+                return self.run_command_prompt();
+            }
 
             // Fe2O3 harmonized quit
             "q" => {
@@ -1615,7 +1622,7 @@ impl App {
                 self.do_paste(key == "p", 1);
                 return false;
             }
-            ":" => { self.cmdline.clear(); self.mode = Mode::Command; return false; }
+            ":" => { return self.run_command_prompt(); }
             "\"" => { self.pending.register_prefix = true; return false; }
             _ => {}
         }
@@ -2215,29 +2222,33 @@ impl App {
     }
 
     // ── Command mode ───────────────────────────────────────────────────
-    fn handle_command(&mut self, key: &str) -> bool {
-        match key {
-            "ESC" | "C-[" | "C-C" => { self.cmdline.clear(); self.mode = Mode::Normal; false }
-            "BACK" | "BACKSPACE" | "C-H" => {
-                if self.cmdline.is_empty() { self.mode = Mode::Normal; }
-                else { self.cmdline.pop(); }
-                false
-            }
-            "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
-                let cmd = self.cmdline.trim().to_string();
-                self.cmdline.clear();
-                self.mode = Mode::Normal;
-                self.execute_command(&cmd)
-            }
-            other => {
-                if other.chars().count() == 1 {
-                    let c = other.chars().next().unwrap();
-                    if !c.is_control() { self.cmdline.push(c); }
-                }
-                false
-            }
-        }
+    /// Pointer-style command prompt: hand the input to crust's `pane.ask`
+    /// which runs its own editline against the footer pane. No
+    /// render_all-per-keystroke (the source of the v0.1.13 cmdline
+    /// flicker), and the cursor placement is handled inside crust where
+    /// the pane geometry already lives — no raw `\x1b[r;cH` from scribe.
+    fn run_command_prompt(&mut self) -> bool {
+        // Use a darker bg (cmd_bg, palette 17) to match pointer's `:` prompt
+        // styling. ask_with_bg restores the pane bg after Enter / Esc.
+        let cmd = self.footer.ask_with_bg(":", "", 17);
+        let cmd = cmd.trim().to_string();
+        // ask leaves the pane painted with the prompt line; render_footer
+        // restores the regular status bar before returning.
+        self.render_footer();
+        self.position_cursor();
+        if cmd.is_empty() { return false; }
+        let quit = self.execute_command(&cmd);
+        if !quit { self.render_all(); }
+        quit
     }
+
+    /// Legacy keystroke-by-keystroke command handler — no longer reached
+    /// (Mode::Command is never set in v0.1.14+; `:` calls
+    /// `run_command_prompt` directly). Kept only because the main loop's
+    /// match still has a `Mode::Command` arm; removing the variant is a
+    /// follow-up cleanup.
+    #[allow(dead_code)]
+    fn handle_command(&mut self, _key: &str) -> bool { false }
 
     /// Returns true to quit the editor.
     fn execute_command(&mut self, cmd: &str) -> bool {
