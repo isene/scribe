@@ -105,6 +105,9 @@ fn main() {
 
     print!("\x1b[?2004l");
     let _ = std::io::stdout().flush();
+    // Persist `:` command history across runs. The footer pane was the
+    // editline target; its history is the live list.
+    save_cmd_history(&app.footer.history);
     Crust::cleanup();
     Crust::clear_screen();
 }
@@ -233,6 +236,12 @@ impl App {
         let rc = load_scriberc();
         let active_theme = cli_theme.or_else(|| rc.theme.clone());
         if let Some(ref t) = active_theme { highlight::set_theme(t); }
+
+        // Footer hosts the `:` command prompt — enable editline history so
+        // Up / Down recalls past commands (per-session). Persisted history
+        // is loaded from ~/.config/scribe/cmdhistory below.
+        footer.record = true;
+        footer.history = load_cmd_history();
 
         let auto_spell = matches!(buf.kind, FileKind::Email) || rc.spell;
         let mut app = Self {
@@ -495,6 +504,29 @@ fn load_scriberc() -> RcConfig {
         }
     }
     cfg
+}
+
+/// `~/.config/scribe/cmdhistory` — newline-delimited list of past `:`
+/// commands, oldest first. Capped at 100 entries (mirroring editline's
+/// in-memory cap). Empty / missing file → empty history.
+fn cmd_history_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/cmdhistory")
+}
+
+fn load_cmd_history() -> Vec<String> {
+    std::fs::read_to_string(cmd_history_path())
+        .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn save_cmd_history(hist: &[String]) {
+    let path = cmd_history_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    // Cap on disk too, in case the in-memory list grew beyond 100.
+    let start = hist.len().saturating_sub(100);
+    let body = hist[start..].join("\n");
+    let _ = std::fs::write(&path, body);
 }
 
 /// Width of the line-number gutter for a buffer with `line_count` lines.
