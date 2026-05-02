@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.23** — daily-driveable for prose. Implemented:
+**v0.1.24** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -95,6 +95,8 @@ Requires `claude` on `PATH` (both commands).
 | Yank/cut feedback | Statusline confirms every register write: `5 lines yanked`, `23 chars yanked into "a`, `3 lines deleted`, etc. |
 | Register inspector | `:reg` (or `:registers`) opens a popup listing all set registers with kind + first 60 chars. ESC closes. |
 | Move lines | `Ctrl-Up` / `Ctrl-Down` swap the current line with the one above / below. Counts work (`5 Ctrl-Down`). |
+| Increment | `Ctrl-A` / `Ctrl-X` increment / decrement the number at-or-after the cursor. Recognises ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (e.g. `2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Ctrl-A` adds 30 days). Zero-padding preserved on integers. |
+| Insert helpers | `Ctrl-Y` / `Ctrl-E` in Insert mode insert the character from the same column on the line above / below. Useful for stretching tables and ASCII diagrams. |
 | Spellcheck | `:set spell`, `:set spelllang=NAME` (e.g. `nb_NO`), `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
 | Config popup | `:config` — modal preferences pane (theme, numbers, spell on/off, lang, underline color). `W` saves to scriberc, `ESC` closes. |
 | Themes | `:set theme=NAME` (monokai / solarized / nord / dracula / gruvbox / plain), `--theme=NAME` CLI |

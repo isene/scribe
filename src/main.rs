@@ -227,6 +227,73 @@ fn parse_macro_text(text: &str) -> Vec<String> {
     out
 }
 
+/// If `line[start..]` begins with a valid `YYYY-MM-DD`, parse it,
+/// add `delta` days, and return the new formatted date. Otherwise
+/// returns None — the caller falls back to plain integer increment.
+/// Uses Julian-day arithmetic so month-end and leap-year rollover
+/// (incl. the 100/400 Gregorian rules) are exact.
+fn iso_date_match(line: &str, start: usize, delta: i64) -> Option<String> {
+    let bytes = line.as_bytes();
+    if start + 10 > bytes.len() { return None; }
+    let chunk = &bytes[start..start + 10];
+    // Shape check: NNNN-NN-NN.
+    if chunk[4] != b'-' || chunk[7] != b'-' { return None; }
+    for &i in &[0, 1, 2, 3, 5, 6, 8, 9] {
+        if !chunk[i].is_ascii_digit() { return None; }
+    }
+    // Reject if the next char is a digit — that would mean the "year"
+    // is actually a longer number that happens to share the layout.
+    if let Some(&b) = bytes.get(start + 10) {
+        if b.is_ascii_digit() { return None; }
+    }
+    let y: i64 = std::str::from_utf8(&chunk[0..4]).ok()?.parse().ok()?;
+    let m: i64 = std::str::from_utf8(&chunk[5..7]).ok()?.parse().ok()?;
+    let d: i64 = std::str::from_utf8(&chunk[8..10]).ok()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=days_in_month(y, m as u32)).contains(&(d as i64)) {
+        return None;
+    }
+    let jdn = ymd_to_jdn(y, m as i32, d as i32);
+    let (y2, m2, d2) = jdn_to_ymd(jdn + delta);
+    Some(format!("{:04}-{:02}-{:02}", y2, m2, d2))
+}
+
+/// Days in month for the proleptic Gregorian calendar. Months 1..=12.
+fn days_in_month(year: i64, month: u32) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11               => 30,
+        2 => if is_leap(year) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Convert (year, month, day) → Julian Day Number. Standard formula
+/// (Fliegel & Van Flandern); valid for all positive years.
+fn ymd_to_jdn(y: i64, m: i32, d: i32) -> i64 {
+    let a = (14 - m as i64) / 12;
+    let y = y + 4800 - a;
+    let m = m as i64 + 12 * a - 3;
+    d as i64 + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045
+}
+
+/// Inverse of `ymd_to_jdn`. Returns (year, month, day).
+fn jdn_to_ymd(jdn: i64) -> (i64, i32, i32) {
+    let a = jdn + 32044;
+    let b = (4 * a + 3) / 146097;
+    let c = a - (146097 * b) / 4;
+    let d = (4 * c + 3) / 1461;
+    let e = c - (1461 * d) / 4;
+    let m_ = (5 * e + 2) / 153;
+    let day = (e - (153 * m_ + 2) / 5 + 1) as i32;
+    let month = (m_ + 3 - 12 * (m_ / 10)) as i32;
+    let year = 100 * b + d - 4800 + m_ / 10;
+    (year, month, day)
+}
+
 /// Pending Normal-mode command being assembled key-by-key.
 #[derive(Default, Clone)]
 struct Pending {
@@ -1829,6 +1896,13 @@ impl App {
             "C-UP"   => for _ in 0..count { self.move_line_up(); },
             "C-DOWN" => for _ in 0..count { self.move_line_down(); },
 
+            // Ctrl-A / Ctrl-X — increment / decrement the number under
+            // or after the cursor. Recognises plain integers (with
+            // optional leading `-`) AND ISO 8601 dates (YYYY-MM-DD)
+            // with proper month / leap-year rollover. Replays via dot.
+            "C-A" => { self.change_number(count as i64); }
+            "C-X" => { self.change_number(-(count as i64)); }
+
             // Enter Insert
             "i" => self.enter_insert(),
             "a" => {
@@ -2103,6 +2177,126 @@ impl App {
         self.buf.end_compound();
         self.cur_line += 1;
         self.clamp_col_to_line();
+    }
+
+    /// Increment or decrement the first number / date at-or-after the
+    /// cursor on the current line by `delta`. Recognises:
+    ///   * ISO 8601 dates `YYYY-MM-DD` — adds/subtracts days, with
+    ///     proper month-end and leap-year rollover via Julian-day
+    ///     arithmetic.
+    ///   * Decimal integers, with an optional leading minus that's
+    ///     part of the literal (i.e. `-` is included only if the char
+    ///     before it isn't alphanumeric).
+    /// Cursor lands on the last char of the new value (vim semantics).
+    /// Records dot-repeat so `.` repeats the increment.
+    fn change_number(&mut self, delta: i64) {
+        let line = self.buf.line(self.cur_line);
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        let bytes = line.as_bytes();
+        let cur = self.cur_col.min(bytes.len());
+
+        // ISO-date detection FIRST. The cursor can sit anywhere within
+        // a YYYY-MM-DD span (last digit, dash, anywhere) — try every
+        // candidate start position from `cur-9` up to and including
+        // `cur` so we'll find the date no matter where the cursor
+        // landed. Then a small forward scan in case the cursor is
+        // just before a date on the same line.
+        let try_date = |cs: usize| iso_date_match(&line, cs, delta);
+        let mut date_hit: Option<(usize, String)> = None;
+        let max_back = cur.min(9);
+        for back in 0..=max_back {
+            let cs = cur - back;
+            if let Some(new) = try_date(cs) { date_hit = Some((cs, new)); break; }
+        }
+        if date_hit.is_none() {
+            for fwd in 1.. {
+                let cs = cur + fwd;
+                if cs + 10 > bytes.len() { break; }
+                if let Some(new) = try_date(cs) { date_hit = Some((cs, new)); break; }
+            }
+        }
+        if let Some((cs, new)) = date_hit {
+            let abs_start = line_off + cs;
+            let abs_end   = line_off + cs + 10;
+            self.buf.apply(abs_start, abs_end, &new);
+            self.cur_col = cs + new.len() - 1;
+            self.want_col = self.cur_col;
+            self.last_change = Some(LastChange::SimpleAction {
+                key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
+                count: delta.unsigned_abs() as usize,
+                register: None,
+            });
+            return;
+        }
+
+        // No date — fall back to plain integer. Walk back through any
+        // digit run we may already be inside, then forward to the
+        // next digit (or `-` sign of a negative literal).
+        let mut start = cur;
+        while start > 0 && bytes[start - 1].is_ascii_digit() { start -= 1; }
+        while start < bytes.len() {
+            let b = bytes[start];
+            if b.is_ascii_digit() { break; }
+            if b == b'-' && start + 1 < bytes.len() && bytes[start + 1].is_ascii_digit()
+                && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            { break; }
+            start += 1;
+        }
+        if start >= bytes.len() { return; }
+
+        // Plain integer.
+        let neg = bytes[start] == b'-';
+        let num_start = if neg { start + 1 } else { start };
+        let mut end = num_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+        if end == num_start { return; } // no digits
+        let digits = &line[num_start..end];
+        let parsed: i64 = match digits.parse::<i64>() {
+            Ok(n) => if neg { -n } else { n },
+            Err(_) => return,
+        };
+        let new_val = parsed.saturating_add(delta);
+        // Preserve zero-padding width for non-negative inputs (vim
+        // `nrformats` would only do this in `octal`/`hex` modes; we
+        // do it for any leading zero so `001` increments to `002`).
+        let pad = digits.len();
+        let new_text = if !neg && digits.starts_with('0') && new_val >= 0 {
+            format!("{:0width$}", new_val, width = pad)
+        } else {
+            new_val.to_string()
+        };
+        let abs_start = line_off + start;
+        let abs_end   = line_off + end;
+        self.buf.apply(abs_start, abs_end, &new_text);
+        self.cur_col = start + new_text.len().saturating_sub(1);
+        self.want_col = self.cur_col;
+        self.last_change = Some(LastChange::SimpleAction {
+            key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
+            count: delta.unsigned_abs() as usize,
+            register: None,
+        });
+    }
+
+    /// Copy the char at the cursor's character-column from line
+    /// `cur_line + dir` (-1 = above, +1 = below) and insert it at the
+    /// cursor. No-op when there's no source line (top/bottom of buf)
+    /// or when the source line is too short to have a char at that
+    /// column. Used by Insert-mode Ctrl-Y / Ctrl-E.
+    fn copy_char_from(&mut self, dir: i32) {
+        let src_idx: isize = self.cur_line as isize + dir as isize;
+        if src_idx < 0 { return; }
+        let src_idx = src_idx as usize;
+        if src_idx >= self.buf.line_count() { return; }
+        let cur_line = self.buf.line(self.cur_line);
+        let chars_before = cur_line[..self.cur_col.min(cur_line.len())].chars().count();
+        let src = self.buf.line(src_idx);
+        let Some(ch) = src.chars().nth(chars_before) else { return };
+        let s = ch.to_string();
+        let off = self.cursor_byte();
+        self.buf.apply(off, off, &s);
+        self.cur_col += s.len();
+        self.want_col = self.cur_col;
+        if self.capturing_insert { self.captured_insert.push_str(&s); }
     }
 
     fn enter_insert(&mut self) {
@@ -2703,6 +2897,13 @@ impl App {
                     self.buf.apply(off, end, "");
                 }
             }
+            // Vim Insert-mode helpers:
+            // Ctrl-Y inserts the char from the SAME column on the line
+            // ABOVE; Ctrl-E inserts the char from the line BELOW. The
+            // column is character-based (not byte) so multi-byte text
+            // (æ, ø, å, emoji) lines up the way the user sees it.
+            "C-Y" => { self.copy_char_from(-1); }
+            "C-E" => { self.copy_char_from( 1); }
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, "\n");
