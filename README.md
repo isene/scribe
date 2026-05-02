@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.24** — daily-driveable for prose. Implemented:
+**v0.1.25** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -84,7 +84,7 @@ Requires `claude` on `PATH` (both commands).
 | Linewise ops | `dd cc yy >> << gqq`, `D C Y`, counts (`5dd`) |
 | Text objects | `iw aw i" a" i' a' i\` a\` i( a( i[ a[ i{ a{ i< a< ip ap` (+ `ib`/`iB` aliases) |
 | Edit primitives | `x X r{c}`, `J`, `~`, `p P` |
-| Visual modes | `v` charwise, `V` linewise, `Ctrl-v` block — operate with any operator |
+| Visual modes | `v` charwise, `V` linewise, `Ctrl-v` block — operate with any operator. Statusline shows live `sel: Nl Nw Nc` while selecting. |
 | Registers | `"a` … `"z`, `"+`/`"*` (system clipboard via OSC 52), `"0` last yank, unnamed `""`. Named registers persist to `~/.config/scribe/registers.json` on every yank — survives restarts AND shares live across concurrent scribe sessions (yank in scribe A, `"ap` in scribe B). |
 | Search | `/ ?` (regex), `n N`, `* #` (word under cursor) |
 | Substitute | `:s/pat/rep/[gi]` current line, `:%s/pat/rep/[gi]` whole buffer, atomic undo |
@@ -97,6 +97,8 @@ Requires `claude` on `PATH` (both commands).
 | Move lines | `Ctrl-Up` / `Ctrl-Down` swap the current line with the one above / below. Counts work (`5 Ctrl-Down`). |
 | Increment | `Ctrl-A` / `Ctrl-X` increment / decrement the number at-or-after the cursor. Recognises ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (e.g. `2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Ctrl-A` adds 30 days). Zero-padding preserved on integers. |
 | Insert helpers | `Ctrl-Y` / `Ctrl-E` in Insert mode insert the character from the same column on the line above / below. Useful for stretching tables and ASCII diagrams. |
+| Auto-wrap | `:set textwidth=N` (or `:set tw=N`) — typing a space past column N breaks the line at the last preceding whitespace. `:set tw=0` disables. |
+| Reading mode | `:read` toggles distraction-free rendering — line numbers off, header / footer dimmed to a divider line. `:noread` exits. |
 | Spellcheck | `:set spell`, `:set spelllang=NAME` (e.g. `nb_NO`), `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
 | Config popup | `:config` — modal preferences pane (theme, numbers, spell on/off, lang, underline color). `W` saves to scriberc, `ESC` closes. |
 | Themes | `:set theme=NAME` (monokai / solarized / nord / dracula / gruvbox / plain), `--theme=NAME` CLI |

@@ -431,6 +431,16 @@ struct App {
     /// the exact byte offset.
     mark_jump_prefix: bool,
     mark_jump_exact: bool,
+    /// `:read` distraction-free mode. Hides line numbers, dims the
+    /// header / footer to the bare minimum (mode + position only),
+    /// and centers the text by padding the gutter. Toggled via
+    /// `:read` / `:noread`. Doesn't change buffer state — pure
+    /// presentation.
+    reading_mode: bool,
+    /// `:set textwidth=N` (alias `:set tw=N`). Auto-wraps the line
+    /// during typing when it exceeds `textwidth` characters by
+    /// breaking at the last whitespace before the limit. 0 = off.
+    textwidth: usize,
 }
 
 impl App {
@@ -497,6 +507,8 @@ impl App {
             mark_set_prefix: false,
             mark_jump_prefix: false,
             mark_jump_exact: false,
+            reading_mode: false,
+            textwidth: 0,
         };
         if auto_spell { app.spell_enable(); }
         app
@@ -913,7 +925,7 @@ impl App {
         // approximate cursor placement assuming the cursor is on the first
         // wrap row (typical for short lines); long-wrapped lines can be
         // off by gutter_w on continuation rows — acceptable for v1.
-        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers);
+        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode);
 
         let mut visual_row: usize = 0;
         for ln in self.scroll..self.cur_line {
@@ -944,6 +956,12 @@ impl App {
     }
 
     fn render_header(&mut self) {
+        if self.reading_mode {
+            // Distraction-free: just a thin dim divider so the eye has
+            // a top boundary without a full chrome bar.
+            self.header.say(&style::fg(&" ".repeat(self.cols as usize), 240));
+            return;
+        }
         let name = self.buf.path.as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[no name]".into());
@@ -1011,8 +1029,8 @@ impl App {
         };
 
         let line_count = self.buf.line_count();
-        let show_numbers = self.show_numbers;
-        let relative_numbers = self.relative_numbers;
+        let show_numbers = self.show_numbers && !self.reading_mode;
+        let relative_numbers = self.relative_numbers && !self.reading_mode;
 
         let mut out = String::new();
         for i in 0..pane_h {
@@ -1143,6 +1161,17 @@ impl App {
     }
 
     fn render_footer(&mut self) {
+        if self.reading_mode {
+            // Reading mode: only show transient status (the user
+            // pressed a key that produced one), otherwise dim line.
+            let bg = format!("\x1b[48;5;{}m", 234u8);
+            let line = match &self.status {
+                Some((msg, c)) => format!("{} {}{}\x1b[0m", bg, style::fg(msg, *c), bg),
+                None => format!("{}{}\x1b[0m", bg, " ".repeat(self.cols as usize)),
+            };
+            self.footer.say(&line);
+            return;
+        }
         // SGR-aware: each style::fg / style::bg helper closes with \x1b[0m,
         // which resets BACKGROUND to terminal default. After every styled
         // segment we re-assert the pane's bg so the gap spaces don't render
@@ -1158,19 +1187,34 @@ impl App {
         // left of the position indicator so the status message in the
         // middle slot can shrink without overlapping. Cheap on prose-sized
         // buffers; if it ever becomes the hot path, gate behind `dirty`.
-        let words = self.compute_wordcount();
-        let chars = self.buf.rope.len_chars();
-        let spell_lbl = if self.spell_enabled {
-            format!("spell:{}", self.spell_lang)
+        // In Visual mode, swap whole-buffer stats for selection stats —
+        // matches vim's `g Ctrl-G` flash but live + always-on. Lines /
+        // words / chars are all measured over the active selection.
+        let (stats_plain, stats_styled) = if self.mode.is_visual() {
+            let (lines, words, chars) = self.compute_selection_stats();
+            let plain = format!(" sel: {}l {}w {}c ", lines, words, chars);
+            let styled = format!(" sel: {}l {}w {}c{} ",
+                style::fg(&lines.to_string(), 252),
+                style::fg(&words.to_string(), 252),
+                style::fg(&chars.to_string(), 244),
+                bg_on);
+            (plain, styled)
         } else {
-            "spell:off".to_string()
+            let words = self.compute_wordcount();
+            let chars = self.buf.rope.len_chars();
+            let spell_lbl = if self.spell_enabled {
+                format!("spell:{}", self.spell_lang)
+            } else {
+                "spell:off".to_string()
+            };
+            let plain = format!(" {}w  {}c  {} ", words, chars, spell_lbl);
+            let styled = format!(" {}w  {}c  {}{} ",
+                style::fg(&words.to_string(), 252),
+                style::fg(&chars.to_string(), 244),
+                style::fg(&spell_lbl, if self.spell_enabled { 35 } else { 244 }),
+                bg_on);
+            (plain, styled)
         };
-        let stats_plain = format!(" {}w  {}c  {} ", words, chars, spell_lbl);
-        let stats_styled = format!(" {}w  {}c  {}{} ",
-            style::fg(&words.to_string(), 252),
-            style::fg(&chars.to_string(), 244),
-            style::fg(&spell_lbl, if self.spell_enabled { 35 } else { 244 }),
-            bg_on);
 
         let middle_plain: String = if self.mode == Mode::Command {
             format!(" :{}", self.cmdline)
@@ -1234,6 +1278,69 @@ impl App {
             n += self.buf.line(i).split_whitespace().count();
         }
         n
+    }
+
+    /// Lines / words / chars over the current Visual selection. For
+    /// charwise (`v`) the span is the byte range between cursor and
+    /// anchor, inclusive of the cell under the cursor. For linewise
+    /// (`V`) it's whole lines. For block (`Ctrl-V`) it's the column
+    /// range on each spanned line. Caller only invokes this in
+    /// Visual modes — outside Visual the result is meaningless.
+    fn compute_selection_stats(&self) -> (usize, usize, usize) {
+        match self.mode {
+            Mode::VisualLine => {
+                let l1 = self.visual_anchor_line.min(self.cur_line);
+                let l2 = self.visual_anchor_line.max(self.cur_line);
+                let mut chars = 0usize;
+                let mut words = 0usize;
+                for i in l1..=l2 {
+                    let line = self.buf.line(i);
+                    chars += line.chars().count() + 1; // +1 for the newline
+                    words += line.split_whitespace().count();
+                }
+                let lines = l2 - l1 + 1;
+                (lines, words, chars.saturating_sub(1)) // drop final newline
+            }
+            Mode::VisualBlock => {
+                let l1 = self.visual_anchor_line.min(self.cur_line);
+                let l2 = self.visual_anchor_line.max(self.cur_line);
+                let c1 = self.visual_anchor_col.min(self.cur_col);
+                let c2 = self.visual_anchor_col.max(self.cur_col);
+                let mut chars = 0usize;
+                let mut words = 0usize;
+                for i in l1..=l2 {
+                    let line = self.buf.line(i);
+                    let lo = c1.min(line.len());
+                    let hi = (c2 + 1).min(line.len());
+                    let mut a = lo;
+                    while a < hi && !line.is_char_boundary(a) { a += 1; }
+                    let mut b = hi;
+                    while b < line.len() && !line.is_char_boundary(b) { b += 1; }
+                    let slice = &line[a..b];
+                    chars += slice.chars().count();
+                    words += slice.split_whitespace().count();
+                }
+                (l2 - l1 + 1, words, chars)
+            }
+            _ => {
+                // Charwise.
+                let cur = self.cursor_byte();
+                let (lo, hi) = if cur < self.visual_anchor {
+                    (cur, self.visual_anchor)
+                } else {
+                    (self.visual_anchor, cur)
+                };
+                // Include the cell under the cursor (vim's inclusive end).
+                let total = self.buf.rope.len_bytes();
+                let mut hi2 = (hi + 1).min(total);
+                while hi2 < total && !self.buf.rope.to_string().is_char_boundary(hi2) { hi2 += 1; }
+                let span: String = self.buf.rope.byte_slice(lo..hi2).to_string();
+                let chars = span.chars().count();
+                let words = span.split_whitespace().count();
+                let lines = span.matches('\n').count() + 1;
+                (lines, words, chars)
+            }
+        }
     }
 
     fn set_status(&mut self, msg: &str, c: u8) { self.status = Some((msg.into(), c)); }
@@ -2928,11 +3035,55 @@ impl App {
                         self.cur_col += other.len();
                         self.want_col = self.cur_col;
                         if self.capturing_insert { self.captured_insert.push_str(other); }
+                        // Auto-wrap on space when the line outgrew tw.
+                        // Only fires when the user just typed a space —
+                        // breaking on every char would cut words.
+                        if self.textwidth > 0 && c == ' ' {
+                            self.auto_wrap();
+                        }
                     }
                 }
             }
         }
         false
+    }
+
+    /// If the current line exceeds `textwidth` characters, replace
+    /// the last whitespace at-or-before the cursor with a newline so
+    /// typing continues on the next line. Adjusts cursor position.
+    /// Skips when no suitable break point exists (e.g. one giant
+    /// word) so we never mid-word break. Records nothing in the dot
+    /// register — the user kept typing; this is presentation glue.
+    fn auto_wrap(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        if line.chars().count() <= self.textwidth { return; }
+        let bytes = line.as_bytes();
+        let cur = self.cur_col.min(bytes.len());
+        // Walk back from just-before-cursor to find a whitespace
+        // that's not the very first non-whitespace position
+        // (preserves leading indent on the wrapped line).
+        let leading_ws = bytes.iter().take_while(|b| **b == b' ' || **b == b'\t').count();
+        let mut break_at: Option<usize> = None;
+        let mut i = cur;
+        while i > leading_ws {
+            i -= 1;
+            if bytes[i] == b' ' || bytes[i] == b'\t' {
+                break_at = Some(i);
+                break;
+            }
+        }
+        let Some(b) = break_at else { return };
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        let abs = line_off + b;
+        self.buf.apply(abs, abs + 1, "\n");
+        // Cursor was at byte `cur` of the original line (cur > b
+        // since we walked back from cur). After replacing one byte
+        // with '\n', the cursor is on the new line at column
+        // `cur - b - 1`.
+        let new_col = cur.saturating_sub(b + 1);
+        self.cur_line += 1;
+        self.cur_col = new_col;
+        self.want_col = self.cur_col;
     }
 
     // ── Dot-repeat replay ──────────────────────────────────────────────
@@ -3295,6 +3446,29 @@ impl App {
             }
             "reg" | "registers" | "display" => {
                 self.show_reg_popup();
+                false
+            }
+            "read" | "reading" => {
+                self.reading_mode = true;
+                self.set_status(" reading mode (use :noread to exit)", 244);
+                false
+            }
+            "noread" | "noreading" => {
+                self.reading_mode = false;
+                self.set_status(" reading mode off", 244);
+                false
+            }
+            other if other.starts_with("set textwidth") || other.starts_with("set tw") => {
+                let key = if other.starts_with("set textwidth") { "set textwidth" } else { "set tw" };
+                let v = other.trim_start_matches(key).trim_start_matches('=').trim();
+                if v.is_empty() {
+                    self.set_status(&format!(" textwidth={} (0=off)", self.textwidth), 244);
+                } else if let Ok(n) = v.parse::<usize>() {
+                    self.textwidth = n;
+                    self.set_status(&format!(" textwidth={}", n), 244);
+                } else {
+                    self.set_status(" usage: :set textwidth=N", 196);
+                }
                 false
             }
             other if other.starts_with("set spelllang") || other.starts_with("set lang") => {
