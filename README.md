@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.20** — daily-driveable for prose. Implemented:
+**v0.1.21** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -85,7 +85,7 @@ Requires `claude` on `PATH` (both commands).
 | Text objects | `iw aw i" a" i' a' i\` a\` i( a( i[ a[ i{ a{ i< a< ip ap` (+ `ib`/`iB` aliases) |
 | Edit primitives | `x X r{c}`, `J`, `~`, `p P` |
 | Visual modes | `v` charwise, `V` linewise, `Ctrl-v` block — operate with any operator |
-| Registers | `"a` … `"z`, `"+`/`"*` (system clipboard via OSC 52), `"0` last yank, unnamed `""` |
+| Registers | `"a` … `"z`, `"+`/`"*` (system clipboard via OSC 52), `"0` last yank, unnamed `""`. Named registers persist to `~/.config/scribe/registers.json` on every yank — survives restarts AND shares live across concurrent scribe sessions (yank in scribe A, `"ap` in scribe B). |
 | Search | `/ ?` (regex), `n N`, `* #` (word under cursor) |
 | Substitute | `:s/pat/rep/[gi]` current line, `:%s/pat/rep/[gi]` whole buffer, atomic undo |
 | Undo | `u` undo, `Ctrl-R` redo, undo **tree** in memory; cursor follows the edit site |
@@ -105,7 +105,6 @@ Requires `claude` on `PATH` (both commands).
 ## Roadmap
 
 - **Multi-line state in source highlighting** — block comments / multi-line strings keep their color across line breaks. Currently line-stateless (visible at the top of any file with a `/* */` block).
-- **Persistent registers** — yank survives across scribe restarts (`~/.config/scribe/registers.json`).
 - **Reading mode** (`:read` toggle) — distraction-free, prose-styled, dim chrome, Markdown rendered.
 - **HyperList editing intelligence** — Tab fold/unfold, smart auto-indent, Operator preservation.
 - **Cross-session shared registers** via Unix socket — yank in one scribe, paste in another.

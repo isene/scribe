@@ -389,7 +389,7 @@ impl App {
             cmdline: String::new(), status: None,
             cols, rows, header, main_p, footer,
             pending: Pending::default(),
-            regs: Registers::new(),
+            regs: Registers::load(),
             search: SearchState::new(),
             visual_anchor: 0,
             visual_anchor_line: 0,
