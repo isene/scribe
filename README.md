@@ -25,15 +25,15 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Claude Code integration
 
-`:claude` runs `claude -p` with your text on stdin and splices the response back. The behaviour adapts to your mode:
+`:claude` runs `claude -p` with your text on stdin and splices the response back. The scoping is deliberately conservative — whole-buffer replacement requires an explicit selection so a stray prompt can't silently destroy your file:
 
 ```
 :claude rewrite this paragraph in plainer English
    → with a Visual selection: replace the selection with the response
-   → without selection: rewrite the whole buffer
+   → without selection:        replace the CURRENT PARAGRAPH (text-object `ap`)
 
 :claude what's a tighter version of this?
-   → same scoping rules (selection > buffer)
+   → same scoping rules: selection > current paragraph
 
 :claude grammar
    → shorthand: "Fix grammar, spelling, punctuation. Preserve meaning + tone."
@@ -48,9 +48,29 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
    → input = buffer up to cursor; INSERT response at cursor (no replace)
 ```
 
-Verbs (`grammar`, `tighten`, `plain`, `continue`) are baked-in shortcuts. Anything else is sent verbatim as the prompt. The whole turn is one compound undo node, so `u` reverses the change in one step.
+To rewrite the **whole buffer**, select it first: `ggVG:claude …`.
 
-Requires `claude` on `PATH`.
+Verbs (`grammar`, `tighten`, `plain`, `continue`) are baked-in shortcuts. Anything else is sent verbatim as the prompt. The whole turn is one compound undo node, so `u` reverses the change in one step. The status line shows ` claude: NNN chars  (u to undo)` after a successful turn as a reminder.
+
+If Claude has rewritten code into prose (or vice versa) and the highlighter looks wrong, swap it with `:set syntax=plain` / `:set syntax=markdown` / `:set syntax=rust` — see the [status table](#status) below for the full list of recognised syntaxes.
+
+### Full Claude Code session — `:chat`
+
+For multi-turn discussion, `:chat` suspends scribe and opens a regular interactive Claude Code session in the same terminal. The current buffer (including unsaved edits) is snapshotted to `/tmp/scribe-chat-<pid>.txt` and its path is mentioned in the initial message, so Claude can read it on demand:
+
+```
+:chat
+   → scribe yields the terminal; you're in `claude` interactively.
+   → ask anything, paste excerpts, iterate. The buffer's tempfile path
+     is in claude's first message — read it via /file or just ask claude
+     to read it.
+   → /exit (or claude's normal quit) returns you to scribe, buffer
+     untouched.
+```
+
+Use `:claude {prompt}` for surgical one-shot edits where you want the response spliced back; use `:chat` when you want a real conversation.
+
+Requires `claude` on `PATH` (both commands).
 
 ## Status
 
@@ -72,11 +92,12 @@ Requires `claude` on `PATH`.
 | Dot-repeat | `.` replays the last change (operator + motion + inserted text, replace, paste) |
 | Spellcheck | `:set spell`, `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
 | Themes | `:set theme=NAME` (monokai / solarized / nord / dracula / gruvbox / plain), `--theme=NAME` CLI |
+| Syntax override | `:set syntax=NAME` (plain / email / rust / md / py / sh / …) — change the buffer's filetype on the fly |
 | Line numbers | `:set number` / `:set rnu` (relative) / `:set nonumber` |
-| Claude | `:claude {prompt}` (see [section above](#claude-code-integration)) |
+| Claude | `:claude {prompt}` one-shot, `:chat` interactive session (see [Claude Code integration](#claude-code-integration)) |
 | Command history | Up / Down at the `:` prompt, persisted in `~/.config/scribe/cmdhistory` |
 | Ex commands | `:w :q :q! :wq :x :e <path> :set …` |
-| Quit | `q` save+quit, `Q` quit no save (Fe₂O₃ harmonised; vim ex-style still works) |
+| Quit | `q` quits when clean (refuses + warns if dirty), `Q` quits + discards changes, `:wq` saves + quits. Every save first writes `<path>.scribe-bak` so an accidental `:wq` after a destructive `:claude` is recoverable. |
 
 ## Roadmap
 

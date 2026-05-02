@@ -128,6 +128,16 @@ impl Buffer {
         let Some(path) = self.path.clone() else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "no file"));
         };
+        // Belt + braces: snapshot the current on-disk content to
+        // `<path>.scribe-bak` before overwriting. Survives accidental
+        // `:wq` after a destructive `:claude` turn — the original file is
+        // one rename away. Failure to write the backup is non-fatal; the
+        // save still proceeds.
+        if path.exists() {
+            let mut bak = path.clone().into_os_string();
+            bak.push(".scribe-bak");
+            let _ = std::fs::copy(&path, std::path::PathBuf::from(bak));
+        }
         let mut s = String::new();
         for chunk in self.rope.chunks() { s.push_str(chunk); }
         std::fs::write(&path, s)?;

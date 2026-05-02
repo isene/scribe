@@ -1535,13 +1535,16 @@ impl App {
                 return self.run_command_prompt();
             }
 
-            // Fe2O3 harmonized quit
+            // Fe2O3 harmonized quit, but with a guard against silent
+            // overwrites: `q` quits when clean, refuses with a status
+            // message when dirty. The user used to lose original files
+            // when hitting `q` after a destructive `:claude` turn — that
+            // saved the response over the source on disk. Now they must
+            // explicitly `:wq` to commit or `Q` to discard.
             "q" => {
                 if self.buf.dirty {
-                    if let Err(e) = self.buf.save() {
-                        self.set_status(&format!(" save failed: {}", e), 196);
-                        return false;
-                    }
+                    self.set_status(" unsaved changes — :wq to save+quit, Q to discard", 196);
+                    return false;
                 }
                 return true;
             }
@@ -2282,7 +2285,7 @@ impl App {
     /// Returns true to quit the editor.
     fn execute_command(&mut self, cmd: &str) -> bool {
         match cmd {
-            "w" => {
+            "w" | "W" => {
                 match self.buf.save() {
                     Ok(_)  => self.set_status(" written", 46),
                     Err(e) => self.set_status(&format!(" save failed: {}", e), 196),
@@ -2291,7 +2294,10 @@ impl App {
             }
             "q"  => { if self.buf.dirty { self.set_status(" unsaved changes (use :q! to force)", 196); false } else { true } }
             "q!" => true,
-            "wq" | "x" => {
+            // `:Wq` / `:WQ` / `:wQ` accepted as aliases for `:wq` so a
+            // sticky shift key (or muscle memory) doesn't bounce the user
+            // out with "unknown: Wq".
+            "wq" | "Wq" | "wQ" | "WQ" | "x" | "X" => {
                 let _ = self.buf.save();
                 true
             }
@@ -2340,6 +2346,43 @@ impl App {
                 self.relative_numbers = false;
                 false
             }
+            other if other.starts_with("set syntax") => {
+                // `:set syntax=NAME` — override the buffer's detected file
+                // kind so the renderer treats the content as `NAME`.
+                // Useful after `:claude` has rewritten code into prose, or
+                // when scribe guessed Plain for an unrecognised extension.
+                let name = other.trim_start_matches("set syntax")
+                    .trim_start_matches('=')
+                    .trim();
+                if name.is_empty() {
+                    let label = match &self.buf.kind {
+                        FileKind::Plain => "plain".to_string(),
+                        FileKind::Email => "email".to_string(),
+                        FileKind::Source(s) => s.clone(),
+                    };
+                    self.set_status(&format!(" syntax: {} | use :set syntax=NAME", label), 244);
+                } else {
+                    match name {
+                        "plain" | "text" | "txt" | "none" => {
+                            self.buf.kind = FileKind::Plain;
+                            self.set_status(" syntax: plain", 244);
+                        }
+                        "email" | "mail" | "eml" => {
+                            self.buf.kind = FileKind::Email;
+                            self.set_status(" syntax: email", 244);
+                        }
+                        n => {
+                            if highlight::lang_known(n).is_some() {
+                                self.buf.kind = FileKind::Source(n.to_string());
+                                self.set_status(&format!(" syntax: {}", n), 244);
+                            } else {
+                                self.set_status(&format!(" unknown syntax: {}", n), 196);
+                            }
+                        }
+                    }
+                }
+                false
+            }
             other if other.starts_with("set theme") => {
                 let name = other.trim_start_matches("set theme")
                     .trim_start_matches('=')
@@ -2373,6 +2416,7 @@ impl App {
                 self.run_claude_command(raw_prompt);
                 false
             }
+            "chat" => { self.run_chat_session(); false }
             other => {
                 self.set_status(&format!(" unknown: {}", other), 196);
                 false
@@ -2462,14 +2506,16 @@ impl App {
     /// `:claude {prompt}` — pipe a slice of the buffer through `claude -p`
     /// and splice the response back in.
     ///
-    /// Input scope:
+    /// Input scope (deliberately conservative — whole-buffer replacement
+    /// requires an explicit selection like `ggVG`):
     ///   * `:claude` (no args) or `:claude continue` — input is the buffer
     ///     up to the cursor; the response is INSERTED at the cursor (no
     ///     replacement). Use this to extend a draft.
     ///   * Otherwise, if a Visual selection is active when `:` was pressed,
     ///     input is the selection and the response REPLACES it.
-    ///   * Otherwise, input is the whole buffer and the response replaces
-    ///     it. Use this for "rewrite the whole thing" passes.
+    ///   * Otherwise, input is the CURRENT PARAGRAPH (text-object `ap`)
+    ///     and the response replaces just that paragraph. To rewrite the
+    ///     whole buffer, select it explicitly first: `ggVG:claude …`.
     ///
     /// Verb shortcuts (the second word after `:claude`):
     ///   * `grammar`  — fix grammar/punctuation, preserve meaning + tone
@@ -2492,11 +2538,26 @@ impl App {
 
         match claude_run(&prompt, &input_text) {
             Ok(response) => {
+                // Normalise trailing newlines: trim everything claude
+                // appended, then add exactly one back IF the input we
+                // replaced ended with `\n`. Otherwise the response's
+                // last line concatenates with the next byte after the
+                // replaced range — typically the `\n` of a trailing
+                // blank line, which gets consumed and the blank line
+                // disappears. Tightening "para1\npara2\n…" then losing
+                // the blank between paragraphs was the v0.1.18 bug.
                 let response = response.trim_end_matches('\n').to_string();
                 if response.is_empty() {
                     self.set_status(" claude returned empty response", 196);
                     return;
                 }
+                let response = if input_text.ends_with('\n') {
+                    let mut s = response;
+                    s.push('\n');
+                    s
+                } else {
+                    response
+                };
                 self.buf.begin_compound();
                 if replace {
                     self.buf.apply(input_start, input_end, &response);
@@ -2507,7 +2568,7 @@ impl App {
                     self.cursor_to_byte(cur + response.len());
                 }
                 self.buf.end_compound();
-                self.set_status(&format!(" claude: {} chars", response.len()), 46);
+                self.set_status(&format!(" claude: {} chars  (u to undo)", response.len()), 46);
             }
             Err(e) => self.set_status(&format!(" claude: {}", e), 196),
         }
@@ -2544,10 +2605,17 @@ impl App {
             let text = self.buf.rope.byte_slice(lo..hi2).to_string();
             return (lo, hi2, text, true);
         }
-        // Whole buffer.
-        let total = self.buf.rope.len_bytes();
-        let text = self.buf.rope.to_string();
-        (0, total, text, true)
+        // No selection: use the current paragraph (text-object `ap`).
+        // Whole-buffer replacement requires an explicit selection
+        // (`ggVG`) so a stray `:claude rewrite` can't silently destroy
+        // the whole file.
+        let cur = self.cursor_byte();
+        if let Some((lo, hi)) = textobj::around_paragraph(&self.buf, cur) {
+            let text = self.buf.rope.byte_slice(lo..hi).to_string();
+            return (lo, hi, text, true);
+        }
+        // Empty buffer / cursor on a blank-only line: insert at cursor.
+        (cur, cur, String::new(), false)
     }
 
     /// Map verb shortcuts to a longer prompt; passthrough anything else.
@@ -2562,6 +2630,54 @@ impl App {
             "plain"         => "Rewrite in plainer English. Preserve meaning. Output only the rewritten text.".to_string(),
             _ => raw.to_string(),
         }
+    }
+
+    /// `:chat` — suspend scribe and open an interactive Claude Code
+    /// session in the same terminal. The current buffer content is
+    /// snapshotted to a tempfile and the path is included in the initial
+    /// message so claude can read it on demand. When the user exits the
+    /// chat (`/exit` etc.), scribe regains the terminal and the buffer is
+    /// untouched.
+    fn run_chat_session(&mut self) {
+        // Snapshot the live buffer (including unsaved changes) to a
+        // tempfile so claude can read it during the chat.
+        let pid = std::process::id();
+        let tmpfile = format!("/tmp/scribe-chat-{}.txt", pid);
+        let mut content = String::new();
+        for chunk in self.buf.rope.chunks() { content.push_str(chunk); }
+        let _ = std::fs::write(&tmpfile, &content);
+
+        let path_label = self.buf.path.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "[no name]".into());
+        let initial = format!(
+            "I'm editing {} in scribe. The current buffer content (including unsaved edits) is in {}. \
+            Help me work with this text — feel free to read the snapshot when you need to. \
+            When you're done, /exit returns me to the editor.",
+            path_label, tmpfile
+        );
+
+        // Release the terminal so claude has full keyboard control.
+        // Bracketed-paste mode would interfere with claude's own input
+        // handling, so disable it for the duration.
+        use std::io::Write as _;
+        print!("\x1b[?2004l");
+        let _ = std::io::stdout().flush();
+        Crust::cleanup();
+        Crust::clear_screen();
+
+        let _ = std::process::Command::new("claude")
+            .arg(&initial)
+            .status();
+
+        // Restore scribe's terminal state and force a full repaint.
+        Crust::init();
+        Crust::set_app_identity("Scribe");
+        print!("\x1b[?2004h");
+        let _ = std::io::stdout().flush();
+        let _ = std::fs::remove_file(&tmpfile);
+        self.handle_resize();
+        self.set_status(" back from chat", 244);
     }
 }
 

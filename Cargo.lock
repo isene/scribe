@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "crossterm",
  "libc",
@@ -236,7 +236,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scribe"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-highlight",
