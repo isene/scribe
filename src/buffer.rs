@@ -94,6 +94,20 @@ impl Buffer {
         }
     }
 
+    /// Build an in-memory buffer from a string. Used by `:help` (which
+    /// embeds the README at compile time) and by other internal scratch
+    /// buffers. No path → `:w` would error or save to the user's CWD;
+    /// callers that don't want save-by-accident should set `dirty=false`
+    /// after construction (already the default for help).
+    pub fn from_str(text: &str, kind: FileKind) -> Self {
+        Self {
+            rope: Rope::from_str(text),
+            path: None, dirty: false, kind,
+            nodes: Vec::new(), head: None,
+            compound_depth: 0, pending_compound: Vec::new(),
+        }
+    }
+
     pub fn from_path(path: PathBuf) -> std::io::Result<Self> {
         let s = std::fs::read_to_string(&path).unwrap_or_default();
         let kind = detect_kind(&path, &s);

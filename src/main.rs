@@ -117,6 +117,7 @@ fn main() {
     // Persist `:` command history across runs. The footer pane was the
     // editline target; its history is the live list.
     save_cmd_history(&app.footer.history);
+    app.save_session();
     Crust::cleanup();
     Crust::clear_screen();
 }
@@ -450,6 +451,14 @@ struct App {
     /// during typing when it exceeds `textwidth` characters by
     /// breaking at the last whitespace before the limit. 0 = off.
     textwidth: usize,
+    /// User keymaps loaded from scriberc's `[keymap]` section.
+    keymaps: Vec<KeyMap>,
+    /// First key of a multi-key map LHS that just fired — waiting on
+    /// the second key to either match or fall through.
+    map_pending: Option<String>,
+    /// Recursion guard: keymap RHS is fed back through the handler,
+    /// which may itself trigger maps. Cap at 4.
+    map_depth: usize,
 }
 
 impl App {
@@ -520,12 +529,58 @@ impl App {
             reading_width: rc.reading_width,
             paragraph_dim: rc.paragraph_dim,
             textwidth: 0,
+            keymaps: rc.keymaps,
+            map_pending: None,
+            map_depth: 0,
         };
         if auto_spell { app.spell_enable(); }
-        // Apply reading-mode layout if rcfile asked for it at launch —
-        // pane geometry needs to reflect reading_width / centering.
         if app.reading_mode { app.apply_layout(); }
+        // Restore cursor + scroll from the last session for this path.
+        // CLI `+N` (handled in main()) overrides this — checked there.
+        app.restore_session();
         app
+    }
+
+    /// Look up the file's last cursor + scroll position from
+    /// `~/.config/scribe/sessions.json` and apply it. Silently no-ops
+    /// when the file has no path (`Buffer::empty()`), the session file
+    /// doesn't exist, or the saved position is past EOF (file was
+    /// edited externally).
+    fn restore_session(&mut self) {
+        let Some(path) = self.buf.path.clone() else { return };
+        let key = path.to_string_lossy().to_string();
+        let sessions = load_sessions();
+        let Some(s) = sessions.get(&key) else { return };
+        let total = self.buf.line_count();
+        if total == 0 { return; }
+        self.cur_line = s.line.min(total - 1);
+        let line_len = self.buf.line(self.cur_line).len();
+        self.cur_col = s.col.min(line_len);
+        self.scroll = s.scroll.min(total.saturating_sub(1));
+        self.snap_col_to_boundary();
+        self.want_col = self.cur_col;
+    }
+
+    /// Persist the current cursor + scroll back to sessions.json. Safe
+    /// to call on quit even if the file has no path — drops silently.
+    fn save_session(&self) {
+        let Some(path) = self.buf.path.as_ref() else { return };
+        let key = path.to_string_lossy().to_string();
+        let mut sessions = load_sessions();
+        sessions.insert(key, SessionEntry {
+            line: self.cur_line,
+            col: self.cur_col,
+            scroll: self.scroll,
+        });
+        // Cap at 200 entries — discard the oldest if we go over. We
+        // don't track recency, so just trim arbitrarily; sessions.json
+        // staying small matters more than perfect LRU.
+        if sessions.len() > 200 {
+            let drop_count = sessions.len() - 200;
+            let drop_keys: Vec<String> = sessions.keys().take(drop_count).cloned().collect();
+            for k in drop_keys { sessions.remove(&k); }
+        }
+        save_sessions(&sessions);
     }
 
     // ── Spellcheck ─────────────────────────────────────────────────────
@@ -739,6 +794,19 @@ fn load_personal_dict() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One user keymap. `mode` is "normal" / "insert" / "visual" (case-
+/// insensitive); LHS is the trigger sequence in the same notation
+/// macros use (`zr`, `<C-Space>`, `<Esc>`); RHS is the expanded
+/// sequence to feed back through the input layer. RHS strings
+/// starting with `:` are treated specially — fed straight to the
+/// command executor instead of the keystroke pipeline.
+#[derive(Clone, Debug)]
+struct KeyMap {
+    mode: String,
+    lhs: Vec<String>,
+    rhs: String,
+}
+
 /// Persistent settings loaded once at startup from `~/.config/scribe/scriberc`.
 /// The runtime `:set` commands mutate the App's in-memory state directly
 /// (without writing back) — the rcfile is the user's hand-edited source of
@@ -764,6 +832,42 @@ struct RcConfig {
     paragraph_dim: bool,
     /// `read = true` — enter reading mode at startup.
     reading_mode: bool,
+    /// User keymaps from a `[keymap]` section. Format per line:
+    ///   `MODE LHS RHS`
+    /// e.g. `normal zr :read` or `insert jk <Esc>`.
+    keymaps: Vec<KeyMap>,
+}
+
+/// Per-file session state — where the cursor was last time scribe
+/// closed this path. Indexed by absolute file path so renames don't
+/// fool it. Keyed lookup on file open; written on save / quit.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct SessionEntry {
+    line: usize,
+    col: usize,
+    scroll: usize,
+}
+
+fn sessions_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/sessions.json")
+}
+
+fn load_sessions() -> std::collections::HashMap<String, SessionEntry> {
+    let Ok(content) = std::fs::read_to_string(sessions_path()) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_sessions(map: &std::collections::HashMap<String, SessionEntry>) {
+    let path = sessions_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    let Ok(json) = serde_json::to_string_pretty(map) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Path to the persistent error log. Append-only; rotated by hand if it
@@ -845,10 +949,31 @@ fn load_scriberc() -> RcConfig {
     let path = scriberc_path();
     let Ok(content) = std::fs::read_to_string(&path) else { return cfg; };
     let truthy = |v: &str| matches!(v.trim(), "true" | "1" | "yes" | "on");
+    let mut in_keymap = false;
     for line in content.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() { continue; }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let stripped = line.split('#').next().unwrap_or("").trim();
+        if stripped.is_empty() { continue; }
+        // Section headers: `[keymap]` switches to whitespace-delimited
+        // 3-tuple parsing; any other `[...]` returns to the default
+        // `key = value` parser.
+        if let Some(s) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_keymap = matches!(s.trim().to_lowercase().as_str(), "keymap" | "keymaps" | "map");
+            continue;
+        }
+        if in_keymap {
+            let mut it = stripped.splitn(3, char::is_whitespace);
+            let mode = it.next().unwrap_or("").trim();
+            let lhs  = it.next().unwrap_or("").trim();
+            let rhs  = it.next().unwrap_or("").trim();
+            if mode.is_empty() || lhs.is_empty() || rhs.is_empty() { continue; }
+            cfg.keymaps.push(KeyMap {
+                mode: mode.to_lowercase(),
+                lhs: parse_macro_text(lhs),
+                rhs: rhs.to_string(),
+            });
+            continue;
+        }
+        let Some((k, v)) = stripped.split_once('=') else { continue };
         let k = k.trim();
         let v = v.trim();
         match k {
@@ -1524,6 +1649,7 @@ impl App {
 
     // ── Normal mode (pending state machine) ────────────────────────────
     fn handle_normal(&mut self, key: &str) -> bool {
+        if let Some(q) = self.try_keymap("normal", key) { return q; }
         self.status = None;
 
         // Macro register-prefix dispatch. Done first so a count / operator
@@ -2251,6 +2377,94 @@ impl App {
     /// Replay every key captured in macro register `reg`, dispatching it
     /// through the current mode handler. Replay sets `replay_depth` so
     /// keys produced by replay are NOT re-captured into a recording.
+    /// Try the keymap layer for `key` in mode `mode_name`. Returns:
+    ///   `Some(quit)` — a map fired and consumed the key (RHS ran)
+    ///   `None`       — no map matched; caller proceeds with built-in
+    ///                  handling for `key`.
+    /// Supports 1- and 2-key LHS sequences. With a 2-key map, after
+    /// the first key matches a known prefix we set `map_pending` and
+    /// consume; the next call resolves the pair (matched RHS fires;
+    /// otherwise the buffered prefix is replayed through normal
+    /// dispatch and the new key falls through).
+    fn try_keymap(&mut self, mode_name: &str, key: &str) -> Option<bool> {
+        if self.map_depth > 0 || self.keymaps.is_empty() { return None; }
+        // Resolve pending 2-key prefix first.
+        if let Some(prev) = self.map_pending.take() {
+            // Look for an exact 2-key match.
+            for m in &self.keymaps.clone() {
+                if m.mode != mode_name { continue; }
+                if m.lhs.len() == 2 && m.lhs[0] == prev && m.lhs[1] == key {
+                    return Some(self.run_keymap_rhs(&m.rhs));
+                }
+            }
+            // No match — replay the prefix as if the user typed it,
+            // then fall through so the caller handles `key`.
+            self.dispatch_key_no_map(mode_name, &prev);
+            return None;
+        }
+        // Check for 1-key exact match.
+        for m in &self.keymaps.clone() {
+            if m.mode != mode_name { continue; }
+            if m.lhs.len() == 1 && m.lhs[0] == key {
+                return Some(self.run_keymap_rhs(&m.rhs));
+            }
+        }
+        // Check for 2-key prefix; if any map starts with `key`,
+        // hold the key and wait.
+        let any_prefix = self.keymaps.iter()
+            .any(|m| m.mode == mode_name && m.lhs.len() == 2 && m.lhs[0] == key);
+        if any_prefix {
+            self.map_pending = Some(key.to_string());
+            return Some(false);
+        }
+        None
+    }
+
+    /// Execute the RHS of a triggered keymap. RHS strings starting
+    /// with `:` run as ex commands (so a user can map `zq` to `:wq`).
+    /// Other RHS strings are parsed via `parse_macro_text` and fed
+    /// back through the current mode's handler with `map_depth`
+    /// incremented so we don't infinite-loop on a mapping that
+    /// rewrites itself. Returns true if the editor should quit.
+    fn run_keymap_rhs(&mut self, rhs: &str) -> bool {
+        if let Some(cmd) = rhs.strip_prefix(':') {
+            return self.execute_command(cmd.trim());
+        }
+        let keys = parse_macro_text(rhs);
+        self.map_depth += 1;
+        let mut quit = false;
+        for k in keys {
+            quit = match self.mode {
+                Mode::Normal      => self.handle_normal(&k),
+                Mode::Insert      => self.handle_insert(&k),
+                Mode::Visual      |
+                Mode::VisualLine  |
+                Mode::VisualBlock => self.handle_visual(&k),
+                Mode::Command     => false,
+            };
+            if quit { break; }
+        }
+        self.map_depth -= 1;
+        quit
+    }
+
+    /// Dispatch a single key through the active mode's handler with
+    /// the keymap layer suppressed. Used when a 2-key prefix was
+    /// staged but the second key didn't match — we replay the
+    /// stored prefix as a normal keystroke.
+    fn dispatch_key_no_map(&mut self, _mode_name: &str, key: &str) {
+        self.map_depth += 1;
+        match self.mode {
+            Mode::Normal      => { self.handle_normal(key); }
+            Mode::Insert      => { self.handle_insert(key); }
+            Mode::Visual      |
+            Mode::VisualLine  |
+            Mode::VisualBlock => { self.handle_visual(key); }
+            Mode::Command     => {}
+        }
+        self.map_depth -= 1;
+    }
+
     fn replay_macro(&mut self, reg: char) {
         if self.replay_depth >= 4 {
             self.set_status(" macro recursion too deep", 196);
@@ -2567,6 +2781,7 @@ impl App {
     }
 
     fn handle_visual(&mut self, key: &str) -> bool {
+        if let Some(q) = self.try_keymap("visual", key) { return q; }
         // Esc / v(in same kind) returns to Normal.
         match (self.mode, key) {
             (_, "ESC") | (_, "C-[")
@@ -3045,6 +3260,7 @@ impl App {
 
     // ── Insert mode ────────────────────────────────────────────────────
     fn handle_insert(&mut self, key: &str) -> bool {
+        if let Some(q) = self.try_keymap("insert", key) { return q; }
         match key {
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
@@ -3417,6 +3633,25 @@ impl App {
         }
     }
 
+    /// Open the bundled README as an in-memory help buffer. The text is
+    /// embedded at compile time (`include_str!`) so `:help` works
+    /// without filesystem access. Buffer has no path → `:w` would
+    /// fail safely; users searching for terms use `/`, `n`, `N` as
+    /// usual. Close with `q` (clean — no save warning) to return.
+    fn open_help(&mut self) {
+        const HELP: &str = include_str!("../README.md");
+        if self.buf.dirty {
+            self.set_status(" save current buffer first (or Q to discard)", 196);
+            return;
+        }
+        self.buf = Buffer::from_str(HELP, FileKind::Source("md".into()));
+        self.cur_line = 0;
+        self.cur_col = 0;
+        self.scroll = 0;
+        self.want_col = 0;
+        self.set_status(" :help — / to search, q to close, :e <file> to return", 244);
+    }
+
     /// `:reg` popup — list contents of all named registers (and the
     /// unnamed / last-yank slots) so the user can inspect macros and
     /// yanks. Read-only: scrolls if the list is taller than the popup.
@@ -3535,6 +3770,10 @@ impl App {
             "set nospell" => {
                 self.spell_disable();
                 self.set_status(" spell off", 244);
+                false
+            }
+            "help" | "h" => {
+                self.open_help();
                 false
             }
             "config" | "Config" => {

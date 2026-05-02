@@ -27,7 +27,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Status
 
-**v0.1.26** — daily-driveable for prose. Full feature reference below.
+**v0.1.27** — daily-driveable for prose. Full feature reference below.
 
 ## Reference
 
@@ -203,6 +203,32 @@ Source highlight handles **multi-line state**: block comments and string literal
 - `W` save current settings to `~/.config/scribe/scriberc` (preserves comments and unknown keys)
 - `ESC` close
 
+### Help
+
+`:help` (or `:h`) opens the bundled README in the current buffer as a Markdown source — search with `/`, navigate with normal motions. Refuses if the current buffer is dirty (save or `Q` first). `:e <file>` returns to your work.
+
+### Sessions
+
+Cursor position + scroll for every file you edit are saved to `~/.config/scribe/sessions.json` on quit and restored next time you open the same path. CLI `+N` overrides the saved position. The store is capped at 200 entries.
+
+### Custom keymaps
+
+Drop a `[keymap]` section into scriberc to define your own bindings. Format per line: `MODE LHS RHS`.
+
+```
+[keymap]
+normal  zr  :read
+normal  zq  :wq
+insert  jk  <Esc>
+normal  qq  :q!
+```
+
+- `MODE` is `normal`, `insert`, or `visual`.
+- `LHS` is 1- or 2-key — single chars or vim-style escapes (`<Esc>`, `<C-Space>`, `<CR>`, `<C-Up>`).
+- `RHS` starting with `:` runs as an ex command. Anything else is fed back through the input layer as if you typed it.
+
+User maps take precedence over scribe's built-in `zr`/`zq`/`zn`/`zp` shortcuts (which stay as defaults if you don't define your own).
+
 ### Quick keys (Z prefix)
 
 | Keys | Action |
@@ -323,6 +349,7 @@ paragraphdim = true          # Limelight-style dim of non-current paragraphs
 | `~/.config/scribe/scriberc` | persistent settings |
 | `~/.config/scribe/cmdhistory` | `:` command history (capped at 100) |
 | `~/.config/scribe/registers.json` | persisted yank/macro registers |
+| `~/.config/scribe/sessions.json` | per-file cursor + scroll positions |
 | `~/.config/scribe/spell.add` | personal dictionary for `zg` |
 | `~/.config/scribe/scribe.log` | error log (panics + backtraces) |
 | `<file>.scribe-bak` | one-step backup written before every save |
