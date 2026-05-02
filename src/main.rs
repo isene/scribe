@@ -2254,22 +2254,19 @@ impl App {
     }
 
     // ── Command mode ───────────────────────────────────────────────────
-    /// Pointer-style command prompt: hand the input to crust's `pane.ask`
-    /// which runs its own editline against the footer pane. No
-    /// render_all-per-keystroke (the source of the v0.1.13 cmdline
-    /// flicker), and the cursor placement is handled inside crust where
-    /// the pane geometry already lives — no raw `\x1b[r;cH` from scribe.
+    /// Pointer-style command prompt — match pointer's flow exactly:
+    ///   let cmd = pane.ask_with_bg(":", "", BG);
+    ///   render the pane back to its normal state;
+    ///   run the command.
+    /// No mid-ask render_all and no position_cursor calls — crust's
+    /// editline owns the cursor for the duration of the prompt.
     fn run_command_prompt(&mut self) -> bool {
-        // Use a darker bg (cmd_bg, palette 17) to match pointer's `:` prompt
-        // styling. ask_with_bg restores the pane bg after Enter / Esc.
         let cmd = self.footer.ask_with_bg(":", "", 17);
-        let cmd = cmd.trim().to_string();
-        // ask leaves the pane painted with the prompt line; render_footer
-        // restores the regular status bar before returning.
+        // Ask painted the prompt line; restore the regular status bar.
+        // Editline already turned the cursor off on exit (see editline's
+        // tail `cursor::Hide`). render_all below will reposition + show.
         self.render_footer();
-        self.position_cursor();
-        if cmd.is_empty() { return false; }
-        let quit = self.execute_command(&cmd);
+        let quit = self.execute_command(cmd.trim());
         if !quit { self.render_all(); }
         quit
     }
@@ -2371,6 +2368,11 @@ impl App {
                     false
                 }
             }
+            other if other == "claude" || other.starts_with("claude ") => {
+                let raw_prompt = if other == "claude" { "" } else { other[7..].trim() };
+                self.run_claude_command(raw_prompt);
+                false
+            }
             other => {
                 self.set_status(&format!(" unknown: {}", other), 196);
                 false
@@ -2455,6 +2457,145 @@ impl App {
         self.buf.apply(line_start, line_end, &new_line);
         count
     }
+
+    // ── Claude integration ────────────────────────────────────────────
+    /// `:claude {prompt}` — pipe a slice of the buffer through `claude -p`
+    /// and splice the response back in.
+    ///
+    /// Input scope:
+    ///   * `:claude` (no args) or `:claude continue` — input is the buffer
+    ///     up to the cursor; the response is INSERTED at the cursor (no
+    ///     replacement). Use this to extend a draft.
+    ///   * Otherwise, if a Visual selection is active when `:` was pressed,
+    ///     input is the selection and the response REPLACES it.
+    ///   * Otherwise, input is the whole buffer and the response replaces
+    ///     it. Use this for "rewrite the whole thing" passes.
+    ///
+    /// Verb shortcuts (the second word after `:claude`):
+    ///   * `grammar`  — fix grammar/punctuation, preserve meaning + tone
+    ///   * `tighten`  — make it more concise
+    ///   * `plain`    — rewrite in plainer English
+    ///   * anything else is sent verbatim as the prompt
+    ///
+    /// All edits go through one `begin_compound` / `end_compound` pair so
+    /// a single `u` reverses the entire Claude turn.
+    fn run_claude_command(&mut self, raw_prompt: &str) {
+        let (input_start, input_end, input_text, replace) = self.claude_input(raw_prompt);
+        let prompt = self.claude_prompt(raw_prompt);
+
+        // Show "asking…" status now and force a footer paint so the user
+        // sees something while claude -p runs (which can take 5-30s).
+        self.set_status(" asking claude…", 244);
+        self.render_footer();
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+
+        match claude_run(&prompt, &input_text) {
+            Ok(response) => {
+                let response = response.trim_end_matches('\n').to_string();
+                if response.is_empty() {
+                    self.set_status(" claude returned empty response", 196);
+                    return;
+                }
+                self.buf.begin_compound();
+                if replace {
+                    self.buf.apply(input_start, input_end, &response);
+                    self.cursor_to_byte(input_start + response.len());
+                } else {
+                    let cur = self.cursor_byte();
+                    self.buf.apply(cur, cur, &response);
+                    self.cursor_to_byte(cur + response.len());
+                }
+                self.buf.end_compound();
+                self.set_status(&format!(" claude: {} chars", response.len()), 46);
+            }
+            Err(e) => self.set_status(&format!(" claude: {}", e), 196),
+        }
+        // Exit visual after running so the user lands back in Normal with
+        // the cursor at the end of the inserted/replaced region.
+        if self.mode.is_visual() { self.mode = Mode::Normal; }
+    }
+
+    /// Resolve the input range + text + replace-vs-insert flag for the
+    /// `:claude {raw_prompt}` invocation. See `run_claude_command` doc for
+    /// the rules.
+    fn claude_input(&self, raw_prompt: &str) -> (usize, usize, String, bool) {
+        // continue / empty → insert at cursor, input = preceding buffer.
+        if raw_prompt.is_empty() || raw_prompt == "continue" {
+            let cur = self.cursor_byte();
+            let text = self.buf.rope.byte_slice(0..cur).to_string();
+            return (cur, cur, text, false);
+        }
+        // Visual selection wins when active.
+        if self.mode.is_visual() {
+            let cur = self.cursor_byte();
+            let (lo, hi) = if cur < self.visual_anchor {
+                (cur, self.visual_anchor)
+            } else {
+                (self.visual_anchor, cur)
+            };
+            let s = self.buf.rope.to_string();
+            let mut hi2 = hi;
+            if hi2 < s.len() {
+                let mut p = hi2 + 1;
+                while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                hi2 = p;
+            }
+            let text = self.buf.rope.byte_slice(lo..hi2).to_string();
+            return (lo, hi2, text, true);
+        }
+        // Whole buffer.
+        let total = self.buf.rope.len_bytes();
+        let text = self.buf.rope.to_string();
+        (0, total, text, true)
+    }
+
+    /// Map verb shortcuts to a longer prompt; passthrough anything else.
+    /// All shortcut prompts end with "Output only the …" so claude -p
+    /// returns a clean drop-in replacement (no preamble, no trailing
+    /// commentary).
+    fn claude_prompt(&self, raw: &str) -> String {
+        match raw {
+            "" | "continue" => "Continue the text naturally from where it leaves off. Output only the continuation, no preamble.".to_string(),
+            "grammar"       => "Fix grammar, spelling, and punctuation. Preserve meaning, tone, and voice. Output only the corrected text.".to_string(),
+            "tighten"       => "Rewrite to be more concise. Preserve meaning and voice. Output only the rewritten text.".to_string(),
+            "plain"         => "Rewrite in plainer English. Preserve meaning. Output only the rewritten text.".to_string(),
+            _ => raw.to_string(),
+        }
+    }
+}
+
+/// Spawn `claude -p PROMPT` with `input` on stdin, return the captured
+/// stdout on success or a short error message on failure. Synchronous —
+/// blocks until claude exits.
+fn claude_run(prompt: &str, input: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("claude")
+        .args(["-p", prompt])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "binary not on PATH".to_string(),
+            _ => format!("spawn: {}", e),
+        })?;
+    if !input.is_empty() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(input.as_bytes())
+                .map_err(|e| format!("stdin write: {}", e))?;
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output()
+        .map_err(|e| format!("wait: {}", e))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let snippet = err.lines().next().unwrap_or("(no message)");
+        return Err(snippet.chars().take(80).collect());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 // EmailLineStyle, line_style_email, find_sig_start, InlineToken,
