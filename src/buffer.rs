@@ -82,6 +82,12 @@ pub struct Buffer {
     /// reaches 0) commits the accumulated edits as a single node.
     compound_depth: usize,
     pending_compound: Vec<Edit>,
+    /// True for files that decrypt on open and re-encrypt on save (HL
+    /// dotfile convention: `.foo.hl` is auto-encrypted on disk).
+    pub encrypted: bool,
+    /// In-memory password for the encrypted file. Never persisted.
+    /// Cleared when the buffer is replaced (`:e <other>`).
+    pub password: Option<String>,
 }
 
 impl Buffer {
@@ -91,6 +97,8 @@ impl Buffer {
             path: None, dirty: false, kind: FileKind::Plain,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            encrypted: false,
+            password: None,
         }
     }
 
@@ -105,6 +113,8 @@ impl Buffer {
             path: None, dirty: false, kind,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            encrypted: false,
+            password: None,
         }
     }
 
@@ -116,7 +126,22 @@ impl Buffer {
             path: Some(path), dirty: false, kind,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            encrypted: false,
+            password: None,
         })
+    }
+
+    /// Used by the dotfile auto-decrypt path in main().
+    pub fn from_decrypted(path: PathBuf, plaintext: String, password: String) -> Self {
+        let kind = detect_kind(&path, &plaintext);
+        Self {
+            rope: Rope::from_str(&plaintext),
+            path: Some(path), dirty: false, kind,
+            nodes: Vec::new(), head: None,
+            compound_depth: 0, pending_compound: Vec::new(),
+            encrypted: true,
+            password: Some(password),
+        }
     }
 
     /// Begin grouping subsequent `apply()` calls into a single undo node.
@@ -142,19 +167,24 @@ impl Buffer {
         let Some(path) = self.path.clone() else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "no file"));
         };
-        // Belt + braces: snapshot the current on-disk content to
-        // `<path>.scribe-bak` before overwriting. Survives accidental
-        // `:wq` after a destructive `:claude` turn — the original file is
-        // one rename away. Failure to write the backup is non-fatal; the
-        // save still proceeds.
-        if path.exists() {
+        if !self.encrypted && path.exists() {
+            // Skip backup for encrypted files: writing the cleartext
+            // to `<path>.scribe-bak` defeats the entire point.
             let mut bak = path.clone().into_os_string();
             bak.push(".scribe-bak");
             let _ = std::fs::copy(&path, std::path::PathBuf::from(bak));
         }
         let mut s = String::new();
         for chunk in self.rope.chunks() { s.push_str(chunk); }
-        std::fs::write(&path, s)?;
+        if self.encrypted {
+            let pw = self.password.clone()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other,
+                    "encrypted but no cached password — re-open the file"))?;
+            let cipher = encrypt(&s, &pw)?;
+            std::fs::write(&path, cipher)?;
+        } else {
+            std::fs::write(&path, s)?;
+        }
         self.dirty = false;
         Ok(())
     }
@@ -240,4 +270,109 @@ impl Buffer {
         let line_start = self.rope.line_to_byte(line);
         (line, byte - line_start)
     }
+}
+
+/// True when `path` should trigger the HL auto-decrypt flow. Matches
+/// the Ruby app's behaviour:
+///
+///   * dot-prefixed `.foo.hl` / `.foo.woim` (legacy convention), AND
+///     the file content actually starts with `ENC:`. A freshly-created
+///     dotfile that has no `ENC:` header is treated as plaintext.
+///   * any file whose first non-empty line starts with `ENC:` is
+///     auto-decrypted regardless of name. This makes `.p2.hl` work
+///     when stored at `/home/.safe/.p2.hl` and lets users put
+///     encrypted blocks anywhere they like.
+pub fn is_encrypted_dotfile(path: &PathBuf) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else { return false };
+    let dotfile_hl = name.starts_with('.')
+        && (name.ends_with(".hl") || name.ends_with(".woim"));
+    if !dotfile_hl {
+        // Non-dotfile: only encrypted iff the file content says so.
+        return looks_like_enc_file(path);
+    }
+    // Dotfile: encrypted iff the content also says so. A fresh empty
+    // dotfile is treated as plaintext (matches Ruby).
+    looks_like_enc_file(path)
+}
+
+fn looks_like_enc_file(path: &PathBuf) -> bool {
+    let Ok(s) = std::fs::read_to_string(path) else { return false };
+    s.trim_start().starts_with("ENC:")
+}
+
+/// HL encryption scheme — byte-for-byte compatible with the Ruby
+/// `hyperlist` app (and therefore with the user's existing
+/// `.p2.hl` / `.pass.hl` / etc. password files):
+///
+///   plain → "ENC:" + base64(salt[16] ‖ iv[16] ‖ aes-256-cbc(pkcs7(plain)))
+///   key  = PBKDF2-HMAC-SHA256(password, salt, 10000, 32)
+///
+/// This is intentionally NOT the openssl CLI's `Salted__` envelope —
+/// the Ruby implementation uses a custom container with the IV stored
+/// alongside the salt so each line / file is independently
+/// decryptable. We mirror that contract here.
+pub fn encrypt(plaintext: &str, password: &str) -> std::io::Result<String> {
+    use aes::Aes256;
+    use cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    use base64::Engine as _;
+    type Enc = cbc::Encryptor<Aes256>;
+
+    let mut salt = [0u8; 16];
+    let mut iv   = [0u8; 16];
+    getrandom::getrandom(&mut salt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("rng: {}", e)))?;
+    getrandom::getrandom(&mut iv)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("rng: {}", e)))?;
+    let key = derive_key(password, &salt);
+
+    let cipher = Enc::new(key.as_slice().into(), &iv.into());
+    let ct = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext.as_bytes());
+
+    let mut combined = Vec::with_capacity(32 + ct.len());
+    combined.extend_from_slice(&salt);
+    combined.extend_from_slice(&iv);
+    combined.extend_from_slice(&ct);
+
+    Ok(format!("ENC:{}", base64::engine::general_purpose::STANDARD.encode(combined)))
+}
+
+/// Decrypt the HL `ENC:` envelope written by [`encrypt`] (or by the
+/// Ruby `hyperlist` app). Returns the plaintext.
+pub fn decrypt(ciphertext: &str, password: &str) -> std::io::Result<String> {
+    use aes::Aes256;
+    use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use base64::Engine as _;
+    type Dec = cbc::Decryptor<Aes256>;
+
+    let payload = ciphertext.trim().strip_prefix("ENC:")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "missing ENC: prefix"))?;
+    let blob = base64::engine::general_purpose::STANDARD.decode(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("base64: {}", e)))?;
+    if blob.len() < 32 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "ENC: payload too short"));
+    }
+    let salt = &blob[0..16];
+    let iv   = &blob[16..32];
+    let ct   = &blob[32..];
+    let key = derive_key(password, salt);
+
+    let cipher = Dec::new(key.as_slice().into(), iv.into());
+    let pt = cipher.decrypt_padded_vec_mut::<Pkcs7>(ct)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other,
+            "decrypt failed (wrong password or corrupt data)"))?;
+    String::from_utf8(pt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("utf-8: {}", e)))
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+    use hmac::Hmac;
+    use sha2::Sha256;
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 10000, &mut key)
+        .expect("pbkdf2 cannot fail for 32-byte output");
+    key
 }

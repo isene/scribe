@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Modal text editor for writers — vim-like core, Claude integration, single binary. Part of the Fe2O3 Rust terminal suite."
@@ -14,6 +14,17 @@ ropey = "1.6"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# HL `ENC:` format — byte-for-byte compatible with the Ruby `hyperlist`
+# app: AES-256-CBC, key = PBKDF2-HMAC-SHA256(pw, salt, 10000, 32),
+# payload = base64(salt[16] || iv[16] || ciphertext).
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding"] }
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
 
 [profile.release]
 opt-level = 3

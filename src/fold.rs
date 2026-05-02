@@ -1,0 +1,233 @@
+//! Indent-based folding for HyperList (`.hl`) and any other syntax that
+//! uses indentation to denote structure.
+//!
+//! Model: a fold spans a line and all consecutive following lines that
+//! are indented further than it. A fold is "closed" when its body is
+//! collapsed; `Folds::is_visible(line)` returns false for hidden lines.
+//! Closing/opening a fold doesn't move text — it's purely a render-time
+//! filter.
+//!
+//! `fold_level(line)` is the indent level: each leading TAB or `*` adds
+//! one level. (HyperList accepts both for legacy reasons.)
+//!
+//! Usage:
+//!   * `Folds::toggle_at(line, lines)` — `<SPACE>` behavior. If the line
+//!     starts a fold (next line is more deeply indented), toggles
+//!     between collapsed and expanded.
+//!   * `Folds::toggle_recursive_at(line, lines)` — `<C-SPACE>`. Toggles
+//!     this fold AND every nested fold inside it.
+//!   * `Folds::set_level(n, lines)` — `\0` … `\f`. Closes every fold
+//!     deeper than `n` levels in.
+//!
+//! Storage: a `HashSet<usize>` of START line indexes that are currently
+//! closed. Cheap lookup, simple state.
+
+use std::collections::HashSet;
+
+#[derive(Default, Clone, Debug)]
+pub struct Folds {
+    closed: HashSet<usize>,
+}
+
+/// Indent level of `line`: count of leading TAB or `*` chars. Empty
+/// lines and lines beginning with neither return 0.
+pub fn fold_level(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| *c == '\t' || *c == '*')
+        .count()
+}
+
+/// Index of the last line in the fold starting at `start` — i.e. the
+/// last line whose indent is strictly greater than line `start`'s.
+/// Skips blank lines (they're considered part of whatever fold contains
+/// them). Returns `start` itself if the next line isn't a child.
+pub fn fold_end(start: usize, lines: &[String]) -> usize {
+    if start >= lines.len() { return start; }
+    let parent_lvl = fold_level(&lines[start]);
+    let mut end = start;
+    let mut i = start + 1;
+    while i < lines.len() {
+        let line = &lines[i];
+        if line.trim().is_empty() {
+            // Blank — peek ahead to see if a child follows.
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() { j += 1; }
+            if j < lines.len() && fold_level(&lines[j]) > parent_lvl {
+                end = j;
+                i = j + 1;
+                continue;
+            }
+            break;
+        }
+        if fold_level(line) > parent_lvl {
+            end = i;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// True iff `start` has at least one child line (i.e. is foldable).
+pub fn is_foldable(start: usize, lines: &[String]) -> bool {
+    fold_end(start, lines) > start
+}
+
+impl Folds {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn clear(&mut self) { self.closed.clear(); }
+
+    /// Total number of currently-closed folds.
+    pub fn count(&self) -> usize { self.closed.len() }
+
+    /// True if `line` is hidden by some closed fold above it.
+    pub fn is_visible(&self, line: usize, lines: &[String]) -> bool {
+        if self.closed.is_empty() { return true; }
+        // Scan only the closed-fold starts that are < line. A fold
+        // starting at S hides every line in (S, fold_end(S)].
+        for &s in &self.closed {
+            if s < line && fold_end(s, lines) >= line {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Iterate every closed fold start whose hidden range contains
+    /// `line`. Innermost first (largest start).
+    pub fn closed_folds_containing(&self, line: usize, lines: &[String]) -> Vec<usize> {
+        let mut hits: Vec<usize> = self.closed.iter()
+            .copied()
+            .filter(|&s| s < line && fold_end(s, lines) >= line)
+            .collect();
+        hits.sort_by(|a, b| b.cmp(a));
+        hits
+    }
+
+    /// `<SPACE>`: toggle the fold at `line`. If the cursor is on a
+    /// fold-able line, flips it. Otherwise no-op.
+    pub fn toggle_at(&mut self, line: usize, lines: &[String]) {
+        if !is_foldable(line, lines) {
+            // If user pressed SPACE inside a closed fold's body, jump
+            // to the innermost containing fold and toggle that.
+            if let Some(&s) = self.closed_folds_containing(line, lines).first() {
+                self.closed.remove(&s);
+                return;
+            }
+            return;
+        }
+        if self.closed.contains(&line) {
+            self.closed.remove(&line);
+        } else {
+            self.closed.insert(line);
+        }
+    }
+
+    /// `<C-SPACE>`: toggle the fold at `line` AND every nested fold
+    /// strictly inside it. If the outer fold is currently open, closes
+    /// the outer and every descendant. If currently closed, opens
+    /// everything back up.
+    pub fn toggle_recursive_at(&mut self, line: usize, lines: &[String]) {
+        if !is_foldable(line, lines) {
+            if let Some(&s) = self.closed_folds_containing(line, lines).first() {
+                self.toggle_recursive_at(s, lines);
+            }
+            return;
+        }
+        let end = fold_end(line, lines);
+        let was_closed = self.closed.contains(&line);
+        if was_closed {
+            // Open: clear every closed fold whose start is in [line..=end].
+            self.closed.retain(|&s| !(s >= line && s <= end));
+        } else {
+            // Close: insert this AND every child that's foldable.
+            self.closed.insert(line);
+            let mut i = line + 1;
+            while i <= end {
+                if is_foldable(i, lines) {
+                    self.closed.insert(i);
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// `\N`: globally close every fold deeper than `level` (in levels;
+    /// the line's indent count). After this call, every fold whose
+    /// start has indent >= `level` is closed; folds shallower than
+    /// `level` are open.
+    ///
+    /// `level=0` opens all folds; large `level` (e.g. 15) closes
+    /// nothing. The vim convention is "show up to N levels expanded".
+    pub fn set_level(&mut self, level: usize, lines: &[String]) {
+        self.closed.clear();
+        for (i, line) in lines.iter().enumerate() {
+            if !is_foldable(i, lines) { continue; }
+            // Fold at line `i` has indent = fold_level(line). When the
+            // user says "show level 3", folds whose START indent is >=3
+            // should be closed (their bodies are at depth > 3).
+            if fold_level(line) >= level {
+                self.closed.insert(i);
+            }
+        }
+    }
+
+    /// Open every fold (alias for `set_level(usize::MAX)` semantics).
+    pub fn open_all(&mut self) { self.closed.clear(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(s: &str) -> Vec<String> {
+        s.lines().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn fold_level_counts_tabs_and_asterisks() {
+        assert_eq!(fold_level("foo"), 0);
+        assert_eq!(fold_level("\tfoo"), 1);
+        assert_eq!(fold_level("\t\tfoo"), 2);
+        assert_eq!(fold_level("**foo"), 2);
+        assert_eq!(fold_level("\t*foo"), 2);
+    }
+
+    #[test]
+    fn fold_end_basic() {
+        let l = lines("a\n\tb\n\t\tc\n\td\ne");
+        assert_eq!(fold_end(0, &l), 3);
+        assert_eq!(fold_end(1, &l), 2);
+        assert_eq!(fold_end(4, &l), 4);
+    }
+
+    #[test]
+    fn toggle_hides_children() {
+        let l = lines("a\n\tb\n\tc\nd");
+        let mut f = Folds::new();
+        f.toggle_at(0, &l);
+        assert!(f.is_visible(0, &l));
+        assert!(!f.is_visible(1, &l));
+        assert!(!f.is_visible(2, &l));
+        assert!(f.is_visible(3, &l));
+        f.toggle_at(0, &l);
+        assert!(f.is_visible(1, &l));
+    }
+
+    #[test]
+    fn set_level_hides_deep() {
+        let l = lines("a\n\tb\n\t\tc\n\td\ne");
+        let mut f = Folds::new();
+        f.set_level(1, &l);
+        assert!(f.is_visible(0, &l));   // depth 0 always visible
+        assert!(f.is_visible(1, &l));   // depth 1 — visible at level 1
+        assert!(!f.is_visible(2, &l));  // depth 2 — hidden
+        assert!(f.is_visible(3, &l));   // depth 1 — visible
+        f.set_level(0, &l);
+        // level 0: only level-0 lines visible
+        assert!(f.is_visible(0, &l));
+        assert!(!f.is_visible(1, &l));
+    }
+}

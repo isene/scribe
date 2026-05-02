@@ -27,7 +27,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Status
 
-**v0.1.27** — daily-driveable for prose. Full feature reference below.
+**v0.1.28** — daily-driveable for prose AND HyperList. Full feature reference below.
 
 ## Reference
 
@@ -374,9 +374,13 @@ export EDITOR=scribe
 
 Scribe accepts `+N` for line-jump (vim convention), so kastrup's compose flow drops the cursor straight on the body.
 
+## HyperList
+
+Scribe ships with full `hyperlist.vim` parity for `.hl` and `.woim` files: indent folding, autonumbering, encryption (incl. dotfile auto-encrypt with byte-for-byte compatibility with the Ruby `hyperlist` app's `ENC:` format), references, exports, and more. See [HYPERLIST.md](HYPERLIST.md) or `:h hl` inside scribe.
+
 ## Roadmap
 
-- **HyperList editing intelligence** — Tab fold/unfold, smart auto-indent, operator preservation.
+- HyperList Tab fold/unfold via Tab key (currently SPACE) — minor ergonomics tweak.
 - **General `:map` system** — user-defined keymaps in scriberc instead of hardcoded built-ins.
 - **`:earlier 5m`** — time-based undo navigation.
 

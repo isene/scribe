@@ -9,6 +9,9 @@
 //! rope's helpers.
 
 mod buffer;
+mod calendar;
+mod export;
+mod fold;
 mod mode;
 mod motion;
 mod register;
@@ -55,6 +58,23 @@ fn main() {
         }
     }
     install_panic_hook();
+    // Auto-decrypt HL dotfiles before entering the alt-screen so the
+    // password prompt + any error messages stay on the regular tty.
+    // If decrypt fails, scribe exits cleanly with the openssl error.
+    let pre_decrypted: Option<(PathBuf, String, String)> = path.as_ref()
+        .filter(|p| buffer::is_encrypted_dotfile(p) && p.exists())
+        .and_then(|p| {
+            let cipher = std::fs::read_to_string(p).ok()?;
+            if cipher.is_empty() { return None; }
+            let pw = read_password_tty("Password: ").ok()?;
+            match buffer::decrypt(&cipher, &pw) {
+                Ok(plain) => Some((p.clone(), plain, pw)),
+                Err(e) => {
+                    eprintln!("scribe: decrypt failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
     Crust::init();
     Crust::set_app_identity("Scribe");
     // Bracketed paste: terminal wraps the pasted blob in `CSI 200~ ... 201~`
@@ -67,6 +87,11 @@ fn main() {
     let _ = std::io::stdout().flush();
 
     let mut app = App::new(path, cli_theme);
+    // If we pre-decrypted, swap the buffer for the plaintext + path
+    // and remember the password so save() re-encrypts.
+    if let Some((p, plain, pw)) = pre_decrypted {
+        app.buf = buffer::Buffer::from_decrypted(p, plain, pw);
+    }
     if let Some(n) = start_line {
         if n > 0 {
             let last = app.buf.line_count().saturating_sub(1);
@@ -378,6 +403,12 @@ struct App {
     z_prefix: bool,
     /// `]` or `[` prefix: next key is a bracket motion (`]s`, `[s`, …).
     bracket_prefix: Option<char>,
+    /// `\` (vim leader) prefix: next key is a leader-mapped command
+    /// (`\v` checkbox, `\h` highlight, `\0`..`\f` fold level, …).
+    leader_prefix: bool,
+    /// `\a` is overloaded — single keypress = fold level 10, but
+    /// `\an` is the autonumber toggle. Track that we're mid-`\a…`.
+    leader_a_pending: bool,
     /// Spellcheck — None until first enabled (or auto-on for email). When
     /// hunspell is missing, stays None and we set a status message.
     spell: Option<spell::Spell>,
@@ -459,6 +490,22 @@ struct App {
     /// Recursion guard: keymap RHS is fed back through the handler,
     /// which may itself trigger maps. Cap at 4.
     map_depth: usize,
+    /// Indent-based folds (HyperList + any indented format). State is
+    /// per-buffer; replaced when `:e <other>` swaps the buffer.
+    folds: fold::Folds,
+    /// `\an` / `\#` autonumber toggle. When on, Insert-mode `<CR>`
+    /// auto-increments the next item on the same level; `Ctrl-T` /
+    /// `Ctrl-D` indent / outdent with renumbering.
+    autonumber: bool,
+    /// Show/Hide pattern from `zs` / `zh` / `:show` / `:hide`. Folds
+    /// every line that doesn't match (show) or matches (hide). None
+    /// disables the filter and reverts to indent folding.
+    showhide: Option<(String, bool)>,
+    /// State / Transition underline mode cycle: 0=none, 1=state, 2=transition.
+    st_underline: u8,
+    /// `g:calendar` equivalent — destination for `\G`.
+    calendar: Option<String>,
+    alldates: bool,
 }
 
 impl App {
@@ -508,6 +555,8 @@ impl App {
             captured_insert: String::new(),
             z_prefix: false,
             bracket_prefix: None,
+            leader_prefix: false,
+            leader_a_pending: false,
             spell: None,
             spell_enabled: false,
             spell_lang: rc.spell_lang.clone().unwrap_or_else(|| "en_US".into()),
@@ -532,6 +581,12 @@ impl App {
             keymaps: rc.keymaps,
             map_pending: None,
             map_depth: 0,
+            folds: fold::Folds::new(),
+            autonumber: false,
+            showhide: None,
+            st_underline: 0,
+            calendar: rc.calendar.clone(),
+            alldates: rc.alldates,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -836,6 +891,100 @@ struct RcConfig {
     ///   `MODE LHS RHS`
     /// e.g. `normal zr :read` or `insert jk <Esc>`.
     keymaps: Vec<KeyMap>,
+    /// `calendar = email@example.com` — destination calendar for `\G`.
+    calendar: Option<String>,
+    /// `alldates = true` — include past events too.
+    alldates: bool,
+}
+
+/// Prompt on the controlling tty for a password with echo disabled.
+/// Defers to `stty -echo` since pulling in `termios` for one call is
+/// excessive. Re-enables echo on return regardless of outcome.
+fn read_password_tty(prompt: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    let _ = std::process::Command::new("stty").arg("-echo").status();
+    print!("{}", prompt);
+    let _ = std::io::stdout().flush();
+    let mut pw = String::new();
+    let stdin = std::io::stdin();
+    stdin.lock().read_line(&mut pw)?;
+    let _ = std::process::Command::new("stty").arg("echo").status();
+    println!();
+    Ok(pw.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+}
+
+/// Parse the leading number prefix of an HL item (after indentation).
+/// Returns (path_prefix, last_index, has_trailing_period).
+/// Examples:
+///   "1.2.3 foo" → ("1.2.", 3, false)
+///   "1.2.3. foo" → ("1.2.", 3, true)
+///   "5 foo"     → ("", 5, false)
+///   "5. foo"    → ("", 5, true)
+///   "foo"       → None
+fn parse_number_prefix(s: &str) -> Option<(String, u64, bool)> {
+    // Pattern: <digits>(.<digits>)*\.?<space>
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() { return None; }
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
+    let head = &s[..i];
+    // Optional trailing period inside `head` separates path from idx.
+    let trailing_period = head.ends_with('.');
+    let head_no_dot = if trailing_period { &head[..head.len()-1] } else { head };
+    let last_dot = head_no_dot.rfind('.');
+    let (prefix, idx_str) = match last_dot {
+        Some(p) => (&head[..p+1], &head_no_dot[p+1..]),
+        None    => ("", head_no_dot),
+    };
+    let idx: u64 = idx_str.parse().ok()?;
+    Some((prefix.to_string(), idx, trailing_period))
+}
+
+/// Strip the leading number+space from an HL item's body (post-indent).
+/// Returns (consumed_bytes, remainder). If no number, returns (0, s).
+fn strip_number_prefix(s: &str) -> (usize, &str) {
+    if parse_number_prefix(s).is_none() { return (0, s); }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
+    while i < bytes.len() && bytes[i] == b' ' { i += 1; }
+    (i, &s[i..])
+}
+
+/// Find the first `<…>` (or `<<…>>`) reference on `line` at or after
+/// byte offset `from`. Returns the matched substring incl. brackets.
+fn find_reference(line: &str, from: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let mut i = from.min(n);
+    while i < n {
+        if bytes[i] == b'<' {
+            // Find matching `>`. Allow one level of nesting for `<<…>>`.
+            let mut j = i + 1;
+            while j < n && bytes[j] != b'>' { j += 1; }
+            if j < n {
+                let mut end = j + 1;
+                if end < n && bytes[end] == b'>' { end += 1; } // <<...>>
+                return Some(line[i..end].to_string());
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `YYYY-MM-DD HH.MM` for HL checkbox timestamps. Local time. No
+/// dependency: divmod from Unix epoch + tz offset from libc.
+fn current_timestamp() -> String {
+    use std::process::Command;
+    // Fallback: shell out to `date` for correct local time including DST.
+    if let Ok(out) = Command::new("date").arg("+%Y-%m-%d %H.%M").output() {
+        if let Ok(s) = String::from_utf8(out.stdout) {
+            return s.trim().to_string();
+        }
+    }
+    "0000-00-00 00.00".into()
 }
 
 /// Per-file session state — where the cursor was last time scribe
@@ -995,6 +1144,8 @@ fn load_scriberc() -> RcConfig {
             }
             "paragraphdim" | "pdim" => cfg.paragraph_dim = truthy(v),
             "read" | "reading" => cfg.reading_mode = truthy(v),
+            "calendar" => if !v.is_empty() { cfg.calendar = Some(v.to_string()); },
+            "alldates" => cfg.alldates = truthy(v),
             _ => {}
         }
     }
@@ -1189,9 +1340,23 @@ impl App {
             self.current_paragraph_bounds()
         } else { (0, usize::MAX) };
 
+        // Snapshot the buffer's lines once for fold computation.
+        // Cheap on prose-sized files; if a 1MB buffer ever shows up,
+        // gate behind `folds.count() > 0` to skip the work.
+        let all_lines: Vec<String> = (0..line_count).map(|i| self.buf.line(i)).collect();
+
         let mut out = String::new();
-        for i in 0..pane_h {
-            let line_idx = self.scroll + i;
+        let mut row = 0usize;
+        let mut line_idx_walk = self.scroll;
+        while row < pane_h {
+            while line_idx_walk < line_count
+                && !self.folds.is_visible(line_idx_walk, &all_lines)
+            {
+                line_idx_walk += 1;
+            }
+            let line_idx = line_idx_walk;
+            let i = row;
+            'line: {
             if line_idx < line_count {
                 // Gutter prefix per visible line (line numbers / relative
                 // numbers). Emitted as part of the rendered text so the
@@ -1250,18 +1415,12 @@ impl App {
                     if !source_lines.is_empty() && miss_ranges.is_empty() && !line_is_dim {
                         if let Some(styled) = source_lines.get(i) {
                             out.push_str(styled);
-                            if i + 1 < pane_h { out.push('\n'); }
-                            continue;
+                            break 'line;
                         }
                     }
-                    // Unified emit: base_fg + KEY-bold + inline tokens
-                    // (addresses → magenta 201, URLs → blue 4 + OSC 8) +
-                    // misspelling overlay. Single function handles all
-                    // attribute combinations and minimises SGR transitions.
                     let tokens = highlight::inline_tokens(&line);
                     highlight::emit_email_line(&mut out, &line, base_fg, bold_until, &tokens, &miss_ranges);
-                    if i + 1 < pane_h { out.push('\n'); }
-                    continue;
+                    break 'line;
                 }
                 // Selection touches this line: char-by-char so we can apply
                 // selection bg precisely. (Email-mode fg is dropped on the
@@ -1310,7 +1469,19 @@ impl App {
             } else {
                 out.push_str(&style::fg("~", 244));
             }
+            } // end 'line:
+            // Closed-fold marker — appended after the line content so
+            // any colors emitted above are already reset.
+            if line_idx < line_count
+                && self.folds.closed_folds_containing(line_idx + 1, &all_lines)
+                       .first().copied() == Some(line_idx)
+            {
+                let count = fold::fold_end(line_idx, &all_lines).saturating_sub(line_idx);
+                out.push_str(&style::fg(&format!("  ▸ {}", count), 244));
+            }
             if i + 1 < pane_h { out.push('\n'); }
+            row += 1;
+            line_idx_walk += 1;
         }
         self.main_p.set_text(&out);
         // Diff-render: only repaints rows whose rendered output actually
@@ -1773,12 +1944,69 @@ impl App {
                 }
                 "n" => self.jump_next_misspelling(),
                 "p" => self.jump_prev_misspelling(),
+                "s" => self.showhide_word(true),
+                "h" => self.showhide_word(false),
+                "0" => {
+                    self.showhide = None;
+                    let total = self.buf.line_count();
+                    let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+                    self.folds.set_level(99, &all); // re-fold by indent
+                    self.set_status(" show/hide cleared", 244);
+                }
                 _ => {}
             }
             return false;
         }
         if key == "z" && self.pending.operator.is_none() && self.pending.count1.is_none() {
             self.z_prefix = true;
+            return false;
+        }
+
+        // Leader (`\`) prefix dispatch.
+        if self.leader_a_pending {
+            self.leader_a_pending = false;
+            if key == "n" {
+                // `\an` — autonumber toggle. Match hyperlist.vim.
+                self.autonumber = !self.autonumber;
+                self.set_status(if self.autonumber { " autonumber on" } else { " autonumber off" }, 244);
+                return false;
+            }
+            // Anything else: re-dispatch as the original `\a` (fold 10),
+            // then process `key` as a fresh keystroke.
+            self.handle_leader("a");
+            return self.handle_normal(key);
+        }
+        if self.leader_prefix {
+            self.leader_prefix = false;
+            if key == "a" {
+                // Defer: could be `\a` (fold 10) or `\an` (autonumber).
+                self.leader_a_pending = true;
+                return false;
+            }
+            return self.handle_leader(key);
+        }
+        if key == "\\" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            self.leader_prefix = true;
+            return false;
+        }
+
+        // <SPACE>: toggle fold under cursor. <C-SPACE>: toggle recursive.
+        if key == " " && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            let total = self.buf.line_count();
+            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            self.folds.toggle_at(self.cur_line, &all);
+            return false;
+        }
+        if key == "C-SPACE" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            let total = self.buf.line_count();
+            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            self.folds.toggle_recursive_at(self.cur_line, &all);
             return false;
         }
 
@@ -1919,6 +2147,22 @@ impl App {
                     // Enter `gq` operator-pending. Don't clear pending — count
                     // and register survive into the next motion / `q` shortcut.
                     self.pending.operator = Some('Q');
+                }
+                "r" => {
+                    self.pending.clear();
+                    self.goto_reference();
+                }
+                "f" => {
+                    self.pending.clear();
+                    self.open_file_under_cursor();
+                }
+                "DOWN" | "j" => {
+                    self.pending.clear();
+                    self.presentation_step(1);
+                }
+                "UP" | "k" => {
+                    self.pending.clear();
+                    self.presentation_step(-1);
                 }
                 _ => { self.pending.clear(); }
             }
@@ -2089,13 +2333,13 @@ impl App {
                 Some(b)
             }
             "j" | "DOWN" => {
-                let target_line = (self.cur_line + count).min(self.buf.line_count().saturating_sub(1));
+                let target_line = self.next_visible_line_down(self.cur_line, count);
                 let off = self.buf.line_byte_offset(target_line);
                 let len = self.buf.line(target_line).len();
                 Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
             }
             "k" | "UP" => {
-                let target_line = self.cur_line.saturating_sub(count);
+                let target_line = self.next_visible_line_up(self.cur_line, count);
                 let off = self.buf.line_byte_offset(target_line);
                 let len = self.buf.line(target_line).len();
                 Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
@@ -2201,15 +2445,19 @@ impl App {
             "A" => { self.cur_col = self.current_line_len(); self.enter_insert(); }
             "o" => {
                 let off = self.buf.line_byte_offset(self.cur_line) + self.current_line_len();
-                self.buf.apply(off, off, "\n");
+                let indent = self.indent_to_inherit();
+                self.buf.apply(off, off, &format!("\n{}", indent));
                 self.cur_line += 1;
-                self.cur_col = 0;
+                self.cur_col = indent.len();
+                self.want_col = self.cur_col;
                 self.enter_insert();
             }
             "O" => {
                 let off = self.buf.line_byte_offset(self.cur_line);
-                self.buf.apply(off, off, "\n");
-                self.cur_col = 0;
+                let indent = self.indent_to_inherit();
+                self.buf.apply(off, off, &format!("{}\n", indent));
+                self.cur_col = indent.len();
+                self.want_col = self.cur_col;
                 self.enter_insert();
             }
 
@@ -2672,6 +2920,684 @@ impl App {
         self.cur_col += s.len();
         self.want_col = self.cur_col;
         if self.capturing_insert { self.captured_insert.push_str(&s); }
+    }
+
+    /// Leading-whitespace prefix of the current line (TAB/space/`*`),
+    /// suitable for `o`/`O` to inherit on a new line. For HyperList
+    /// buffers we honour the convention; for plain text we still
+    /// indent to keep prose lists tidy.
+    fn indent_to_inherit(&self) -> String {
+        let line = self.buf.line(self.cur_line);
+        line.chars()
+            .take_while(|c| *c == '\t' || *c == ' ' || *c == '*')
+            .collect()
+    }
+
+    /// Vim-leader (`\`) dispatch. Handles fold-level `\0`..`\9`,
+    /// `\a`..`\f`, checkbox `\v`/`\V`/`\o`, highlight `\h`, and the
+    /// other HyperList-flavored leader maps. Returns true to quit
+    /// (none of these do, but keep the signature consistent).
+    fn handle_leader(&mut self, key: &str) -> bool {
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        match key {
+            // Fold levels: \0..\9 = 0..9, \a..\f = 10..15
+            "0" => self.folds.set_level(0, &all),
+            "1" => self.folds.set_level(1, &all),
+            "2" => self.folds.set_level(2, &all),
+            "3" => self.folds.set_level(3, &all),
+            "4" => self.folds.set_level(4, &all),
+            "5" => self.folds.set_level(5, &all),
+            "6" => self.folds.set_level(6, &all),
+            "7" => self.folds.set_level(7, &all),
+            "8" => self.folds.set_level(8, &all),
+            "9" => self.folds.set_level(9, &all),
+            "a" => self.folds.set_level(10, &all),
+            "b" => self.folds.set_level(11, &all),
+            "c" => self.folds.set_level(12, &all),
+            "d" => self.folds.set_level(13, &all),
+            "e" => self.folds.set_level(14, &all),
+            "f" => self.folds.set_level(15, &all),
+            // Checkboxes
+            "v" => self.toggle_checkbox(false),
+            "V" => self.toggle_checkbox(true),
+            "o" => self.mark_in_progress(),
+            // Limelight reuse
+            "h" => {
+                self.paragraph_dim = !self.paragraph_dim;
+                if !self.reading_mode { self.reading_mode = true; self.apply_layout(); }
+                self.set_status(if self.paragraph_dim { " highlight on" } else { " highlight off" }, 244);
+            }
+            // Autonumbering toggle (\an / \#).
+            "#" => {
+                self.autonumber = !self.autonumber;
+                self.set_status(if self.autonumber { " autonumber on" } else { " autonumber off" }, 244);
+            }
+            "a" if false => {} // \a is a fold level — handled above; \an is keymap-resolved by user
+            // Renumber visual selection.
+            "R" => self.renumber_visual(),
+            // State / Transition underline cycle.
+            "u" => {
+                self.st_underline = (self.st_underline + 1) % 3;
+                let label = match self.st_underline {
+                    1 => "state items underlined",
+                    2 => "transition items underlined",
+                    _ => "underlining off",
+                };
+                self.set_status(&format!(" {}", label), 244);
+            }
+            // Sort visual block by indent.
+            "s" => self.sort_visual_by_indent(),
+            // Encryption.
+            "z" => self.encrypt_lines(false),
+            "Z" => self.encrypt_lines(true),
+            "x" => self.decrypt_lines(false),
+            "X" => self.decrypt_lines(true),
+            // Calendar (Phase 4 — wire here for forward compat).
+            "G" => self.calendar_add(),
+            // Complexity (Phase 4).
+            "C" => self.complexity_report(),
+            // Exports (Phase 3).
+            "H" => self.export_to("html"),
+            "L" => self.export_to("latex"),
+            "M" => self.export_to("markdown"),
+            // Next template element ("=$" → append).
+            " " => self.jump_next_template(),
+            _ => { self.set_status(&format!(" leader \\{}: unknown", key), 244); }
+        }
+        false
+    }
+
+    /// `\v` (no_stamp) / `\V` (stamp) toggle a checkbox at the start of
+    /// the cursor's item. State machine: nothing → `[_] `, `[_]` →
+    /// `[x]` (with `\V`: also append `\` `YYYY-MM-DD HH.MM:`),
+    /// `[x]` → `[_]` (and strip the timestamp if present).
+    fn toggle_checkbox(&mut self, stamp: bool) {
+        let line = self.buf.line(self.cur_line);
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        // Find the byte index of the first non-whitespace character.
+        let body_start = line.bytes().position(|b| b != b'\t' && b != b' ' && b != b'*')
+            .unwrap_or(line.len());
+        let body = &line[body_start..];
+        let abs = line_off + body_start;
+        if body.starts_with("[O]") {
+            // In-progress → done
+            self.buf.apply(abs, abs + 3, "[x]");
+        } else if body.starts_with("[_]") {
+            let now = current_timestamp();
+            let new = if stamp {
+                format!("[x] {}: ", now)
+            } else { "[x]".into() };
+            self.buf.apply(abs, abs + 3, &new);
+        } else if body.starts_with("[x]") {
+            // Strip the optional " YYYY-MM-DD HH.MM:" timestamp suffix.
+            let after = &body[3..];
+            let mut consume = 3;
+            if let Some(rest) = after.strip_prefix(' ') {
+                if rest.len() >= 17
+                    && rest.as_bytes()[4] == b'-' && rest.as_bytes()[7] == b'-'
+                    && rest.as_bytes()[10] == b' '
+                    && rest.as_bytes()[13] == b'.'
+                    && rest.as_bytes()[16] == b':'
+                {
+                    consume += 1 + 17;
+                }
+            }
+            self.buf.apply(abs, abs + consume, "[_]");
+        } else {
+            // No checkbox yet: prepend.
+            self.buf.apply(abs, abs, "[_] ");
+            self.cur_col += 4;
+            self.want_col = self.cur_col;
+        }
+    }
+
+    /// `\o` toggle in-progress checkbox `[O]`.
+    fn mark_in_progress(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        let body_start = line.bytes().position(|b| b != b'\t' && b != b' ' && b != b'*')
+            .unwrap_or(line.len());
+        let body = &line[body_start..];
+        let abs = line_off + body_start;
+        if body.starts_with("[O]") {
+            self.buf.apply(abs, abs + 3, "[_]");
+        } else if body.starts_with("[_]") || body.starts_with("[x]") {
+            self.buf.apply(abs, abs + 3, "[O]");
+        } else {
+            self.buf.apply(abs, abs, "[O] ");
+            self.cur_col += 4;
+            self.want_col = self.cur_col;
+        }
+    }
+
+    /// `gr` — Goto Reference. Find the `<…>` reference under or after
+    /// the cursor on the current line and jump to it. Supports:
+    ///   - `<file:/path/...>` → opens the file via xdg-open (defers
+    ///     to the user's default opener for the extension).
+    ///   - `<+N>` / `<-N>` → relative line jump.
+    ///   - `<a/b/c>` → path-style search for a multi-level descendant.
+    ///   - `<Anything>` → simple text search.
+    /// Sets the `'` mark at the current position before jumping so
+    /// `''` can return.
+    fn goto_reference(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let line_start = self.buf.line_byte_offset(self.cur_line);
+        // Find the angle-bracketed reference at-or-after the cursor.
+        let body = &line[self.cur_col.min(line.len())..];
+        let abs_start_in_line = self.cur_col.min(line.len());
+        let ref_full = match find_reference(line.as_str(), abs_start_in_line)
+            .or_else(|| find_reference(body, 0))
+        {
+            Some(r) => r,
+            None => { self.set_status(" no <reference> on this line", 244); return; }
+        };
+        // Set mark `'` at current cursor.
+        self.marks.insert('\'', self.cursor_byte());
+        let inner = ref_full.trim_start_matches('<').trim_end_matches('>');
+        if let Some(path) = inner.strip_prefix("file:") {
+            self.open_path_external(path);
+            return;
+        }
+        if let Some(rest) = inner.strip_prefix('+').or_else(|| inner.strip_prefix('-')) {
+            if let Ok(n) = rest.parse::<i64>() {
+                let signed = if inner.starts_with('-') { -n } else { n };
+                let total = self.buf.line_count() as i64;
+                let target = (self.cur_line as i64 + signed).clamp(0, total - 1) as usize;
+                self.cur_line = target;
+                self.cur_col = 0;
+                self.want_col = 0;
+                let _ = line_start; // silence
+                return;
+            }
+        }
+        // Path-style or plain text search. Take the LAST segment after
+        // any `/` and search for it line-by-line, restricting matches
+        // to descendants of the previous segments. Simple version:
+        // search whole buffer for the last segment.
+        let target_text = inner.rsplit('/').next().unwrap_or(inner);
+        for i in 0..self.buf.line_count() {
+            if i == self.cur_line { continue; }
+            if self.buf.line(i).contains(target_text) {
+                self.cur_line = i;
+                self.cur_col = 0;
+                self.want_col = 0;
+                return;
+            }
+        }
+        self.set_status(&format!(" reference not found: <{}>", inner), 196);
+    }
+
+    /// `gf` — open the file referenced under the cursor in an external
+    /// program. We just shell out to `xdg-open` and let the user's
+    /// MIME associations handle the extension dispatch (which is what
+    /// the original vim plugin's per-extension switch ultimately
+    /// approximated). Falls back to `open` on macOS.
+    fn open_file_under_cursor(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let body = &line[self.cur_col.min(line.len())..];
+        // Prefer an `<file:...>` reference if there's one on the line.
+        let path: String = if let Some(r) = find_reference(line.as_str(), 0) {
+            let inner = r.trim_start_matches('<').trim_end_matches('>');
+            if let Some(p) = inner.strip_prefix("file:") { p.to_string() }
+            else { inner.to_string() }
+        } else if let Some(word) = body.split_whitespace().next() {
+            word.to_string()
+        } else {
+            self.set_status(" nothing to open", 244); return;
+        };
+        self.open_path_external(&path);
+    }
+
+    /// Spawn an external opener (xdg-open on Linux, open on macOS) for
+    /// the given path. Expands leading `~`. Best-effort; failures just
+    /// flash a status message.
+    fn open_path_external(&mut self, path: &str) {
+        let expanded = if let Some(rest) = path.strip_prefix("~/") {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(rest).to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.into())
+        } else { path.into() };
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let res = std::process::Command::new(opener)
+            .arg(&expanded)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match res {
+            Ok(_)  => self.set_status(&format!(" opened {}", expanded), 244),
+            Err(e) => self.set_status(&format!(" open failed: {}", e), 196),
+        }
+    }
+
+    /// `\R` (visual): renumber the lines in the visual selection. Uses
+    /// the FIRST selected line's number as the seed; only lines at the
+    /// same indent get renumbered. Children stay put. Mirrors
+    /// hyperlist.vim's Renumber() routine.
+    fn renumber_visual(&mut self) {
+        if !self.mode.is_visual() { return; }
+        let l1 = self.visual_anchor_line.min(self.cur_line);
+        let l2 = self.visual_anchor_line.max(self.cur_line);
+        // Read first line. Determine indent + initial number prefix.
+        let first = self.buf.line(l1);
+        let (indent, _) = first.split_at(first.bytes().position(|b| b != b'\t' && b != b'*').unwrap_or(0));
+        let body = &first[indent.len()..];
+        // Extract leading number (e.g. "1.2.3 " or "5. " or "5 ") — capture the
+        // path prefix and the trailing index that we'll increment.
+        let (prefix, mut idx, trailing_period) = parse_number_prefix(body)
+            .unwrap_or_else(|| ("".into(), 1, false));
+        self.buf.begin_compound();
+        for ln in l1..=l2 {
+            let line = self.buf.line(ln);
+            if !line.starts_with(indent) { continue; }
+            let line_indent = line.bytes().take_while(|&b| b == b'\t' || b == b'*').count();
+            if line_indent != indent.len() { continue; }
+            // Replace any existing leading number (else inject one).
+            let line_off = self.buf.line_byte_offset(ln);
+            let body = &line[indent.len()..];
+            let (existing_w, body_after_num) = strip_number_prefix(body);
+            let new_num = format!("{}{}{}", prefix, idx, if trailing_period { "." } else { "" });
+            let new_line_body = format!("{} {}", new_num, body_after_num.trim_start());
+            let abs_start = line_off + indent.len();
+            let abs_end = line_off + indent.len() + existing_w;
+            self.buf.apply(abs_start, abs_end, &new_line_body[..new_line_body.len() - body_after_num.trim_start().len() - 1]);
+            // Re-read the modified line to be safe; just bump idx and move on.
+            idx += 1;
+        }
+        self.buf.end_compound();
+        self.set_status(&format!(" renumbered {}..{}", l1 + 1, l2 + 1), 46);
+    }
+
+    /// `\s` (visual): sort the visually selected items alphabetically
+    /// at the indent of the first selected line. Children come along
+    /// with their parent. Mirrors hyperlist.vim's sort hack.
+    fn sort_visual_by_indent(&mut self) {
+        if !self.mode.is_visual() { return; }
+        let l1 = self.visual_anchor_line.min(self.cur_line);
+        let l2 = self.visual_anchor_line.max(self.cur_line);
+        let total = self.buf.line_count();
+        if l2 + 1 >= total {
+            self.set_status(" last line cannot be at end of buffer", 196);
+            return;
+        }
+        // All lines in span.
+        let lines: Vec<String> = (l1..=l2).map(|i| self.buf.line(i)).collect();
+        let target_indent = fold::fold_level(&lines[0]);
+        // Group: each top-level item (at target_indent) starts a group;
+        // lines at deeper indent belong to the previous group.
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for ln in &lines {
+            let lvl = fold::fold_level(ln);
+            if lvl < target_indent { continue; }
+            if lvl == target_indent {
+                groups.push(vec![ln.clone()]);
+            } else if let Some(last) = groups.last_mut() {
+                last.push(ln.clone());
+            }
+        }
+        groups.sort_by(|a, b| a[0].cmp(&b[0]));
+        let new_text = groups.into_iter()
+            .flat_map(|g| g.into_iter())
+            .collect::<Vec<_>>()
+            .join("\n") + "\n";
+        let start = self.buf.line_byte_offset(l1);
+        let end = if l2 + 1 < total {
+            self.buf.line_byte_offset(l2 + 1)
+        } else {
+            self.buf.rope.len_bytes()
+        };
+        self.buf.begin_compound();
+        self.buf.apply(start, end, &new_text);
+        self.buf.end_compound();
+        self.set_status(" sorted", 46);
+    }
+
+    /// `\z` / `\Z` — encrypt the current line (and folded children) /
+    /// the entire file via openssl AES-256-CBC + PBKDF2. Prompts for
+    /// password (and confirmation). Doesn't touch the file on disk —
+    /// the encrypted text replaces the buffer content; user `:w`s.
+    fn encrypt_lines(&mut self, whole_file: bool) {
+        let pw = match self.prompt_password_confirm("Encrypt password: ") {
+            Some(p) => p,
+            None => { self.set_status(" cancelled", 244); return; }
+        };
+        let total = self.buf.line_count();
+        let (l1, l2) = if whole_file { (0, total.saturating_sub(1)) }
+                       else if self.mode.is_visual() {
+                           let a = self.visual_anchor_line.min(self.cur_line);
+                           let b = self.visual_anchor_line.max(self.cur_line);
+                           (a, b)
+                       } else { (self.cur_line, self.cur_line) };
+        let start = self.buf.line_byte_offset(l1);
+        let end = if l2 + 1 < total { self.buf.line_byte_offset(l2 + 1) }
+                  else { self.buf.rope.len_bytes() };
+        let plain: String = self.buf.rope.byte_slice(start..end).to_string();
+        match buffer::encrypt(&plain, &pw) {
+            Ok(c) => {
+                self.buf.begin_compound();
+                self.buf.apply(start, end, &c);
+                self.buf.end_compound();
+                self.set_status(" encrypted", 46);
+            }
+            Err(e) => self.set_status(&format!(" encrypt failed: {}", e), 196),
+        }
+    }
+
+    /// `\x` / `\X` — decrypt the current line (or visual) / whole file.
+    fn decrypt_lines(&mut self, whole_file: bool) {
+        let pw = match self.prompt_password("Decrypt password: ") {
+            Some(p) => p,
+            None => { self.set_status(" cancelled", 244); return; }
+        };
+        let total = self.buf.line_count();
+        let (l1, l2) = if whole_file { (0, total.saturating_sub(1)) }
+                       else if self.mode.is_visual() {
+                           let a = self.visual_anchor_line.min(self.cur_line);
+                           let b = self.visual_anchor_line.max(self.cur_line);
+                           (a, b)
+                       } else { (self.cur_line, self.cur_line) };
+        let start = self.buf.line_byte_offset(l1);
+        let end = if l2 + 1 < total { self.buf.line_byte_offset(l2 + 1) }
+                  else { self.buf.rope.len_bytes() };
+        let cipher: String = self.buf.rope.byte_slice(start..end).to_string();
+        match buffer::decrypt(&cipher, &pw) {
+            Ok(p) => {
+                self.buf.begin_compound();
+                self.buf.apply(start, end, &p);
+                self.buf.end_compound();
+                self.set_status(" decrypted", 46);
+            }
+            Err(e) => self.set_status(&format!(" decrypt failed: {}", e), 196),
+        }
+    }
+
+    fn prompt_password(&mut self, label: &str) -> Option<String> {
+        // Use the footer ask path — but mask via a placeholder. Crust
+        // doesn't have a no-echo prompt yet; the input WILL be visible
+        // mid-typing. Acceptable: privacy is mostly for shoulder-surfing,
+        // and the password is wiped on Enter.
+        let s = self.footer.ask_with_bg(label, "", 17);
+        self.render_footer();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn prompt_password_confirm(&mut self, label: &str) -> Option<String> {
+        let p1 = self.prompt_password(label)?;
+        let p2 = self.prompt_password("Confirm: ")?;
+        if p1 != p2 {
+            self.set_status(" passwords don't match", 196);
+            return None;
+        }
+        Some(p1)
+    }
+
+    /// `\<SPACE>` — search forward for `=$` and append.
+    fn jump_next_template(&mut self) {
+        for i in self.cur_line..self.buf.line_count() {
+            let line = self.buf.line(i);
+            if line.trim_end().ends_with('=') {
+                self.cur_line = i;
+                self.cur_col = line.len();
+                self.want_col = self.cur_col;
+                self.enter_insert();
+                return;
+            }
+        }
+        self.set_status(" no template element below", 244);
+    }
+
+    /// `g<DOWN>` / `g<UP>` — presentation step. Move cursor by `dir`
+    /// visible lines; close every fold above level corresponding to
+    /// the target's indent so only it + ancestors remain visible.
+    fn presentation_step(&mut self, dir: i32) {
+        if dir > 0 { self.cur_line = self.next_visible_line_down(self.cur_line, 1); }
+        else        { self.cur_line = self.next_visible_line_up(self.cur_line, 1); }
+        let line = self.buf.line(self.cur_line);
+        let target_lvl = fold::fold_level(&line);
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        // Close folds at the target level + 1 and below.
+        self.folds.set_level(target_lvl + 1, &all);
+        self.cur_col = 0;
+        self.want_col = 0;
+    }
+
+    /// `zs` / `zh` — show or hide all lines NOT containing / containing
+    /// the word under the cursor. Implemented by closing folds at every
+    /// line that fails the test.
+    fn showhide_word(&mut self, show: bool) {
+        let line = self.buf.line(self.cur_line);
+        let off = self.cur_col.min(line.len());
+        let bytes = line.as_bytes();
+        let mut s = off;
+        while s > 0 && (bytes[s-1].is_ascii_alphanumeric() || bytes[s-1] == b'_') { s -= 1; }
+        let mut e = off;
+        while e < bytes.len() && (bytes[e].is_ascii_alphanumeric() || bytes[e] == b'_') { e += 1; }
+        if s == e { self.set_status(" no word at cursor", 244); return; }
+        let word = line[s..e].to_string();
+        self.showhide = Some((word.clone(), show));
+        // Walk lines: any that fails the show/hide criterion AND has
+        // no children that match either — close it. For simplicity we
+        // just close every line that itself fails (children rendered
+        // as part of parent's fold).
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        self.folds.clear();
+        for (i, l) in all.iter().enumerate() {
+            let contains = l.contains(&word);
+            let hide_this = if show { !contains } else { contains };
+            if hide_this && fold::is_foldable(i, &all) {
+                self.folds.toggle_at(i, &all);
+            }
+        }
+        self.set_status(&format!(" {}: {}", if show { "show" } else { "hide" }, word), 244);
+    }
+
+    /// Insert-mode `<CR>` with autonumber on: clone the current line's
+    /// indent + numbering, increment the trailing index, start a new
+    /// item below.
+    fn autonum_newline(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let indent: String = line.chars().take_while(|c| *c == '\t' || *c == '*').collect();
+        let body = &line[indent.len()..];
+        if let Some((prefix, idx, trail)) = parse_number_prefix(body) {
+            let new_num = format!("{}{}{}", prefix, idx + 1, if trail { "." } else { "" });
+            let off = self.buf.line_byte_offset(self.cur_line) + self.current_line_len();
+            let inserted = format!("\n{}{} ", indent, new_num);
+            let inserted_len = inserted.len();
+            self.buf.apply(off, off, &inserted);
+            self.cur_line += 1;
+            self.cur_col = inserted_len - 1; // before the trailing space? prefer end-of-num
+            self.cur_col = indent.len() + new_num.len() + 1;
+            self.want_col = self.cur_col;
+        } else {
+            // Not a numbered line — fall back to plain newline + indent.
+            let off = self.buf.line_byte_offset(self.cur_line) + self.current_line_len();
+            let inserted = format!("\n{}", indent);
+            self.buf.apply(off, off, &inserted);
+            self.cur_line += 1;
+            self.cur_col = indent.len();
+            self.want_col = self.cur_col;
+        }
+    }
+
+    /// Insert-mode `Ctrl-T`: indent right, append `.1` to the line's
+    /// number prefix to make this a child level. (e.g. `1.2 foo` →
+    /// indent + `1.2.1 foo`.)
+    fn autonum_indent_in(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let indent: String = line.chars().take_while(|c| *c == '\t' || *c == '*').collect();
+        let body = &line[indent.len()..];
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        // Add one TAB.
+        self.buf.apply(line_off, line_off, "\t");
+        // Append .1 to the existing number.
+        if let Some((prefix, idx, trail)) = parse_number_prefix(body) {
+            let old = format!("{}{}{}", prefix, idx, if trail { "." } else { "" });
+            let new = format!("{}{}.1{}", prefix, idx, if trail { "." } else { "" });
+            let abs = line_off + 1 + indent.len(); // +1 for the new TAB
+            self.buf.apply(abs, abs + old.len(), &new);
+            self.cur_col = indent.len() + 1 + new.len() + 1;
+            self.want_col = self.cur_col;
+        } else {
+            self.cur_col += 1;
+            self.want_col = self.cur_col;
+        }
+    }
+
+    /// Insert-mode `Ctrl-D`: indent left, drop the trailing `.N` of
+    /// the line's number, increment what was the parent's index.
+    fn autonum_indent_out(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let indent: String = line.chars().take_while(|c| *c == '\t' || *c == '*').collect();
+        if indent.is_empty() { return; }
+        let body = &line[indent.len()..];
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        // Strip one TAB.
+        self.buf.apply(line_off, line_off + 1, "");
+        // De-number: last segment dropped, parent index bumped.
+        if let Some((prefix, _idx, trail)) = parse_number_prefix(body) {
+            // Strip trailing dot from prefix to access the parent index.
+            let p = prefix.trim_end_matches('.');
+            let dot = p.rfind('.');
+            let (gp, parent_idx_str) = match dot {
+                Some(d) => (&p[..d+1], &p[d+1..]),
+                None    => ("", p),
+            };
+            let parent_idx: u64 = parent_idx_str.parse().unwrap_or(0);
+            let new = format!("{}{}{}", gp, parent_idx + 1, if trail { "." } else { "" });
+            let old_full = format!("{}", body);
+            let old_num_len = strip_number_prefix(body).0;
+            let old_num = &old_full[..old_num_len.saturating_sub(1)]; // drop trailing space
+            let abs = line_off + indent.len() - 1; // -1 for stripped TAB
+            self.buf.apply(abs, abs + old_num.len(), &new);
+            self.cur_col = indent.len().saturating_sub(1) + new.len() + 1;
+            self.want_col = self.cur_col;
+        } else {
+            self.cur_col = self.cur_col.saturating_sub(1);
+            self.want_col = self.cur_col;
+        }
+    }
+
+    fn showhide_pattern(&mut self, pattern: &str, show: bool) {
+        if pattern.is_empty() { self.set_status(" empty pattern", 244); return; }
+        let re = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(e) => { self.set_status(&format!(" bad regex: {}", e), 196); return; }
+        };
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        self.folds.clear();
+        for (i, l) in all.iter().enumerate() {
+            let m = re.is_match(l);
+            let hide_this = if show { !m } else { m };
+            if hide_this && fold::is_foldable(i, &all) {
+                self.folds.toggle_at(i, &all);
+            }
+        }
+        self.showhide = Some((pattern.into(), show));
+        self.set_status(&format!(" {}: /{}/", if show { "show" } else { "hide" }, pattern), 244);
+    }
+
+    fn calendar_add(&mut self) {
+        let mut text = String::new();
+        for chunk in self.buf.rope.chunks() { text.push_str(chunk); }
+        let report = calendar::add_future_events(
+            &text,
+            self.calendar.as_deref(),
+            self.alldates);
+        let mode = if self.calendar.is_some() { "gcalcli" } else { "ics files" };
+        if report.errors.is_empty() {
+            self.set_status(&format!(" {} events posted via {}", report.posted, mode), 46);
+        } else {
+            self.set_status(
+                &format!(" {} posted, {} errors (first: {})", report.posted, report.errors.len(),
+                    report.errors.first().cloned().unwrap_or_default()),
+                178);
+        }
+    }
+
+    fn complexity_report(&mut self) {
+        let mut items = 0usize;
+        let mut refs = 0usize;
+        for i in 0..self.buf.line_count() {
+            let line = self.buf.line(i);
+            if line.trim().is_empty() { continue; }
+            items += 1;
+            // Count `<…>` references on the line.
+            let mut p = 0;
+            while let Some(start) = line[p..].find('<') {
+                let abs = p + start;
+                if let Some(rel) = line[abs..].find('>') {
+                    refs += 1;
+                    p = abs + rel + 1;
+                } else { break; }
+            }
+        }
+        self.set_status(&format!(" complexity: {} items + {} refs = {}",
+            items, refs, items + refs), 46);
+    }
+
+    /// `\H` / `\L` / `\M` (and `:export FMT`) — render the buffer to
+    /// HTML / LaTeX / Markdown, write the output next to the source
+    /// file, and report the path. Buffer content untouched.
+    fn export_to(&mut self, fmt: &str) {
+        let mut text = String::new();
+        for chunk in self.buf.rope.chunks() { text.push_str(chunk); }
+        let title = self.buf.path.as_ref()
+            .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
+            .unwrap_or("HyperList")
+            .to_string();
+        let (rendered, ext) = match fmt {
+            "html" | "h" => (export::to_html(&text, &title), "html"),
+            "latex" | "tex" | "l" => (export::to_latex(&text, &title), "tex"),
+            "markdown" | "md" | "m" => (export::to_markdown(&text, &title), "md"),
+            _ => { self.set_status(&format!(" unknown export format: {}", fmt), 196); return; }
+        };
+        let target = match self.buf.path.as_ref() {
+            Some(p) => p.with_extension(ext),
+            None    => std::path::PathBuf::from(format!("scribe-export.{}", ext)),
+        };
+        match std::fs::write(&target, rendered) {
+            Ok(_)  => self.set_status(&format!(" exported → {}", target.display()), 46),
+            Err(e) => self.set_status(&format!(" export failed: {}", e), 196),
+        }
+    }
+
+    /// Step `count` visible lines down from `from`. Lines hidden by
+    /// closed folds are skipped. Stops at the last visible line.
+    fn next_visible_line_down(&self, from: usize, count: usize) -> usize {
+        let total = self.buf.line_count();
+        if total == 0 { return 0; }
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        let mut cur = from;
+        let mut steps = 0;
+        while steps < count {
+            let mut next = cur + 1;
+            while next < total && !self.folds.is_visible(next, &all) { next += 1; }
+            if next >= total { break; }
+            cur = next;
+            steps += 1;
+        }
+        cur
+    }
+
+    /// Step `count` visible lines up from `from`. Symmetrical with
+    /// next_visible_line_down. Stops at line 0.
+    fn next_visible_line_up(&self, from: usize, count: usize) -> usize {
+        let total = self.buf.line_count();
+        if total == 0 { return 0; }
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        let mut cur = from;
+        let mut steps = 0;
+        while steps < count && cur > 0 {
+            let mut next = cur - 1;
+            while next > 0 && !self.folds.is_visible(next, &all) { next -= 1; }
+            if !self.folds.is_visible(next, &all) { break; }
+            cur = next;
+            steps += 1;
+        }
+        cur
     }
 
     fn enter_insert(&mut self) {
@@ -3324,6 +4250,11 @@ impl App {
             // (æ, ø, å, emoji) lines up the way the user sees it.
             "C-Y" => { self.copy_char_from(-1); }
             "C-E" => { self.copy_char_from( 1); }
+            "C-T" if self.autonumber => self.autonum_indent_in(),
+            "C-D" if self.autonumber => self.autonum_indent_out(),
+            "ENTER" | "\n" | "\r" | "C-M" | "C-J" if self.autonumber => {
+                self.autonum_newline();
+            }
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, "\n");
@@ -3638,13 +4569,18 @@ impl App {
     /// without filesystem access. Buffer has no path → `:w` would
     /// fail safely; users searching for terms use `/`, `n`, `N` as
     /// usual. Close with `q` (clean — no save warning) to return.
-    fn open_help(&mut self) {
-        const HELP: &str = include_str!("../README.md");
+    fn open_help(&mut self, topic: &str) {
+        const HELP_MAIN: &str = include_str!("../README.md");
+        const HELP_HL:   &str = include_str!("../HYPERLIST.md");
         if self.buf.dirty {
             self.set_status(" save current buffer first (or Q to discard)", 196);
             return;
         }
-        self.buf = Buffer::from_str(HELP, FileKind::Source("md".into()));
+        let text = match topic.trim().to_lowercase().as_str() {
+            "hl" | "hyperlist" => HELP_HL,
+            _ => HELP_MAIN,
+        };
+        self.buf = Buffer::from_str(text, FileKind::Source("md".into()));
         self.cur_line = 0;
         self.cur_col = 0;
         self.scroll = 0;
@@ -3749,11 +4685,18 @@ impl App {
             other if other.starts_with("e ") => {
                 let path = other[2..].trim();
                 if !path.is_empty() {
-                    if let Ok(b) = Buffer::from_path(PathBuf::from(path)) {
+                    let p = PathBuf::from(path);
+                    if buffer::is_encrypted_dotfile(&p) && p.exists() {
+                        self.set_status(
+                            " encrypted dotfile — open from command line so password prompt works",
+                            196);
+                    } else if let Ok(b) = Buffer::from_path(p) {
                         self.buf = b;
                         self.cur_line = 0;
                         self.cur_col = 0;
                         self.scroll = 0;
+                        self.folds.clear();
+                        self.restore_session();
                     } else {
                         self.set_status(" open failed", 196);
                     }
@@ -3773,7 +4716,12 @@ impl App {
                 false
             }
             "help" | "h" => {
-                self.open_help();
+                self.open_help("");
+                false
+            }
+            other if other.starts_with("help ") || other.starts_with("h ") => {
+                let topic = other.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                self.open_help(topic);
                 false
             }
             "config" | "Config" => {
@@ -3782,6 +4730,17 @@ impl App {
             }
             "reg" | "registers" | "display" => {
                 self.show_reg_popup();
+                false
+            }
+            other if other.starts_with("show ") || other.starts_with("hide ") => {
+                let show = other.starts_with("show ");
+                let pat = other[5..].trim().to_string();
+                self.showhide_pattern(&pat, show);
+                false
+            }
+            other if other.starts_with("export ") => {
+                let fmt = other[7..].trim().to_string();
+                self.export_to(&fmt);
                 false
             }
             "read" | "reading" => {
