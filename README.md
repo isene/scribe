@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.22** — daily-driveable for prose. Implemented:
+**v0.1.23** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -106,8 +106,6 @@ Requires `claude` on `PATH` (both commands).
 | Quit | `q` quits when clean (refuses + warns if dirty), `Q` quits + discards changes, `:wq` saves + quits. Every save first writes `<path>.scribe-bak` so an accidental `:wq` after a destructive `:claude` is recoverable. |
 
 ## Roadmap
-
-- **Multi-line state in source highlighting** — block comments / multi-line strings keep their color across line breaks. Currently line-stateless (visible at the top of any file with a `/* */` block).
 - **Reading mode** (`:read` toggle) — distraction-free, prose-styled, dim chrome, Markdown rendered.
 - **HyperList editing intelligence** — Tab fold/unfold, smart auto-indent, Operator preservation.
 - **Cross-session shared registers** via Unix socket — yank in one scribe, paste in another.

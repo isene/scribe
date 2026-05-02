@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-highlight"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fe2o3-crust",
  "regex",
@@ -236,7 +236,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scribe"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-highlight",
