@@ -27,20 +27,33 @@ use std::path::PathBuf;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    // CLI: scribe [+N] [path]
+    // CLI: scribe [+N] [--theme NAME] [path]
     // `+N` opens the file with the cursor on line N (vim convention; used
     // by kastrup's compose flow to jump straight to the message body).
+    // `--theme NAME` overrides the rcfile theme for this session only.
     let args: Vec<String> = std::env::args().collect();
     let mut start_line: Option<usize> = None;
     let mut path: Option<PathBuf> = None;
-    for arg in args.iter().skip(1) {
+    let mut cli_theme: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
         if let Some(rest) = arg.strip_prefix('+') {
             if let Ok(n) = rest.parse::<usize>() { start_line = Some(n); }
+            i += 1;
+        } else if arg == "--theme" && i + 1 < args.len() {
+            cli_theme = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(rest) = arg.strip_prefix("--theme=") {
+            cli_theme = Some(rest.to_string());
+            i += 1;
         } else if path.is_none() {
             path = Some(PathBuf::from(arg));
+            i += 1;
+        } else {
+            i += 1;
         }
     }
-
     Crust::init();
     Crust::set_app_identity("Scribe");
     // Bracketed paste: terminal wraps the pasted blob in `CSI 200~ ... 201~`
@@ -52,7 +65,7 @@ fn main() {
     print!("\x1b[?2004h");
     let _ = std::io::stdout().flush();
 
-    let mut app = App::new(path);
+    let mut app = App::new(path, cli_theme);
     if let Some(n) = start_line {
         if n > 0 {
             let last = app.buf.line_count().saturating_sub(1);
@@ -185,10 +198,21 @@ struct App {
     spell_enabled: bool,
     /// Sorted by start byte, recomputed on Insert→Normal and on `:set spell`.
     misspellings: Vec<spell::MisspellRange>,
+    /// `:set number` / `:set nonumber` — gutter with line numbers on the
+    /// left of the main pane.
+    show_numbers: bool,
+    /// `:set relativenumber` / `:set rnu` — gutter shows distance from the
+    /// cursor instead of absolute line numbers (cursor line stays absolute).
+    relative_numbers: bool,
+    /// Active highlight theme name (`monokai` / `solarized` / `nord` /
+    /// `dracula` / `gruvbox` / `plain`). Mirrored via `highlight::set_theme`
+    /// so the source-mode renderer picks it up; we keep a copy for
+    /// status display and for saving back to scriberc.
+    theme_name: String,
 }
 
 impl App {
-    fn new(path: Option<PathBuf>) -> Self {
+    fn new(path: Option<PathBuf>, cli_theme: Option<String>) -> Self {
         let (cols, rows) = Crust::terminal_size();
         let mut header = Pane::new(1, 1, cols, 1, 255, 236);
         header.wrap = false; header.scroll = false;
@@ -202,7 +226,15 @@ impl App {
             None    => Buffer::empty(),
         };
 
-        let auto_spell = matches!(buf.kind, FileKind::Email);
+        // rcfile: ~/.config/scribe/scriberc — simple `key = value` lines.
+        // Loaded once per launch; `:set` commands stay in-session until
+        // the user manually edits the rcfile. CLI `--theme NAME` overrides
+        // the rcfile's theme for this session.
+        let rc = load_scriberc();
+        let active_theme = cli_theme.or_else(|| rc.theme.clone());
+        if let Some(ref t) = active_theme { highlight::set_theme(t); }
+
+        let auto_spell = matches!(buf.kind, FileKind::Email) || rc.spell;
         let mut app = Self {
             buf, mode: Mode::Normal,
             cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
@@ -222,6 +254,9 @@ impl App {
             spell: None,
             spell_enabled: false,
             misspellings: Vec::new(),
+            show_numbers: rc.number,
+            relative_numbers: rc.relative_numbers,
+            theme_name: active_theme.unwrap_or_else(|| "monokai".to_string()),
         };
         if auto_spell { app.spell_enable(); }
         app
@@ -417,6 +452,74 @@ fn load_personal_dict() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Persistent settings loaded once at startup from `~/.config/scribe/scriberc`.
+/// The runtime `:set` commands mutate the App's in-memory state directly
+/// (without writing back) — the rcfile is the user's hand-edited source of
+/// truth.
+#[derive(Default)]
+struct RcConfig {
+    theme: Option<String>,
+    number: bool,
+    relative_numbers: bool,
+    spell: bool,
+}
+
+fn scriberc_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/scriberc")
+}
+
+/// Parse the rcfile: simple `key = value` per line, `#` starts a comment.
+/// Unknown keys are ignored silently. Boolean values: `true` / `1` / `yes`
+/// / `on` are truthy; anything else is falsy.
+fn load_scriberc() -> RcConfig {
+    let mut cfg = RcConfig::default();
+    let path = scriberc_path();
+    let Ok(content) = std::fs::read_to_string(&path) else { return cfg; };
+    let truthy = |v: &str| matches!(v.trim(), "true" | "1" | "yes" | "on");
+    for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        let v = v.trim();
+        match k {
+            "theme"          => cfg.theme = Some(v.to_string()),
+            "number" | "nu"  => cfg.number = truthy(v),
+            "relativenumber" | "rnu" => {
+                cfg.relative_numbers = truthy(v);
+                if cfg.relative_numbers { cfg.number = true; }
+            }
+            "spell"          => cfg.spell = truthy(v),
+            _ => {}
+        }
+    }
+    cfg
+}
+
+/// Width of the line-number gutter for a buffer with `line_count` lines.
+/// Returns 0 when numbers are off. Format: " NN │ " — N digits + space +
+/// vertical bar + trailing space, with N at least 2 so single-digit
+/// buffers don't shift layout when they grow past 9 lines.
+fn gutter_width(line_count: usize, show: bool) -> usize {
+    if !show { return 0; }
+    let digits = line_count.to_string().len().max(2);
+    digits + 3
+}
+
+/// Render the gutter cell for `line_idx`. `cur_line` and `relative`
+/// determine whether non-cursor rows display absolute or relative numbers.
+fn gutter_cell(line_idx: usize, cur_line: usize, line_count: usize, relative: bool) -> String {
+    let digits = line_count.to_string().len().max(2);
+    let n = if relative && line_idx != cur_line {
+        line_idx.abs_diff(cur_line)
+    } else {
+        line_idx + 1
+    };
+    // Dim the gutter (240 = gray) so it doesn't compete with content.
+    format!("\x1b[38;5;240m{:>width$} │ \x1b[39m", n, width = digits)
+}
+
 impl App {
 
     // ── Rendering ──────────────────────────────────────────────────────
@@ -440,21 +543,25 @@ impl App {
         let pane_x = self.main_p.x;
         let pane_y = self.main_p.y;
         let pane_w = self.main_p.w as usize;
+        // When line numbers are on, the gutter prepends each line's text
+        // before the pane wraps. The first wrap row of every line has
+        // gutter+content; subsequent wrap rows have content only. We
+        // approximate cursor placement assuming the cursor is on the first
+        // wrap row (typical for short lines); long-wrapped lines can be
+        // off by gutter_w on continuation rows — acceptable for v1.
+        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers);
 
-        // Walk through each visible logical line from scroll up to (and
-        // including) cur_line, summing visual rows. Soft-wrap rows for
-        // pre-cursor lines = ⌈line_w / pane_w⌉ (≥ 1). For cur_line the
-        // cursor sits on the row containing cur_col display position.
         let mut visual_row: usize = 0;
         for ln in self.scroll..self.cur_line {
             if ln >= self.buf.line_count() { break; }
-            let w = self.buf.line(ln).chars().count().max(1);
-            visual_row += ((w - 1) / pane_w) + 1;
+            let w = self.buf.line(ln).chars().count() + gutter_w;
+            visual_row += ((w.max(1) - 1) / pane_w) + 1;
         }
         let cur_disp_col = self.buf.line(self.cur_line)[..self.cur_col.min(self.current_line_len())]
             .chars().count();
-        let row_in_line = cur_disp_col / pane_w;
-        let col_in_row = cur_disp_col % pane_w;
+        let visual_col = cur_disp_col + gutter_w;
+        let row_in_line = visual_col / pane_w;
+        let col_in_row = visual_col % pane_w;
         visual_row += row_in_line;
 
         let row = pane_y + visual_row as u16;
@@ -536,10 +643,20 @@ impl App {
             _ => Vec::new(),
         };
 
+        let line_count = self.buf.line_count();
+        let show_numbers = self.show_numbers;
+        let relative_numbers = self.relative_numbers;
+
         let mut out = String::new();
         for i in 0..pane_h {
             let line_idx = self.scroll + i;
-            if line_idx < self.buf.line_count() {
+            if line_idx < line_count {
+                // Gutter prefix per visible line (line numbers / relative
+                // numbers). Emitted as part of the rendered text so the
+                // pane treats it as the start of the line.
+                if show_numbers {
+                    out.push_str(&gutter_cell(line_idx, self.cur_line, line_count, relative_numbers));
+                }
                 let line = self.buf.line(line_idx);
                 let line_byte_off = self.buf.line_byte_offset(line_idx);
                 // Per-line fg color when email mode says so. None → default.
@@ -2165,11 +2282,135 @@ impl App {
                 self.set_status(" spell off", 244);
                 false
             }
+            "set number" | "set nu" => {
+                self.show_numbers = true;
+                false
+            }
+            "set nonumber" | "set nonu" => {
+                self.show_numbers = false;
+                self.relative_numbers = false;
+                false
+            }
+            "set relativenumber" | "set rnu" => {
+                self.show_numbers = true;
+                self.relative_numbers = true;
+                false
+            }
+            "set norelativenumber" | "set nornu" => {
+                self.relative_numbers = false;
+                false
+            }
+            other if other.starts_with("set theme") => {
+                let name = other.trim_start_matches("set theme")
+                    .trim_start_matches('=')
+                    .trim();
+                if name.is_empty() {
+                    let avail = highlight::available_themes().join(", ");
+                    self.set_status(&format!(" theme: {} | available: {}", self.theme_name, avail), 244);
+                } else {
+                    highlight::set_theme(name);
+                    self.theme_name = name.to_string();
+                    self.set_status(&format!(" theme: {}", name), 244);
+                }
+                false
+            }
+            other if other.starts_with('s') || other.starts_with("%s") => {
+                // :s/PAT/REPL/[FLAGS]   — current line
+                // :%s/PAT/REPL/[FLAGS]  — whole buffer
+                // Falls through to "unknown" for plain `:s` without args.
+                let whole_buffer = other.starts_with("%s");
+                let rest = if whole_buffer { &other[2..] } else { &other[1..] };
+                if rest.starts_with('/') {
+                    self.execute_substitute(whole_buffer, rest);
+                    false
+                } else {
+                    self.set_status(&format!(" unknown: {}", other), 196);
+                    false
+                }
+            }
             other => {
                 self.set_status(&format!(" unknown: {}", other), 196);
                 false
             }
         }
+    }
+
+    /// `:s/PAT/REPL/[FLAGS]` (current line) or `:%s/...` (whole buffer).
+    /// Flags: `g` = global within line, `i` = case-insensitive. The first
+    /// `/` after `s` / `%s` opens the pattern; the next two `/` close
+    /// pattern + replacement. Trailing flags optional.
+    ///
+    /// All edits are wrapped in a compound undo node so a buffer-wide
+    /// substitute undoes as one atomic step regardless of how many lines
+    /// it changed.
+    fn execute_substitute(&mut self, whole_buffer: bool, rest: &str) {
+        debug_assert!(rest.starts_with('/'));
+        let parts: Vec<&str> = rest[1..].splitn(3, '/').collect();
+        if parts.len() < 2 {
+            self.set_status(" :s expects /PATTERN/REPLACEMENT/[FLAGS]", 196);
+            return;
+        }
+        let pattern = parts[0];
+        let replacement = parts[1];
+        let flags = parts.get(2).copied().unwrap_or("");
+        let global = flags.contains('g');
+        let case_insensitive = flags.contains('i');
+
+        let mut re_str = String::new();
+        if case_insensitive { re_str.push_str("(?i)"); }
+        re_str.push_str(pattern);
+        let re = match regex::Regex::new(&re_str) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status(&format!(" bad pattern: {}", e), 196);
+                return;
+            }
+        };
+
+        self.buf.begin_compound();
+        let mut count = 0usize;
+        if whole_buffer {
+            // Iterate bottom-up so each apply leaves earlier line offsets
+            // intact (lines above the current one are untouched).
+            let total = self.buf.line_count();
+            for line_idx in (0..total).rev() {
+                count += self.substitute_on_line(line_idx, &re, replacement, global);
+            }
+        } else {
+            count += self.substitute_on_line(self.cur_line, &re, replacement, global);
+        }
+        self.buf.end_compound();
+
+        if count == 0 {
+            self.set_status(&format!(" pattern not found: {}", pattern), 196);
+        } else {
+            let scope = if whole_buffer { "buffer" } else { "line" };
+            self.set_status(&format!(" {} substitution(s) on {}", count, scope), 46);
+        }
+    }
+
+    fn substitute_on_line(
+        &mut self,
+        line_idx: usize,
+        re: &regex::Regex,
+        replacement: &str,
+        global: bool,
+    ) -> usize {
+        let line = self.buf.line(line_idx);
+        if line.is_empty() { return 0; }
+        let count = if global {
+            re.find_iter(&line).count()
+        } else if re.is_match(&line) { 1 } else { 0 };
+        if count == 0 { return 0; }
+        let new_line = if global {
+            re.replace_all(&line, replacement).into_owned()
+        } else {
+            re.replace(&line, replacement).into_owned()
+        };
+        let line_start = self.buf.line_byte_offset(line_idx);
+        let line_end = line_start + line.len();
+        self.buf.apply(line_start, line_end, &new_line);
+        count
     }
 }
 
