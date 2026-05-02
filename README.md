@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.21** — daily-driveable for prose. Implemented:
+**v0.1.22** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -90,7 +90,10 @@ Requires `claude` on `PATH` (both commands).
 | Substitute | `:s/pat/rep/[gi]` current line, `:%s/pat/rep/[gi]` whole buffer, atomic undo |
 | Undo | `u` undo, `Ctrl-R` redo, undo **tree** in memory; cursor follows the edit site |
 | Dot-repeat | `.` replays the last change (operator + motion + inserted text, replace, paste) |
-| Macros | `M{reg}` start recording, `M` again to stop; `@{reg}` replay, `@@` last. Stored in the same registers as yanks — `"ap` pastes the captured key sequence (`<Esc>`, `<C-Up>`, `<CR>`, …) as editable text; yank an edited version back into a register and replay runs the new sequence. (`m` left free for marks.) |
+| Macros | `M{reg}` start recording, `M` again to stop; `@{reg}` replay, `@@` last. Stored in the same registers as yanks — `"ap` pastes the captured key sequence (`<Esc>`, `<C-Up>`, `<CR>`, …) as editable text; yank an edited version back into a register and replay runs the new sequence. |
+| Marks | `m{a-z}` set, `'a` jump to first non-blank of mark line, `` `a `` jump to exact column. Session-local. |
+| Yank/cut feedback | Statusline confirms every register write: `5 lines yanked`, `23 chars yanked into "a`, `3 lines deleted`, etc. |
+| Register inspector | `:reg` (or `:registers`) opens a popup listing all set registers with kind + first 60 chars. ESC closes. |
 | Move lines | `Ctrl-Up` / `Ctrl-Down` swap the current line with the one above / below. Counts work (`5 Ctrl-Down`). |
 | Spellcheck | `:set spell`, `:set spelllang=NAME` (e.g. `nb_NO`), `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
 | Config popup | `:config` — modal preferences pane (theme, numbers, spell on/off, lang, underline color). `W` saves to scriberc, `ESC` closes. |

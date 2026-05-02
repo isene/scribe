@@ -350,6 +350,20 @@ struct App {
     at_prefix: bool,
     /// Bound to keep `@a` containing `@a` from infinite-recursing.
     replay_depth: usize,
+    /// In-buffer marks set by `m{a-z}` and jumped to via `'{a-z}` (line
+    /// start) or `` `{a-z} `` (exact col). Stored as absolute byte
+    /// offsets — a stable position even when the line/col mapping
+    /// shifts under edits. Session-local for now; persisting them
+    /// would need invalidation on reload.
+    marks: std::collections::HashMap<char, usize>,
+    /// Set after `m` in Normal mode — next ascii char names the mark.
+    mark_set_prefix: bool,
+    /// Set after `'` or `` ` `` in Normal mode — next char names the
+    /// mark to jump to. `mark_jump_exact` distinguishes the two: `'`
+    /// lands on first non-blank of the mark's line, `` ` `` lands at
+    /// the exact byte offset.
+    mark_jump_prefix: bool,
+    mark_jump_exact: bool,
 }
 
 impl App {
@@ -412,6 +426,10 @@ impl App {
             macro_prefix: false,
             at_prefix: false,
             replay_depth: 0,
+            marks: std::collections::HashMap::new(),
+            mark_set_prefix: false,
+            mark_jump_prefix: false,
+            mark_jump_exact: false,
         };
         if auto_spell { app.spell_enable(); }
         app
@@ -1153,6 +1171,34 @@ impl App {
 
     fn set_status(&mut self, msg: &str, c: u8) { self.status = Some((msg.into(), c)); }
 
+    /// Statusline confirmation for yank / delete / change. Mirrors vim's
+    /// "N lines yanked" so the user has visible feedback that the
+    /// register was written. `verb` is "yanked" / "deleted" / "changed".
+    /// Color: 46 (green) for yank, 178 (orange) for cut.
+    fn say_yank(&mut self, verb: &str, reg: Option<char>, kind: YankKind, text: &str) {
+        let count_label = match kind {
+            YankKind::Charwise => {
+                let n = text.chars().count();
+                if n == 1 { "1 char".into() } else { format!("{} chars", n) }
+            }
+            YankKind::Linewise => {
+                // Linewise text ends with `\n`; line count = newlines.
+                let n = text.matches('\n').count().max(1);
+                if n == 1 { "1 line".into() } else { format!("{} lines", n) }
+            }
+            YankKind::Block => {
+                let n = text.matches('\n').count() + 1;
+                if n == 1 { "1 block row".into() } else { format!("{} block rows", n) }
+            }
+        };
+        let reg_part = match reg {
+            Some(c) => format!(r#" into "{}"#, c),
+            None    => String::new(),
+        };
+        let color = if verb == "yanked" { 46 } else { 178 };
+        self.set_status(&format!(" {} {}{}", count_label, verb, reg_part), color);
+    }
+
     // ── Cursor helpers ─────────────────────────────────────────────────
     fn current_line_len(&self) -> usize {
         self.buf.line(self.cur_line).len()
@@ -1312,6 +1358,53 @@ impl App {
             && self.pending.count1.is_none() && self.pending.text_object.is_none()
         {
             self.at_prefix = true;
+            return false;
+        }
+
+        // Mark dispatch.
+        if self.mark_set_prefix {
+            self.mark_set_prefix = false;
+            if let Some(c) = key.chars().next() {
+                if c.is_ascii_alphabetic() {
+                    self.marks.insert(c, self.cursor_byte());
+                    self.set_status(&format!(" mark '{} set", c), 244);
+                }
+            }
+            return false;
+        }
+        if self.mark_jump_prefix {
+            self.mark_jump_prefix = false;
+            let exact = self.mark_jump_exact;
+            self.mark_jump_exact = false;
+            if let Some(c) = key.chars().next() {
+                if c.is_ascii_alphabetic() {
+                    if let Some(&byte) = self.marks.get(&c) {
+                        self.cursor_to_byte(byte);
+                        if !exact {
+                            // `'a` lands on first non-blank of the
+                            // mark's line; `` `a `` lands at exact col.
+                            let off = motion::line_first_nonblank(
+                                &self.buf, self.cursor_byte());
+                            self.cursor_to_byte(off);
+                        }
+                    } else {
+                        self.set_status(&format!(" mark '{} not set", c), 196);
+                    }
+                }
+            }
+            return false;
+        }
+        if key == "m" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            self.mark_set_prefix = true;
+            return false;
+        }
+        if (key == "'" || key == "`") && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            self.mark_jump_prefix = true;
+            self.mark_jump_exact = key == "`";
             return false;
         }
 
@@ -2204,10 +2297,14 @@ impl App {
         let combined = yanked.join("\n");
         // Block-aware register: paste later overlays at column instead of
         // splicing newlines inline.
+        let reg = self.pending.register;
+        let combined_for_msg = combined.clone();
         match op {
-            'y' => self.regs.yank(self.pending.register, combined, YankKind::Block),
-            _   => self.regs.cut(self.pending.register, combined, YankKind::Block),
+            'y' => self.regs.yank(reg, combined, YankKind::Block),
+            _   => self.regs.cut(reg, combined, YankKind::Block),
         }
+        let verb = if op == 'y' { "yanked" } else if op == 'c' { "changed" } else { "deleted" };
+        self.say_yank(verb, reg, YankKind::Block, &combined_for_msg);
         if op != 'y' { self.buf.end_compound(); }
         self.cur_line = l1;
         self.cur_col = c1;
@@ -2222,23 +2319,30 @@ impl App {
         if start >= end { return; }
         let text: String = self.buf.rope.byte_slice(start..end).to_string();
         let reg_name = self.pending.register;
+        let msg_text = text.clone();
+        let verb;
         match op {
             'd' => {
                 self.regs.cut(reg_name, text, YankKind::Charwise);
                 self.buf.apply(start, end, "");
                 self.cursor_to_byte(start);
+                verb = Some("deleted");
             }
             'c' => {
                 self.regs.cut(reg_name, text, YankKind::Charwise);
                 self.buf.apply(start, end, "");
                 self.cursor_to_byte(start);
                 self.enter_insert();
+                verb = Some("changed");
             }
             'y' => {
                 self.regs.yank(reg_name, text, YankKind::Charwise);
-                // Cursor doesn't move on yank.
+                verb = Some("yanked");
             }
-            _ => {}
+            _ => { verb = None; }
+        }
+        if let Some(v) = verb {
+            self.say_yank(v, reg_name, YankKind::Charwise, &msg_text);
         }
     }
 
@@ -2257,6 +2361,7 @@ impl App {
         // Linewise text always ends with a newline so paste works correctly.
         if !text.ends_with('\n') { text.push('\n'); }
         let reg_name = self.pending.register;
+        let msg_text = text.clone();
         match op {
             'd' => {
                 self.regs.cut(reg_name, text, YankKind::Linewise);
@@ -2265,6 +2370,7 @@ impl App {
                 self.cur_line = new_line;
                 self.cur_col = 0;
                 self.want_col = 0;
+                self.say_yank("deleted", reg_name, YankKind::Linewise, &msg_text);
             }
             'c' => {
                 self.regs.cut(reg_name, text, YankKind::Linewise);
@@ -2274,9 +2380,11 @@ impl App {
                 self.cur_col = 0;
                 self.want_col = 0;
                 self.enter_insert();
+                self.say_yank("changed", reg_name, YankKind::Linewise, &msg_text);
             }
             'y' => {
                 self.regs.yank(reg_name, text, YankKind::Linewise);
+                self.say_yank("yanked", reg_name, YankKind::Linewise, &msg_text);
             }
             'Q' => {
                 // gq: paragraph reformat. Width 72 in email mode (RFC 5322
@@ -2335,7 +2443,10 @@ impl App {
         };
         let mut text: String = self.buf.rope.byte_slice(start..end).to_string();
         if !text.ends_with('\n') { text.push('\n'); }
-        self.regs.yank(self.pending.register, text, YankKind::Linewise);
+        let reg = self.pending.register;
+        let msg_text = text.clone();
+        self.regs.yank(reg, text, YankKind::Linewise);
+        self.say_yank("yanked", reg, YankKind::Linewise, &msg_text);
     }
 
     fn do_replace_char(&mut self, c: char) {
@@ -2857,6 +2968,72 @@ impl App {
         }
     }
 
+    /// `:reg` popup — list contents of all named registers (and the
+    /// unnamed / last-yank slots) so the user can inspect macros and
+    /// yanks. Read-only: scrolls if the list is taller than the popup.
+    /// Preview text is escaped (`<Esc>`, `<CR>`, …) so macros stay
+    /// human-readable; long content is truncated at 60 chars.
+    fn show_reg_popup(&mut self) {
+        let popup_w = 70u16;
+        let popup_h = 22u16;
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+
+        let mut keys: Vec<char> = vec!['"', '0'];
+        for c in 'a'..='z' { keys.push(c); }
+        for c in '1'..='9' { keys.push(c); }
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push(format!("  {}", style::bold("Registers")));
+        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+        for k in keys {
+            let entry = self.regs.get(k);
+            let (kind_lbl, preview) = match entry {
+                None => continue, // skip empty slots so the popup isn't a sea of blanks
+                Some(y) => {
+                    let kind = match y.kind {
+                        YankKind::Charwise => "c",
+                        YankKind::Linewise => "l",
+                        YankKind::Block    => "b",
+                    };
+                    // Show literal newlines as `\n` so the line stays one row.
+                    let mut p = y.text.replace('\n', "\\n");
+                    if p.chars().count() > 60 {
+                        p = p.chars().take(60).collect::<String>() + "…";
+                    }
+                    (kind, p)
+                }
+            };
+            lines.push(format!("  {}  [{}]  {}",
+                style::fg(&format!(r#""{}"#, k), 220),
+                style::fg(kind_lbl, 244),
+                style::fg(&preview, 81)));
+        }
+        if lines.len() == 3 {
+            lines.push(format!("  {}", style::fg("(no registers set)", 244)));
+        }
+        lines.push(String::new());
+        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+        lines.push(format!("  {}  Close", style::fg("ESC", 220)));
+
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            match k.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN"   => { popup.pane.ix = popup.pane.ix.saturating_add(1); popup.pane.refresh(); }
+                "k" | "UP"     => { popup.pane.ix = popup.pane.ix.saturating_sub(1); popup.pane.refresh(); }
+                "PgDOWN" | " " => popup.pane.pagedown(),
+                "PgUP"         => popup.pane.pageup(),
+                "g" | "HOME"   => popup.pane.top(),
+                "G" | "END"    => popup.pane.bottom(),
+                _ => {}
+            }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        self.render_all();
+    }
+
     /// Legacy keystroke-by-keystroke command handler — no longer reached
     /// (Mode::Command is never set in v0.1.14+; `:` calls
     /// `run_command_prompt` directly). Kept only because the main loop's
@@ -2913,6 +3090,10 @@ impl App {
             }
             "config" | "Config" => {
                 self.show_config_popup();
+                false
+            }
+            "reg" | "registers" | "display" => {
+                self.show_reg_popup();
                 false
             }
             other if other.starts_with("set spelllang") || other.starts_with("set lang") => {
