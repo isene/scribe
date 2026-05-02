@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.25** — daily-driveable for prose. Implemented:
+**v0.1.26** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -98,7 +98,8 @@ Requires `claude` on `PATH` (both commands).
 | Increment | `Ctrl-A` / `Ctrl-X` increment / decrement the number at-or-after the cursor. Recognises ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (e.g. `2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Ctrl-A` adds 30 days). Zero-padding preserved on integers. |
 | Insert helpers | `Ctrl-Y` / `Ctrl-E` in Insert mode insert the character from the same column on the line above / below. Useful for stretching tables and ASCII diagrams. |
 | Auto-wrap | `:set textwidth=N` (or `:set tw=N`) — typing a space past column N breaks the line at the last preceding whitespace. `:set tw=0` disables. |
-| Reading mode | `:read` toggles distraction-free rendering — line numbers off, header / footer dimmed to a divider line. `:noread` exits. |
+| Reading mode | `:read` toggles distraction-free rendering — line numbers off, header / footer dimmed to a divider line. `:noread` exits. `:set readingwidth=80` centers text in an 80-col column (Goyo-style). `:set paragraphdim` dims every paragraph except the cursor's (Limelight-style). |
+| Quick spell + read | `zr` toggles reading mode, `zq` saves + quits, `zn` / `zp` jump next / prev misspelling. (`z=` suggest, `zg` add to dict are unchanged.) |
 | Spellcheck | `:set spell`, `:set spelllang=NAME` (e.g. `nb_NO`), `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
 | Config popup | `:config` — modal preferences pane (theme, numbers, spell on/off, lang, underline color). `W` saves to scriberc, `ESC` closes. |
 | Themes | `:set theme=NAME` (monokai / solarized / nord / dracula / gruvbox / plain), `--theme=NAME` CLI |
@@ -144,6 +145,9 @@ relativenumber = false
 spell = false
 lang = en_US           # hunspell dict tag (en_US, nb_NO, nn_NO, de_DE, …)
 spellcolor = 196       # xterm-256 palette index for the spellcheck underline
+read = false           # enter reading mode at startup
+readingwidth = 80      # centered column width when reading (0 = full pane)
+paragraphdim = true    # Limelight-style dim of non-current paragraphs
 ```
 
 `--theme NAME` overrides the rcfile for one session. Runtime `:set` commands stay in-session (the rcfile is the hand-edited source of truth).

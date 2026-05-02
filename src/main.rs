@@ -437,6 +437,15 @@ struct App {
     /// `:read` / `:noread`. Doesn't change buffer state — pure
     /// presentation.
     reading_mode: bool,
+    /// `:set readingwidth=N` — column width of the centered text in
+    /// reading mode. 0 = full pane width (current behaviour). Common
+    /// values: 72, 80, 100. Approximates the Goyo vim plugin.
+    reading_width: usize,
+    /// `:set paragraphdim` — Limelight-style: when in reading mode,
+    /// every paragraph except the one containing the cursor is dimmed
+    /// to a subtle grey. Toggle independently from reading_mode but
+    /// only takes visual effect while reading_mode is on.
+    paragraph_dim: bool,
     /// `:set textwidth=N` (alias `:set tw=N`). Auto-wraps the line
     /// during typing when it exceeds `textwidth` characters by
     /// breaking at the last whitespace before the limit. 0 = off.
@@ -507,10 +516,15 @@ impl App {
             mark_set_prefix: false,
             mark_jump_prefix: false,
             mark_jump_exact: false,
-            reading_mode: false,
+            reading_mode: rc.reading_mode,
+            reading_width: rc.reading_width,
+            paragraph_dim: rc.paragraph_dim,
             textwidth: 0,
         };
         if auto_spell { app.spell_enable(); }
+        // Apply reading-mode layout if rcfile asked for it at launch —
+        // pane geometry needs to reflect reading_width / centering.
+        if app.reading_mode { app.apply_layout(); }
         app
     }
 
@@ -743,6 +757,13 @@ struct RcConfig {
     /// `spell_color = N` (or `spellcolor = N`) in scriberc, or the
     /// config popup.
     spell_color: Option<u8>,
+    /// `readingwidth = N` — column width of the centered text in
+    /// reading mode. 0 = full pane width.
+    reading_width: usize,
+    /// `paragraphdim = true` — Limelight-style dimming when reading.
+    paragraph_dim: bool,
+    /// `read = true` — enter reading mode at startup.
+    reading_mode: bool,
 }
 
 /// Path to the persistent error log. Append-only; rotated by hand if it
@@ -844,6 +865,11 @@ fn load_scriberc() -> RcConfig {
             "spellcolor" | "spell_color" => {
                 if let Ok(n) = v.parse::<u8>() { cfg.spell_color = Some(n); }
             }
+            "readingwidth" | "rw" => {
+                if let Ok(n) = v.parse::<usize>() { cfg.reading_width = n; }
+            }
+            "paragraphdim" | "pdim" => cfg.paragraph_dim = truthy(v),
+            "read" | "reading" => cfg.reading_mode = truthy(v),
             _ => {}
         }
     }
@@ -1031,6 +1057,12 @@ impl App {
         let line_count = self.buf.line_count();
         let show_numbers = self.show_numbers && !self.reading_mode;
         let relative_numbers = self.relative_numbers && !self.reading_mode;
+        // Limelight-style: dim every paragraph except the cursor's
+        // when reading_mode + paragraph_dim are both on.
+        let dim_others = self.reading_mode && self.paragraph_dim;
+        let (para_lo, para_hi) = if dim_others {
+            self.current_paragraph_bounds()
+        } else { (0, usize::MAX) };
 
         let mut out = String::new();
         for i in 0..pane_h {
@@ -1050,11 +1082,15 @@ impl App {
                 } else { highlight::EmailLineStyle::None };
                 // Resolve the base fg + KEY-bold extent for the unified line
                 // emitter. HeaderBold(c): line in c, KEY (up to colon+1) bold.
-                let (base_fg, bold_until): (Option<u8>, Option<usize>) = match line_style {
+                let (mut base_fg, bold_until): (Option<u8>, Option<usize>) = match line_style {
                     highlight::EmailLineStyle::None        => (None, None),
                     highlight::EmailLineStyle::Solid(c)    => (Some(c), None),
                     highlight::EmailLineStyle::HeaderBold(c) => (Some(c), line.find(':').map(|p| p + 1)),
                 };
+                // Limelight: outside the cursor's paragraph → dim. Force
+                // base_fg to a subtle grey, overriding email/source styling.
+                let line_is_dim = dim_others && (line_idx < para_lo || line_idx > para_hi);
+                if line_is_dim { base_fg = Some(240); }
                 // Fast path: when no selection touches this line, we can
                 // emit the whole line in one styled span instead of doing
                 // per-char ANSI emit.
@@ -1086,7 +1122,7 @@ impl App {
                     // has any misspellings we fall through to the plain
                     // emit path so curly underlines show; lines without
                     // misses keep their syntax colors.
-                    if !source_lines.is_empty() && miss_ranges.is_empty() {
+                    if !source_lines.is_empty() && miss_ranges.is_empty() && !line_is_dim {
                         if let Some(styled) = source_lines.get(i) {
                             out.push_str(styled);
                             if i + 1 < pane_h { out.push('\n'); }
@@ -1582,8 +1618,13 @@ impl App {
             return false;
         }
 
-        // `z` prefix: spell actions. Only `z=` (suggest) and `zg` (add to
-        // personal dict) for now; all other z-commands would land here.
+        // `z` prefix: spell + reading-mode shortcuts.
+        //   z=  suggest replacements for misspelled word
+        //   zg  add word at cursor to personal dictionary
+        //   zr  toggle :read (distraction-free reading mode)
+        //   zq  save + quit (equivalent to :wq)
+        //   zn  jump to next misspelling (mirrors `]s`)
+        //   zp  jump to previous misspelling (mirrors `[s`)
         if self.z_prefix {
             self.z_prefix = false;
             match key {
@@ -1593,6 +1634,19 @@ impl App {
                         self.spell_add_word(&word);
                     }
                 }
+                "r" => {
+                    self.reading_mode = !self.reading_mode;
+                    self.apply_layout();
+                    self.set_status(
+                        if self.reading_mode { " reading mode" } else { " reading mode off" },
+                        244);
+                }
+                "q" => {
+                    let _ = self.buf.save();
+                    return true;
+                }
+                "n" => self.jump_next_misspelling(),
+                "p" => self.jump_prev_misspelling(),
                 _ => {}
             }
             return false;
@@ -2420,19 +2474,62 @@ impl App {
         let (cols, rows) = Crust::terminal_size();
         self.cols = cols;
         self.rows = rows;
-        // Wipe screen so the previous frame's bg/border doesn't ghost.
         Crust::clear_screen();
-        // Re-create panes at the new size. Cheaper than mutating each field
-        // and ensures all internal pane state (prev_frame, scroll, …) is
-        // reset for the new geometry.
-        self.header = Pane::new(1, 1, cols, 1, 255, 236);
-        self.header.wrap = false; self.header.scroll = false;
-        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 231, 0);
-        self.main_p.wrap = true;
-        self.footer = Pane::new(1, rows, cols, 1, 255, 236);
-        self.footer.wrap = false; self.footer.scroll = false;
+        self.apply_layout();
         // Keep cursor in view after resize.
         self.scroll = self.cur_line.saturating_sub((self.main_p.h as usize) / 2);
+    }
+
+    /// Recompute pane geometry from `cols` / `rows` / reading mode /
+    /// reading_width. Called from handle_resize and from any toggle
+    /// that changes the layout (`:read`, `:set readingwidth=`).
+    fn apply_layout(&mut self) {
+        let cols = self.cols;
+        let rows = self.rows;
+        let (main_x, main_w) = if self.reading_mode && self.reading_width > 0
+            && (self.reading_width as u16) < cols
+        {
+            let w = self.reading_width as u16;
+            let x = ((cols - w) / 2).max(1);
+            (x, w)
+        } else {
+            (1, cols)
+        };
+        Crust::clear_screen();
+        self.header = Pane::new(1, 1, cols, 1, 255, 236);
+        self.header.wrap = false; self.header.scroll = false;
+        self.main_p = Pane::new(main_x, 2, main_w, rows.saturating_sub(2), 231, 0);
+        self.main_p.wrap = true;
+        // Preserve record + history across layout recompute — recreating
+        // the footer would otherwise blow them away on every `:read`
+        // toggle, killing command-line Up/Down recall.
+        let saved_history = std::mem::take(&mut self.footer.history);
+        self.footer = Pane::new(1, rows, cols, 1, 255, 236);
+        self.footer.wrap = false; self.footer.scroll = false;
+        self.footer.record = true;
+        self.footer.history = saved_history;
+    }
+
+    /// Inclusive line range of the paragraph the cursor is in.
+    /// Paragraphs are separated by blank (whitespace-only) lines.
+    /// Used by Limelight-style dimming.
+    fn current_paragraph_bounds(&self) -> (usize, usize) {
+        let total = self.buf.line_count();
+        if total == 0 { return (0, 0); }
+        let cur = self.cur_line.min(total - 1);
+        let mut start = cur;
+        while start > 0 {
+            let prev = self.buf.line(start - 1);
+            if prev.trim().is_empty() { break; }
+            start -= 1;
+        }
+        let mut end = cur;
+        while end + 1 < total {
+            let next = self.buf.line(end + 1);
+            if next.trim().is_empty() { break; }
+            end += 1;
+        }
+        (start, end)
     }
 
     // ── Visual mode ────────────────────────────────────────────────────
@@ -3450,12 +3547,43 @@ impl App {
             }
             "read" | "reading" => {
                 self.reading_mode = true;
+                self.apply_layout();
                 self.set_status(" reading mode (use :noread to exit)", 244);
                 false
             }
             "noread" | "noreading" => {
                 self.reading_mode = false;
+                self.apply_layout();
                 self.set_status(" reading mode off", 244);
+                false
+            }
+            other if other.starts_with("set readingwidth") || other.starts_with("set rw") => {
+                let key = if other.starts_with("set readingwidth") { "set readingwidth" } else { "set rw" };
+                let v = other.trim_start_matches(key).trim_start_matches('=').trim();
+                if v.is_empty() {
+                    self.set_status(&format!(" readingwidth={} (0=full)", self.reading_width), 244);
+                } else if let Ok(n) = v.parse::<usize>() {
+                    self.reading_width = n;
+                    self.apply_layout();
+                    self.set_status(&format!(" readingwidth={}", n), 244);
+                } else {
+                    self.set_status(" usage: :set readingwidth=N", 196);
+                }
+                false
+            }
+            other if matches!(other, "set paragraphdim" | "set pdim")
+                  || other.starts_with("set paragraphdim=") || other.starts_with("set pdim=")
+                  || matches!(other, "set noparagraphdim" | "set nopdim") =>
+            {
+                let val = if other == "set noparagraphdim" || other == "set nopdim" {
+                    false
+                } else if let Some(v) = other.split('=').nth(1) {
+                    matches!(v.trim(), "true" | "1" | "yes" | "on")
+                } else {
+                    true
+                };
+                self.paragraph_dim = val;
+                self.set_status(if val { " paragraph dim on" } else { " paragraph dim off" }, 244);
                 false
             }
             other if other.starts_with("set textwidth") || other.starts_with("set tw") => {
