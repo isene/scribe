@@ -74,7 +74,7 @@ Requires `claude` on `PATH` (both commands).
 
 ## Status
 
-**v0.1.17** — daily-driveable for prose. Implemented:
+**v0.1.20** — daily-driveable for prose. Implemented:
 
 | Area | Keys / commands |
 |---|---|
@@ -90,7 +90,10 @@ Requires `claude` on `PATH` (both commands).
 | Substitute | `:s/pat/rep/[gi]` current line, `:%s/pat/rep/[gi]` whole buffer, atomic undo |
 | Undo | `u` undo, `Ctrl-R` redo, undo **tree** in memory; cursor follows the edit site |
 | Dot-repeat | `.` replays the last change (operator + motion + inserted text, replace, paste) |
-| Spellcheck | `:set spell`, `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
+| Macros | `M{reg}` start recording, `M` again to stop; `@{reg}` replay, `@@` last. Stored in the same registers as yanks — `"ap` pastes the captured key sequence (`<Esc>`, `<C-Up>`, `<CR>`, …) as editable text; yank an edited version back into a register and replay runs the new sequence. (`m` left free for marks.) |
+| Move lines | `Ctrl-Up` / `Ctrl-Down` swap the current line with the one above / below. Counts work (`5 Ctrl-Down`). |
+| Spellcheck | `:set spell`, `:set spelllang=NAME` (e.g. `nb_NO`), `]s` / `[s` next/prev miss, `z=` suggestions, `zg` add to dict |
+| Config popup | `:config` — modal preferences pane (theme, numbers, spell on/off, lang, underline color). `W` saves to scriberc, `ESC` closes. |
 | Themes | `:set theme=NAME` (monokai / solarized / nord / dracula / gruvbox / plain), `--theme=NAME` CLI |
 | Syntax override | `:set syntax=NAME` (plain / email / rust / md / py / sh / …) — change the buffer's filetype on the fly |
 | Line numbers | `:set number` / `:set rnu` (relative) / `:set nonumber` |
@@ -101,7 +104,6 @@ Requires `claude` on `PATH` (both commands).
 
 ## Roadmap
 
-- **Macros** — `q{reg}` to record, `@{reg}` / `@@` to replay.
 - **Multi-line state in source highlighting** — block comments / multi-line strings keep their color across line breaks. Currently line-stateless (visible at the top of any file with a `/* */` block).
 - **Persistent registers** — yank survives across scribe restarts (`~/.config/scribe/registers.json`).
 - **Reading mode** (`:read` toggle) — distraction-free, prose-styled, dim chrome, Markdown rendered.
@@ -136,6 +138,8 @@ theme = dracula
 number = true
 relativenumber = false
 spell = false
+lang = en_US           # hunspell dict tag (en_US, nb_NO, nn_NO, de_DE, …)
+spellcolor = 196       # xterm-256 palette index for the spellcheck underline
 ```
 
 `--theme NAME` overrides the rcfile for one session. Runtime `:set` commands stay in-session (the rcfile is the hand-edited source of truth).

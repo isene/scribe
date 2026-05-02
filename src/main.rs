@@ -17,10 +17,10 @@ mod spell;
 mod textobj;
 
 use buffer::{Buffer, FileKind};
-use crust::{Crust, Input, Pane};
+use crust::{Crust, Input, Pane, Popup};
 use crust::style;
 use mode::Mode;
-use register::{Registers, YankKind};
+use register::{Registers, Yank, YankKind};
 use search::{Direction, SearchState};
 use std::path::PathBuf;
 
@@ -54,6 +54,7 @@ fn main() {
             i += 1;
         }
     }
+    install_panic_hook();
     Crust::init();
     Crust::set_app_identity("Scribe");
     // Bracketed paste: terminal wraps the pasted blob in `CSI 200~ ... 201~`
@@ -91,6 +92,11 @@ fn main() {
             app.render_all();
             continue;
         }
+        // Macro capture: append the key only if recording was already
+        // active BEFORE dispatch. Suppresses (a) the `M` keystroke that
+        // starts/stops recording and (b) the register-name keystroke that
+        // follows it. Replayed keys (replay_depth>0) are also skipped.
+        let was_recording = app.recording;
         let quit = match app.mode {
             Mode::Normal      => app.handle_normal(&key),
             Mode::Insert      => app.handle_insert(&key),
@@ -99,6 +105,9 @@ fn main() {
             Mode::VisualLine  |
             Mode::VisualBlock => app.handle_visual(&key),
         };
+        if app.replay_depth == 0 && was_recording.is_some() && was_recording == app.recording {
+            app.recording_buf.push_str(&key_to_macro_text(&key));
+        }
         if quit { break; }
         app.render_all();
     }
@@ -110,6 +119,112 @@ fn main() {
     save_cmd_history(&app.footer.history);
     Crust::cleanup();
     Crust::clear_screen();
+}
+
+/// Encode an input-layer key string ("h", "ESC", "C-UP", "ENTER", …) as
+/// vim-style macro text (`h`, `<Esc>`, `<C-Up>`, `<CR>`, …). The result
+/// is written into a register so the user can paste, edit, and re-yank
+/// macros as ordinary text.
+fn key_to_macro_text(key: &str) -> String {
+    match key {
+        "ESC"        => "<Esc>".into(),
+        "ENTER"      => "<CR>".into(),
+        "BACKSPACE"  => "<BS>".into(),
+        "TAB"        => "<Tab>".into(),
+        "DEL" | "C-DEL" => if key == "C-DEL" { "<C-Del>".into() } else { "<Del>".into() },
+        "INS" | "C-INS" => if key == "C-INS" { "<C-Ins>".into() } else { "<Ins>".into() },
+        "UP"         => "<Up>".into(),
+        "DOWN"       => "<Down>".into(),
+        "LEFT"       => "<Left>".into(),
+        "RIGHT"      => "<Right>".into(),
+        "HOME"       => "<Home>".into(),
+        "END"        => "<End>".into(),
+        "PgUP"       => "<PageUp>".into(),
+        "PgDOWN"     => "<PageDown>".into(),
+        "C-UP"       => "<C-Up>".into(),
+        "C-DOWN"     => "<C-Down>".into(),
+        "C-LEFT"     => "<C-Left>".into(),
+        "C-RIGHT"    => "<C-Right>".into(),
+        "S-UP"       => "<S-Up>".into(),
+        "S-DOWN"     => "<S-Down>".into(),
+        "S-LEFT"     => "<S-Left>".into(),
+        "S-RIGHT"    => "<S-Right>".into(),
+        "C-HOME"     => "<C-Home>".into(),
+        "C-END"      => "<C-End>".into(),
+        "C-PgUP"     => "<C-PageUp>".into(),
+        "C-PgDOWN"   => "<C-PageDown>".into(),
+        "C-SPACE"    => "<C-Space>".into(),
+        s if s.starts_with("C-") && s.len() > 2 => format!("<{}>", s),
+        s if s.starts_with('F') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit()) => {
+            format!("<{}>", s)
+        }
+        s => {
+            let mut chars = s.chars();
+            let first = chars.next();
+            match first {
+                Some('<') if chars.next().is_none() => "<lt>".into(),
+                Some(c) if chars.next().is_none() => c.to_string(),
+                _ => format!("<{}>", s),
+            }
+        }
+    }
+}
+
+/// Inverse of `key_to_macro_text`. Walks the macro text and produces the
+/// stream of input-layer key strings to feed back through the mode
+/// handlers. Tokens look like `<Esc>`, `<C-Up>`, `<CR>`. Anything outside
+/// `<...>` is a single literal char.
+fn parse_macro_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(rel) = bytes[i+1..].iter().position(|&b| b == b'>') {
+                let inner = &text[i+1 .. i+1+rel];
+                let key = match inner {
+                    "Esc"      => "ESC".to_string(),
+                    "CR" | "Enter" | "Return" => "ENTER".to_string(),
+                    "BS"       => "BACKSPACE".to_string(),
+                    "Tab"      => "TAB".to_string(),
+                    "Del"      => "DEL".to_string(),
+                    "Ins"      => "INS".to_string(),
+                    "Up"       => "UP".to_string(),
+                    "Down"     => "DOWN".to_string(),
+                    "Left"     => "LEFT".to_string(),
+                    "Right"    => "RIGHT".to_string(),
+                    "Home"     => "HOME".to_string(),
+                    "End"      => "END".to_string(),
+                    "PageUp"   => "PgUP".to_string(),
+                    "PageDown" => "PgDOWN".to_string(),
+                    "C-Up"     => "C-UP".to_string(),
+                    "C-Down"   => "C-DOWN".to_string(),
+                    "C-Left"   => "C-LEFT".to_string(),
+                    "C-Right"  => "C-RIGHT".to_string(),
+                    "S-Up"     => "S-UP".to_string(),
+                    "S-Down"   => "S-DOWN".to_string(),
+                    "S-Left"   => "S-LEFT".to_string(),
+                    "S-Right"  => "S-RIGHT".to_string(),
+                    "C-Home"   => "C-HOME".to_string(),
+                    "C-End"    => "C-END".to_string(),
+                    "C-PageUp"   => "C-PgUP".to_string(),
+                    "C-PageDown" => "C-PgDOWN".to_string(),
+                    "C-Del"    => "C-DEL".to_string(),
+                    "C-Ins"    => "C-INS".to_string(),
+                    "C-Space"  => "C-SPACE".to_string(),
+                    "lt"       => "<".to_string(),
+                    s          => s.to_string(),
+                };
+                out.push(key);
+                i += 2 + rel;
+                continue;
+            }
+        }
+        let c = text[i..].chars().next().unwrap();
+        out.push(c.to_string());
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// Pending Normal-mode command being assembled key-by-key.
@@ -199,6 +314,10 @@ struct App {
     /// hunspell is missing, stays None and we set a status message.
     spell: Option<spell::Spell>,
     spell_enabled: bool,
+    /// Hunspell dict tag for the spawned subprocess. Switching it via
+    /// `:set spelllang=NAME` (or `:set lang=NAME`) drops the current
+    /// hunspell process and re-spawns with the new dict.
+    spell_lang: String,
     /// Sorted by start byte, recomputed on Insert→Normal and on `:set spell`.
     misspellings: Vec<spell::MisspellRange>,
     /// `:set number` / `:set nonumber` — gutter with line numbers on the
@@ -212,6 +331,25 @@ struct App {
     /// so the source-mode renderer picks it up; we keep a copy for
     /// status display and for saving back to scriberc.
     theme_name: String,
+    /// Macro state. `M{reg}` starts capture into `recording = Some(reg)`,
+    /// pressing `M` again stops and commits to register `reg` as charwise
+    /// yank text. `@{reg}` replays from the register. `@@` replays
+    /// last_macro. `m` is intentionally left free for marks (future).
+    /// Macros live in the same register file as yanks — `"ap` pastes the
+    /// captured key sequence as editable text, and you can yank edited
+    /// text back into a register and replay it.
+    recording: Option<char>,
+    last_macro: Option<char>,
+    /// In-memory text being assembled while recording. Committed to the
+    /// register on stop; replay reads from the register so user edits
+    /// (yank back over the slot) take effect on the next replay.
+    recording_buf: String,
+    /// Set after `M` while waiting for the register name.
+    macro_prefix: bool,
+    /// Set after `@` while waiting for the register name.
+    at_prefix: bool,
+    /// Bound to keep `@a` containing `@a` from infinite-recursing.
+    replay_depth: usize,
 }
 
 impl App {
@@ -236,6 +374,7 @@ impl App {
         let rc = load_scriberc();
         let active_theme = cli_theme.or_else(|| rc.theme.clone());
         if let Some(ref t) = active_theme { highlight::set_theme(t); }
+        if let Some(c) = rc.spell_color { highlight::set_miss_color(c); }
 
         // Footer hosts the `:` command prompt — enable editline history so
         // Up / Down recalls past commands (per-session). Persisted history
@@ -262,10 +401,17 @@ impl App {
             bracket_prefix: None,
             spell: None,
             spell_enabled: false,
+            spell_lang: rc.spell_lang.clone().unwrap_or_else(|| "en_US".into()),
             misspellings: Vec::new(),
             show_numbers: rc.number,
             relative_numbers: rc.relative_numbers,
             theme_name: active_theme.unwrap_or_else(|| "monokai".to_string()),
+            recording: None,
+            last_macro: None,
+            recording_buf: String::new(),
+            macro_prefix: false,
+            at_prefix: false,
+            replay_depth: 0,
         };
         if auto_spell { app.spell_enable(); }
         app
@@ -275,19 +421,40 @@ impl App {
     /// Spawn hunspell, load personal dict, mark enabled, run a first scan.
     fn spell_enable(&mut self) {
         if self.spell.is_none() {
-            match spell::Spell::spawn("en_US") {
+            match spell::Spell::spawn(&self.spell_lang) {
                 Some(mut sp) => {
                     sp.load_personal(load_personal_dict());
                     self.spell = Some(sp);
                 }
                 None => {
-                    self.set_status(" spell: hunspell not found", 196);
+                    self.set_status(
+                        &format!(" spell: hunspell + dict '{}' not available", self.spell_lang),
+                        196);
                     return;
                 }
             }
         }
         self.spell_enabled = true;
         self.recheck_spell();
+    }
+
+    /// Drop any existing hunspell process and re-spawn with `lang`. Called
+    /// from `:set spelllang=NAME`. If spawn fails the previous state is
+    /// kept (with a status message); spell stays enabled iff it was.
+    fn spell_set_lang(&mut self, lang: &str) {
+        let was_enabled = self.spell_enabled;
+        self.spell = None;
+        self.spell_lang = lang.to_string();
+        if was_enabled || matches!(self.buf.kind, FileKind::Email) {
+            self.spell_enable();
+            if self.spell_enabled {
+                self.set_status(
+                    &format!(" spell: lang={} ({} words)", self.spell_lang, self.misspellings.len()),
+                    244);
+            }
+        } else {
+            self.set_status(&format!(" spell lang: {} (use :set spell to enable)", self.spell_lang), 244);
+        }
     }
 
     fn spell_disable(&mut self) {
@@ -471,6 +638,80 @@ struct RcConfig {
     number: bool,
     relative_numbers: bool,
     spell: bool,
+    /// Hunspell dict tag — `en_US`, `nb_NO`, `nn_NO`, `de_DE`, … Whatever
+    /// `hunspell -D` lists locally. Empty / unset → default `en_US`.
+    spell_lang: Option<String>,
+    /// xterm-256 palette index for the curly underline drawn on
+    /// misspelled words. Default 196 (bright red). Override via
+    /// `spell_color = N` (or `spellcolor = N`) in scriberc, or the
+    /// config popup.
+    spell_color: Option<u8>,
+}
+
+/// Path to the persistent error log. Append-only; rotated by hand if it
+/// grows too large.
+fn log_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/scribe.log")
+}
+
+/// Append a timestamped line to `~/.config/scribe/scribe.log`. Silent on
+/// failure (no point recursing into the log when the log itself is the
+/// problem). Used by the panic hook and any non-fatal error site.
+fn log_msg(level: &str, msg: &str) {
+    let path = log_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "[{}] {} v{} pid={} {}",
+            ts, level, VERSION, std::process::id(), msg);
+    }
+}
+
+/// Install a panic hook that:
+/// 1. Restores the terminal (Crust::cleanup, disable bracketed paste)
+///    so the user lands on a usable prompt instead of garbage state.
+/// 2. Captures the panic message + location + a backtrace into
+///    `~/.config/scribe/scribe.log`.
+/// 3. Re-prints a one-line summary to stderr so the user sees
+///    "scribe panicked at ... — see ~/.config/scribe/scribe.log".
+fn install_panic_hook() {
+    // Force a backtrace if the user hasn't set one — the log is useless
+    // without it. Doesn't override an explicit RUST_BACKTRACE=0.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Restore terminal first so the panic text isn't eaten by
+        // alt-screen / raw mode.
+        use std::io::Write as _;
+        let _ = std::io::stdout().write_all(b"\x1b[?2004l");
+        let _ = std::io::stdout().flush();
+        Crust::cleanup();
+
+        let payload = info.payload();
+        let msg: &str = if let Some(s) = payload.downcast_ref::<&str>() { *s }
+                        else if let Some(s) = payload.downcast_ref::<String>() { s.as_str() }
+                        else { "<non-string panic payload>" };
+        let loc = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let entry = format!("PANIC at {}: {}\n{}", loc, msg, bt);
+        log_msg("PANIC", &entry);
+
+        eprintln!("\nscribe panicked at {}: {}", loc, msg);
+        eprintln!("see {} for the full backtrace", log_path().display());
+
+        // Hand off to the default hook so any chained behavior still
+        // runs (test framework hook, etc.).
+        default_hook(info);
+    }));
 }
 
 fn scriberc_path() -> std::path::PathBuf {
@@ -500,6 +741,12 @@ fn load_scriberc() -> RcConfig {
                 if cfg.relative_numbers { cfg.number = true; }
             }
             "spell"          => cfg.spell = truthy(v),
+            "spelllang" | "lang" => {
+                if !v.is_empty() { cfg.spell_lang = Some(v.to_string()); }
+            }
+            "spellcolor" | "spell_color" => {
+                if let Ok(n) = v.parse::<u8>() { cfg.spell_color = Some(n); }
+            }
             _ => {}
         }
     }
@@ -721,12 +968,22 @@ impl App {
                     _ => false,
                 };
                 if !line_in_sel {
-                    // Source mode: emit the syntect-styled line straight
-                    // from the pre-built `source_lines` buffer. Selection
-                    // / spell / token overlay don't compose with syntect
-                    // colors yet — when those are needed the line falls
-                    // through to the per-char selection path below.
-                    if !source_lines.is_empty() {
+                    // Compute miss ranges first; we use them in two places.
+                    let line_end_byte = line_byte_off + line.len();
+                    let miss_ranges: Vec<(usize, usize)> = self.misspellings.iter()
+                        .filter(|m| m.end > line_byte_off && m.start < line_end_byte)
+                        .map(|m| {
+                            let s = m.start.saturating_sub(line_byte_off).min(line.len());
+                            let e = m.end.saturating_sub(line_byte_off).min(line.len());
+                            (s, e)
+                        })
+                        .collect();
+                    // Source mode: emit the highlight-styled line straight
+                    // from the pre-built `source_lines` buffer. If the line
+                    // has any misspellings we fall through to the plain
+                    // emit path so curly underlines show; lines without
+                    // misses keep their syntax colors.
+                    if !source_lines.is_empty() && miss_ranges.is_empty() {
                         if let Some(styled) = source_lines.get(i) {
                             out.push_str(styled);
                             if i + 1 < pane_h { out.push('\n'); }
@@ -737,15 +994,6 @@ impl App {
                     // (addresses → magenta 201, URLs → blue 4 + OSC 8) +
                     // misspelling overlay. Single function handles all
                     // attribute combinations and minimises SGR transitions.
-                    let line_end_byte = line_byte_off + line.len();
-                    let miss_ranges: Vec<(usize, usize)> = self.misspellings.iter()
-                        .filter(|m| m.end > line_byte_off && m.start < line_end_byte)
-                        .map(|m| {
-                            let s = m.start.saturating_sub(line_byte_off).min(line.len());
-                            let e = m.end.saturating_sub(line_byte_off).min(line.len());
-                            (s, e)
-                        })
-                        .collect();
                     let tokens = highlight::inline_tokens(&line);
                     highlight::emit_email_line(&mut out, &line, base_fg, bold_until, &tokens, &miss_ranges);
                     if i + 1 < pane_h { out.push('\n'); }
@@ -801,7 +1049,12 @@ impl App {
             if i + 1 < pane_h { out.push('\n'); }
         }
         self.main_p.set_text(&out);
-        self.main_p.full_refresh();
+        // Diff-render: only repaints rows whose rendered output actually
+        // changed. full_refresh used to be called here; on hold-down j/k
+        // that wipes-and-repaints the whole pane every keystroke, which
+        // shows up as a slight flash. Header/footer already use the diff
+        // path via Pane::say.
+        self.main_p.refresh();
     }
 
     fn render_footer(&mut self) {
@@ -815,6 +1068,24 @@ impl App {
         let mode_label = style::bg(&style::fg(self.mode.label(), 0), self.mode.color());
         let pos = format!(" {}:{} ", self.cur_line + 1, self.cur_col + 1);
         let right = format!("scribe v{} ", VERSION);
+
+        // Persistent stats segment: word count + spell status. Sits to the
+        // left of the position indicator so the status message in the
+        // middle slot can shrink without overlapping. Cheap on prose-sized
+        // buffers; if it ever becomes the hot path, gate behind `dirty`.
+        let words = self.compute_wordcount();
+        let chars = self.buf.rope.len_chars();
+        let spell_lbl = if self.spell_enabled {
+            format!("spell:{}", self.spell_lang)
+        } else {
+            "spell:off".to_string()
+        };
+        let stats_plain = format!(" {}w  {}c  {} ", words, chars, spell_lbl);
+        let stats_styled = format!(" {}w  {}c  {}{} ",
+            style::fg(&words.to_string(), 252),
+            style::fg(&chars.to_string(), 244),
+            style::fg(&spell_lbl, if self.spell_enabled { 35 } else { 244 }),
+            bg_on);
 
         let middle_plain: String = if self.mode == Mode::Command {
             format!(" :{}", self.cmdline)
@@ -838,17 +1109,28 @@ impl App {
         let cols = self.cols as usize;
         let mode_w = crust::display_width(&mode_label);
         let middle_w = crust::display_width(&middle_plain);
+        let stats_w = crust::display_width(&stats_plain);
         let pos_w = crust::display_width(&pos);
         let right_w = crust::display_width(&right);
 
-        let total = mode_w + middle_w + pos_w + right_w;
+        let total = mode_w + middle_w + stats_w + pos_w + right_w;
         let line = if total <= cols {
             let gap = cols - total;
-            // Order: badge (its own bg) → bg_on → middle_styled → spaces →
-            // pos → right → final reset. bg_on after every helper that
-            // ends in [0m. spaces inherit bg_on so the gap fills.
+            // Order: badge → bg_on → middle → gap → stats → pos → right →
+            // final reset. bg_on after every helper that ends in [0m so
+            // the trailing reset doesn't drop the bar to terminal-default
+            // bg mid-line.
+            format!("{}{}{}{}{}{}{}\x1b[0m",
+                mode_label, bg_on, middle_styled, " ".repeat(gap),
+                stats_styled, pos, right)
+        } else if mode_w + middle_w + stats_w + pos_w + right_w
+                  .saturating_sub(stats_w) <= cols
+        {
+            // Too tight for the stats segment — drop it.
+            let visible_w = mode_w + middle_w + pos_w + right_w;
+            let pad = cols.saturating_sub(visible_w);
             format!("{}{}{}{}{}{}\x1b[0m",
-                mode_label, bg_on, middle_styled, " ".repeat(gap), pos, right)
+                mode_label, bg_on, middle_styled, " ".repeat(pad), pos, right)
         } else {
             let visible = format!("{}{}{}", mode_label, bg_on, middle_styled);
             let visible_w = mode_w + middle_w;
@@ -856,6 +1138,17 @@ impl App {
             format!("{}{}\x1b[0m", visible, " ".repeat(pad))
         };
         self.footer.say(&line);
+    }
+
+    /// Whitespace-delimited token count over the whole buffer. Cheap
+    /// enough for prose-sized files; if a 1MB log is ever opened, swap
+    /// for a `dirty`-gated cache.
+    fn compute_wordcount(&self) -> usize {
+        let mut n = 0usize;
+        for i in 0..self.buf.line_count() {
+            n += self.buf.line(i).split_whitespace().count();
+        }
+        n
     }
 
     fn set_status(&mut self, msg: &str, c: u8) { self.status = Some((msg.into(), c)); }
@@ -876,6 +1169,7 @@ impl App {
     fn clamp_col_to_line(&mut self) {
         let cap = self.col_cap();
         if self.cur_col > cap { self.cur_col = cap; }
+        self.snap_col_to_boundary();
     }
 
     fn cursor_byte(&self) -> usize {
@@ -898,10 +1192,14 @@ impl App {
     /// Move one char left, wrapping to end of previous line when at column 0.
     fn move_left_wrap(&mut self) {
         if self.cur_col > 0 {
-            self.cur_col -= 1;
+            let line = self.buf.line(self.cur_line);
+            let mut p = self.cur_col - 1;
+            while p > 0 && !line.is_char_boundary(p) { p -= 1; }
+            self.cur_col = p;
         } else if self.cur_line > 0 {
             self.cur_line -= 1;
             self.cur_col = self.col_cap();
+            self.snap_col_to_boundary();
         }
         self.want_col = self.cur_col;
     }
@@ -910,7 +1208,10 @@ impl App {
     fn move_right_wrap(&mut self) {
         let cap = self.col_cap();
         if self.cur_col < cap {
-            self.cur_col += 1;
+            let line = self.buf.line(self.cur_line);
+            let mut p = self.cur_col + 1;
+            while p < line.len() && !line.is_char_boundary(p) { p += 1; }
+            self.cur_col = p.min(cap);
         } else if self.cur_line + 1 < self.buf.line_count() {
             self.cur_line += 1;
             self.cur_col = 0;
@@ -922,6 +1223,7 @@ impl App {
         if self.cur_line > 0 {
             self.cur_line -= 1;
             self.cur_col = self.want_col.min(self.col_cap());
+            self.snap_col_to_boundary();
         }
     }
 
@@ -929,7 +1231,20 @@ impl App {
         if self.cur_line + 1 < self.buf.line_count() {
             self.cur_line += 1;
             self.cur_col = self.want_col.min(self.col_cap());
+            self.snap_col_to_boundary();
         }
+    }
+
+    /// Round `cur_col` DOWN to the nearest UTF-8 char boundary on the
+    /// current line. Cheap defence against any path that advanced
+    /// `cur_col` by 1 byte instead of 1 char — without this guard,
+    /// `position_cursor`'s `line[..cur_col]` slice panics when the
+    /// buffer contains multi-byte chars (æ, ø, å, emoji, …).
+    fn snap_col_to_boundary(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let mut c = self.cur_col.min(line.len());
+        while c > 0 && !line.is_char_boundary(c) { c -= 1; }
+        self.cur_col = c;
     }
 
     // ── Bracketed paste ────────────────────────────────────────────────
@@ -954,6 +1269,51 @@ impl App {
     // ── Normal mode (pending state machine) ────────────────────────────
     fn handle_normal(&mut self, key: &str) -> bool {
         self.status = None;
+
+        // Macro register-prefix dispatch. Done first so a count / operator
+        // already in flight (which we don't want anyway) is not considered.
+        if self.macro_prefix {
+            self.macro_prefix = false;
+            if let Some(c) = key.chars().next() {
+                if c.is_ascii_alphanumeric() {
+                    self.recording_buf.clear();
+                    self.recording = Some(c);
+                    self.set_status(&format!(" recording @{}", c), 178);
+                }
+            }
+            return false;
+        }
+        if self.at_prefix {
+            self.at_prefix = false;
+            let reg = if key == "@" {
+                self.last_macro
+            } else {
+                key.chars().next().filter(|c| c.is_ascii_alphanumeric())
+            };
+            if let Some(r) = reg { self.replay_macro(r); }
+            return false;
+        }
+        // `M` toggles macro recording. While recording, a second `M` stops;
+        // otherwise it primes for the register name.
+        if key == "M" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            if let Some(reg) = self.recording.take() {
+                let text = std::mem::take(&mut self.recording_buf);
+                let bytes = text.len();
+                self.regs.put(reg, Yank { text, kind: YankKind::Charwise });
+                self.set_status(&format!(" recorded @{} ({} bytes)", reg, bytes), 244);
+            } else {
+                self.macro_prefix = true;
+            }
+            return false;
+        }
+        if key == "@" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+        {
+            self.at_prefix = true;
+            return false;
+        }
 
         // `z` prefix: spell actions. Only `z=` (suggest) and `zg` (add to
         // personal dict) for now; all other z-commands would land here.
@@ -1371,6 +1731,11 @@ impl App {
                 self.clamp_col_to_line();
             }
 
+            // Move current line up / down (vim users often map this to
+            // Alt+j/k; user wants Ctrl+arrows). One compound undo node.
+            "C-UP"   => for _ in 0..count { self.move_line_up(); },
+            "C-DOWN" => for _ in 0..count { self.move_line_down(); },
+
             // Enter Insert
             "i" => self.enter_insert(),
             "a" => {
@@ -1553,6 +1918,98 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Replay every key captured in macro register `reg`, dispatching it
+    /// through the current mode handler. Replay sets `replay_depth` so
+    /// keys produced by replay are NOT re-captured into a recording.
+    fn replay_macro(&mut self, reg: char) {
+        if self.replay_depth >= 4 {
+            self.set_status(" macro recursion too deep", 196);
+            return;
+        }
+        let text = match self.regs.get(reg) {
+            Some(y) if !y.text.is_empty() => y.text.clone(),
+            _ => { self.set_status(&format!(" register @{} is empty", reg), 244); return; }
+        };
+        let keys = parse_macro_text(&text);
+        if keys.is_empty() { return; }
+        self.last_macro = Some(reg);
+        self.replay_depth += 1;
+        for key in keys {
+            if key == "RESIZE" || key.starts_with("PASTE\x00") { continue; }
+            match self.mode {
+                Mode::Normal => { self.handle_normal(&key); }
+                Mode::Insert => { self.handle_insert(&key); }
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => { self.handle_visual(&key); }
+                Mode::Command => {}
+            }
+        }
+        self.replay_depth -= 1;
+    }
+
+    /// Swap the current line with the one above. One compound undo node.
+    fn move_line_up(&mut self) {
+        if self.cur_line == 0 { return; }
+        let total = self.buf.line_count();
+        let a = self.cur_line - 1;
+        let b = self.cur_line;
+        let line_a = self.buf.line(a);
+        let line_b = self.buf.line(b);
+        let start = self.buf.line_byte_offset(a);
+        let end = if b + 1 < total {
+            self.buf.line_byte_offset(b + 1)
+        } else {
+            self.buf.rope.len_bytes()
+        };
+        let block_has_trailing_nl = {
+            let cs = self.buf.rope.byte_to_char(start);
+            let ce = self.buf.rope.byte_to_char(end);
+            let span: String = self.buf.rope.slice(cs..ce).into();
+            span.ends_with('\n')
+        };
+        let mut rep = String::with_capacity(line_a.len() + line_b.len() + 2);
+        rep.push_str(&line_b);
+        rep.push('\n');
+        rep.push_str(&line_a);
+        if block_has_trailing_nl { rep.push('\n'); }
+        self.buf.begin_compound();
+        self.buf.apply(start, end, &rep);
+        self.buf.end_compound();
+        self.cur_line -= 1;
+        self.clamp_col_to_line();
+    }
+
+    /// Swap the current line with the one below. One compound undo node.
+    fn move_line_down(&mut self) {
+        let total = self.buf.line_count();
+        if self.cur_line + 1 >= total { return; }
+        let a = self.cur_line;
+        let b = self.cur_line + 1;
+        let line_a = self.buf.line(a);
+        let line_b = self.buf.line(b);
+        let start = self.buf.line_byte_offset(a);
+        let end = if b + 1 < total {
+            self.buf.line_byte_offset(b + 1)
+        } else {
+            self.buf.rope.len_bytes()
+        };
+        let block_has_trailing_nl = {
+            let cs = self.buf.rope.byte_to_char(start);
+            let ce = self.buf.rope.byte_to_char(end);
+            let span: String = self.buf.rope.slice(cs..ce).into();
+            span.ends_with('\n')
+        };
+        let mut rep = String::with_capacity(line_a.len() + line_b.len() + 2);
+        rep.push_str(&line_b);
+        rep.push('\n');
+        rep.push_str(&line_a);
+        if block_has_trailing_nl { rep.push('\n'); }
+        self.buf.begin_compound();
+        self.buf.apply(start, end, &rep);
+        self.buf.end_compound();
+        self.cur_line += 1;
+        self.clamp_col_to_line();
     }
 
     fn enter_insert(&mut self) {
@@ -2274,6 +2731,132 @@ impl App {
         quit
     }
 
+    /// Footer-line text prompt. Returns the entered string (empty on
+    /// ESC). Used by the config popup for value-entry slots (spell
+    /// language, color number, theme name).
+    fn footer_prompt(&mut self, label: &str) -> String {
+        let s = self.footer.ask_with_bg(label, "", 17);
+        self.render_footer();
+        s
+    }
+
+    /// Modal config popup, modelled on pointer's `show_config`. Cycle
+    /// through a fixed key set, mutate the in-session state, optionally
+    /// write the rcfile back. ESC / `q` close. The footer-line prompt
+    /// helper is shared with the rest of the editor so it inherits all
+    /// the editline niceties (history, cursor position, ESC-restore).
+    fn show_config_popup(&mut self) {
+        let themes = highlight::available_themes();
+        let popup_w = 60u16;
+        let popup_h = 18u16;
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+
+        loop {
+            let theme_idx = themes.iter().position(|t| **t == self.theme_name).unwrap_or(0);
+            let on  = |b: bool| if b { style::fg("on",  35)  } else { style::fg("off", 196) };
+            let val = |s: &str| style::fg(s, 81);
+            let key = |k: &str| style::fg(k, 220);
+
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(String::new());
+            lines.push(format!("  {}", style::bold("Preferences")));
+            lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+            lines.push(format!("  {}  Theme:        {}",  key("t"), val(themes[theme_idx])));
+            lines.push(format!("  {}  Number col:   {}",  key("n"), on(self.show_numbers)));
+            lines.push(format!("  {}  Relative no:  {}",  key("r"), on(self.relative_numbers)));
+            lines.push(String::new());
+            lines.push(format!("  {}  Spell:        {}",  key("s"), on(self.spell_enabled)));
+            lines.push(format!("  {}  Spell lang:   {}",  key("l"), val(&self.spell_lang)));
+            let mc = highlight::miss_color();
+            lines.push(format!("  {}  Spell color:  {} {}",
+                key("c"),
+                val(&format!("{}", mc)),
+                style::fg("\u{2588}\u{2588}\u{2588}", mc)));
+            lines.push(String::new());
+            lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+            lines.push(format!("  {}  Save to scriberc       {}  Close",
+                key("W"), key("ESC")));
+
+            popup.show(&lines.join("\n"));
+
+            let Some(k) = Input::getchr(None) else { break };
+            match k.as_str() {
+                "ESC" | "q" => break,
+                "t" => {
+                    let next = (theme_idx + 1) % themes.len();
+                    self.theme_name = themes[next].to_string();
+                    highlight::set_theme(themes[next]);
+                }
+                "n" => {
+                    self.show_numbers = !self.show_numbers;
+                    if !self.show_numbers { self.relative_numbers = false; }
+                }
+                "r" => {
+                    self.relative_numbers = !self.relative_numbers;
+                    if self.relative_numbers { self.show_numbers = true; }
+                }
+                "s" => {
+                    if self.spell_enabled {
+                        self.spell_disable();
+                        self.set_status(" spell off", 244);
+                    } else {
+                        self.spell_enable();
+                        if self.spell_enabled {
+                            self.set_status(
+                                &format!(" spell on ({} words flagged)", self.misspellings.len()),
+                                46);
+                        }
+                    }
+                }
+                "l" => {
+                    let s = self.footer_prompt(&format!("spell lang [{}]: ", self.spell_lang));
+                    let s = s.trim();
+                    if !s.is_empty() { self.spell_set_lang(s); }
+                }
+                "c" => {
+                    let s = self.footer_prompt(&format!("spell color 0-255 [{}]: ", highlight::miss_color()));
+                    if let Ok(v) = s.trim().parse::<u8>() {
+                        highlight::set_miss_color(v);
+                    }
+                }
+                "W" => self.save_scriberc(),
+                _ => {}
+            }
+        }
+        // Wipe the popup, repaint everything underneath.
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        self.render_all();
+    }
+
+    /// Write current preferences back to `~/.config/scribe/scriberc`.
+    /// Preserves comments and unknown keys from the existing file by
+    /// rewriting only the keys we manage; everything else is left as-is.
+    fn save_scriberc(&mut self) {
+        let path = scriberc_path();
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let managed = ["theme", "number", "relativenumber", "spell", "lang", "spellcolor"];
+        let mut out = String::new();
+        for line in existing.lines() {
+            let stripped = line.split('#').next().unwrap_or("").trim();
+            if let Some((k, _)) = stripped.split_once('=') {
+                if managed.iter().any(|m| *m == k.trim()) { continue; }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!("theme = {}\n", self.theme_name));
+        out.push_str(&format!("number = {}\n", self.show_numbers));
+        out.push_str(&format!("relativenumber = {}\n", self.relative_numbers));
+        out.push_str(&format!("spell = {}\n", self.spell_enabled));
+        out.push_str(&format!("lang = {}\n", self.spell_lang));
+        out.push_str(&format!("spellcolor = {}\n", highlight::miss_color()));
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        match std::fs::write(&path, out) {
+            Ok(_)  => self.set_status(" scriberc saved", 46),
+            Err(e) => self.set_status(&format!(" scriberc save failed: {}", e), 196),
+        }
+    }
+
     /// Legacy keystroke-by-keystroke command handler — no longer reached
     /// (Mode::Command is never set in v0.1.14+; `:` calls
     /// `run_command_prompt` directly). Kept only because the main loop's
@@ -2326,6 +2909,24 @@ impl App {
             "set nospell" => {
                 self.spell_disable();
                 self.set_status(" spell off", 244);
+                false
+            }
+            "config" | "Config" => {
+                self.show_config_popup();
+                false
+            }
+            other if other.starts_with("set spelllang") || other.starts_with("set lang") => {
+                let key = if other.starts_with("set spelllang") { "set spelllang" } else { "set lang" };
+                let name = other.trim_start_matches(key)
+                    .trim_start_matches('=')
+                    .trim();
+                if name.is_empty() {
+                    self.set_status(
+                        &format!(" spell lang: {} | :set spelllang=NAME (e.g. nb_NO, nn_NO, en_US)", self.spell_lang),
+                        244);
+                } else {
+                    self.spell_set_lang(name);
+                }
                 false
             }
             "set number" | "set nu" => {
