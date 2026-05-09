@@ -27,6 +27,12 @@ use std::collections::HashSet;
 #[derive(Default, Clone, Debug)]
 pub struct Folds {
     closed: HashSet<usize>,
+    /// Explicit `(start, end)` ranges added by zs/zh/show/hide. Each
+    /// range hides lines `start+1..=end` while the head at `start`
+    /// remains visible. Stored separately from indent-derived folds
+    /// so they coexist (you can space-toggle within a show/hide
+    /// view).
+    explicit: Vec<(usize, usize)>,
 }
 
 /// Indent level of `line`: count of leading TAB or `*` chars. Empty
@@ -74,19 +80,45 @@ pub fn is_foldable(start: usize, lines: &[String]) -> bool {
     fold_end(start, lines) > start
 }
 
+/// Walk upward from `line` to find its immediate parent — the nearest
+/// preceding non-blank line whose indent level is strictly less.
+/// Returns None for top-level lines (level 0) and when no parent
+/// exists.
+pub fn find_parent(line: usize, lines: &[String]) -> Option<usize> {
+    if line == 0 || line >= lines.len() { return None; }
+    let lvl = fold_level(&lines[line]);
+    if lvl == 0 { return None; }
+    let mut i = line;
+    while i > 0 {
+        i -= 1;
+        if lines[i].trim().is_empty() { continue; }
+        if fold_level(&lines[i]) < lvl { return Some(i); }
+    }
+    None
+}
+
 impl Folds {
     pub fn new() -> Self { Self::default() }
 
-    pub fn clear(&mut self) { self.closed.clear(); }
+    pub fn clear(&mut self) { self.closed.clear(); self.explicit.clear(); }
+
+    /// Add a force-close fold over `[start..=end]` (head visible,
+    /// rest hidden). Used by zs/zh to collapse runs of non-matching
+    /// lines.
+    pub fn close_range(&mut self, start: usize, end: usize) {
+        if end > start { self.explicit.push((start, end)); }
+    }
 
     /// Total number of currently-closed folds.
     pub fn count(&self) -> usize { self.closed.len() }
 
     /// True if `line` is hidden by some closed fold above it.
     pub fn is_visible(&self, line: usize, lines: &[String]) -> bool {
+        // Explicit range hides lines strictly inside (start..=end].
+        for &(s, e) in &self.explicit {
+            if line > s && line <= e { return false; }
+        }
         if self.closed.is_empty() { return true; }
-        // Scan only the closed-fold starts that are < line. A fold
-        // starting at S hides every line in (S, fold_end(S)].
         for &s in &self.closed {
             if s < line && fold_end(s, lines) >= line {
                 return false;
@@ -106,15 +138,22 @@ impl Folds {
         hits
     }
 
-    /// `<SPACE>`: toggle the fold at `line`. If the cursor is on a
-    /// fold-able line, flips it. Otherwise no-op.
+    /// `<SPACE>`: toggle the fold at `line`.
+    ///
+    /// - On a foldable line (has children): flip its closed state.
+    /// - On a leaf inside a closed fold: open the innermost
+    ///   containing fold (escape upward).
+    /// - On a leaf with no closed ancestor: fold the immediate
+    ///   parent — handy for "done with this branch, collapse it"
+    ///   without having to navigate back to the parent line first.
     pub fn toggle_at(&mut self, line: usize, lines: &[String]) {
         if !is_foldable(line, lines) {
-            // If user pressed SPACE inside a closed fold's body, jump
-            // to the innermost containing fold and toggle that.
             if let Some(&s) = self.closed_folds_containing(line, lines).first() {
                 self.closed.remove(&s);
                 return;
+            }
+            if let Some(p) = find_parent(line, lines) {
+                self.closed.insert(p);
             }
             return;
         }

@@ -23,21 +23,24 @@ treated as HyperList for backward compatibility.
 Use **Tab** (or `*`) for indentation. Items at greater indent are children of
 the item above.
 
+All HyperList commands live behind the `\` leader. Press `\?` inside any
+HL buffer to see the cheatsheet popup.
+
 ### Folding
 
 | Key / command | Action |
 |---|---|
 | `<SPACE>` | Toggle fold under cursor |
 | `<C-SPACE>` | Toggle fold recursively |
-| `\0` … `\9`, `\a` … `\f` | Set fold level globally (0–15) |
-| `:fold-all` | Fold everything |
-| `:fold-open` | Open every fold |
+| `\0` … `\9` | Set fold level globally (0–9) |
+| `\a` | Open every fold |
+| `:fold-all` / `:fold-open` | Same via ex-command |
 
 ### Numbering
 
 | Key / command | Action |
 |---|---|
-| `\an` or `\#` | Toggle autonumbering |
+| `\n` | Toggle autonumbering |
 | `Ctrl-T` (insert) | Indent + add nested number (e.g. `1.2` → `1.2.1`) |
 | `Ctrl-D` (insert) | De-indent and renumber (e.g. `1.2.1` → `1.3`) |
 | `\R` (visual) | Renumber the visual selection from the first item's index |
@@ -66,36 +69,34 @@ A reference is enclosed in angle brackets. Examples:
 - `<The first Item>` — soft reference / lookup
 - `<file:/path/to/file>` — open a file
 - `<file:~/notes/list.hl>` — open with `~` expansion
+- `<https://example.com>` — open URL in browser
 - `<+5>` — jump 5 lines down
 - `<-3>` — jump 3 lines up
 - `<Parent/Child/Grandchild>` — path with `/` separator
 - `<<Subroutine>>` — hard redirect; jump back after executing
 
-Press **`gr`** with the cursor on a reference to jump there. After jumping,
-press `''` (single quotes twice) to come back.
-
-Press **`gf`** with the cursor on a `<file:…>` reference (or any URL / path)
-to open it in the default external program for its extension.
+Press **`\r`** with the cursor on (or near) a reference to jump. `\r`
+auto-detects: in-buffer references are searched in-file, `<file:…>` and URLs
+are opened externally via xdg-open. Bare URLs and `~/`-style paths on a line
+also work. After jumping, press `''` to come back.
 
 ### Templates
 
 `\<SPACE>` jumps to the next "open" template element on a line — defined as
 an item ending with `=` (sign meaning "fill me in").
 
-### Presentation traversal
+### Presentation mode
 
-| Key | Action |
-|---|---|
-| `g<DOWN>` | Move to next item, fold everything else (presentation) |
-| `g<UP>` | Move to previous item, fold everything else |
-| `\<DOWN>` | Same as `g<DOWN>` but expand more levels under the current item |
-| `\<UP>` | Same as `g<UP>` but expand more levels |
+`\p` toggles presentation mode. While on, the bare `<UP>` / `<DOWN>` arrow
+keys behave like `g<UP>` / `g<DOWN>` — moving item-by-item with everything
+else folded. Status bar shows `presentation ON`. Toggle off with `\p` again.
+
+`g<UP>` / `g<DOWN>` always work, regardless of the toggle.
 
 ### Highlight current branch
 
 `\h` toggles paragraph dimming / Limelight-style focus on the current item
-and its children. Inside scribe this maps to the same `paragraphdim`
-mechanism used in reading mode (see scribe's main README).
+and its children.
 
 ### Show / hide by word
 
@@ -103,13 +104,14 @@ Filter the visible portion of the list by word match:
 
 | Key | Action |
 |---|---|
-| `zs` | Show only items containing the word under the cursor |
-| `zh` | Hide items containing the word under the cursor |
-| `z0` | Reset (back to normal indent folding) |
+| `\S` (or `zs`) | Show only items containing the word under the cursor |
+| `\H` (or `zh`) | Hide items containing the word under the cursor |
+| `\N` (or `z0`) | Reset (back to normal indent folding) |
 | `:show <pattern>` | Show items matching the regex |
 | `:hide <pattern>` | Hide items matching the regex |
 
-Originally inspired by VIM script #1594 (Amit Sethi).
+`zs` / `zh` / `z0` are kept as muscle-memory aliases. Originally inspired by
+VIM script #1594 (Amit Sethi).
 
 ### Sort
 
@@ -121,30 +123,26 @@ correctly. Useful when out-of-sequence numbered items need re-sorting.
 
 ### Encryption
 
-Requires `openssl` on PATH. Uses AES-256-CBC with PBKDF2.
+Uses AES-256-CBC + PBKDF2-HMAC-SHA256 (10 000 iterations, 32-byte key).
+Byte-for-byte compatible with the Ruby `hyperlist` app's `ENC:` format.
 
 | Key | Action |
 |---|---|
-| `\z` | Encrypt the current item (incl. folded children if folded) |
-| `\Z` | Encrypt the entire file |
-| `\x` | Decrypt the current item |
-| `\X` | Decrypt the entire file |
-
-`\z` and `\x` work over a Visual selection too.
+| `\ee` | Encrypt — visual selection if active, else whole file |
+| `\ed` | Decrypt — visual selection if active, else whole file |
+| `\ek` | Rekey — re-encrypt with a new password |
 
 #### Auto-encrypted dotfiles
 
-A file whose name starts with `.` (e.g. `.passwords.hl`) is **automatically
-decrypted on open** (scribe asks for the password) and **automatically
-re-encrypted on save**. While editing, scribe disables backup files for that
-buffer to keep the cleartext from hitting disk.
-
-If you enter the wrong password, you'll see garbage. Press `u` (undo) and
-re-open the file to retry.
+A file whose name starts with `.` (e.g. `.passwords.hl`), or any file whose
+content starts with the `ENC:` header, is **automatically decrypted on open**
+(scribe asks for the password — three attempts, then quits) and
+**automatically re-encrypted on save**. While editing, scribe disables backup
+files for that buffer to keep the cleartext from hitting disk.
 
 ### Calendar export
 
-`\G` extracts every item with a future date and posts it to your default
+`\g` extracts every item with a future date and posts it to your default
 calendar via `gcalcli`. If `gcalcli` isn't on PATH or the variable
 `g:calendar` isn't set, `.ics` files are written to the working directory
 instead.
@@ -163,15 +161,15 @@ to undo, then `:set syntax=hyperlist` to restore HL highlighting).
 
 | Key | Format |
 |---|---|
-| `\H` | HTML (responsive, color-coded) |
-| `\L` | LaTeX (modern packages, color-coded) |
-| `\M` | Markdown (GitHub-flavored, with checkboxes and nested lists) |
+| `\xh` | HTML (responsive, color-coded) |
+| `\xl` | LaTeX (modern packages, color-coded) |
+| `\xm` | Markdown (GitHub-flavored, with checkboxes and nested lists) |
 
 Or use `:export html`, `:export latex`, `:export markdown` ex-commands.
 
 ### Complexity stat
 
-`\C` shows the total of items + references in the current HyperList.
+`\c` shows the total of items + references in the current HyperList.
 
 ---
 

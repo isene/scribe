@@ -1,0 +1,133 @@
+HyperList Test Suite for scribe; Press '\a' to uncollapse this whole HyperList
+	This HyperList serves two purposes
+		A tutorial for all HyperList features in scribe
+			Do each item and you will learn the full HyperList toolkit
+		A fully fledged test suite
+			Doing each item will confirm scribe's HyperList support is working correctly
+	The full keybinding reference lives at ':h hl' (or press '\?' for the popup cheatsheet)
+	Tests are broken into two major categories: "SYNTAX HIGHLIGHTING" and "FUNCTIONALITY TEST"
+	SYNTAX HIGHLIGHTING
+		Check: The Property should be in red
+		CHECK: The Operator should be in blue
+		[? OK] Qualifier in green
+		A #hashtag should be in yellow; And the preceding semicolon in green
+		1. The numbering is an identifier and should appear in magenta
+		+ The multi-line indicator should appear in red
+		 and indicates the item runs across more than one line
+		This link should be in magenta <link to nowhere>
+		This comment should be in teal with the link inside in magenta (the <link to nowhere>)
+		Quotes are also in "teal" and with "links inside in magenta, <link to nowhere>"
+		Check (comment): Comment within a Property should be in teal
+		Keywords END and SKIP should be in magenta
+		Keywords FIXME and TODO should be in black on yellow
+		Markup like *bold* /italics/ and _underline_ should appear correctly
+		Fold this item and child by pressing 'SPACE' and see that it goes from bold to normal text
+			This is a child item
+		Press '\h' and move the cursor one line down
+			This line should appear as normal while all other lines are dimmed
+			Press '\h' again to remove the highlighting
+		Collapse and uncollapse the next line to hide/show the literal block of lines
+		\
+			Check: This "literal" block should not contain any colors
+			[? OK] *bold* /italics/ _underline_ FIXME TODO #hashtag
+		\
+		Check that State items and Transition items are underlined correctly
+			By pressing '\u' State items should be underlined
+			Pressing it again, Transition items should be underlined
+			Pressing it a third time should toggle off underlining of such items
+			Now press '\u' three times
+				S: This is a state item (indicates an item that is describing something)
+				| This is a state item (indicates an item that is describing something)
+				T: This is a transition item (indicates an item to be done/processed)
+				/ This is a transition item (indicates an item to be done/processed)
+	FUNCTIONALITY TEST
+		Toggle folds; Press 'SPACE' twice to see the child of this line collapse and uncollapse
+			This is a child item
+		On the next item, press 'CONTROL+SPACE' twice to see that the fold toggles recursively
+		Set the global fold level: '\3' shows three levels deep, '\9' shows everything; '\a' opens every fold
+			Try pressing '\3' '\4' '\5' '\6' '\7' '\8' '\9' '\a' and observe how the children appear at each level
+			'\3'
+				'\4'
+					'\5'
+						'\6'
+							'\7'
+								'\8'
+									'\9'
+										'\a'
+		By placing the cursor in the reference and pressing '\r' you jump to the next item (<42>)
+		42. This is an item that you will jump to
+		'\r' also opens external files and URLs
+			On a '<file:…>' reference, '\r' opens the file via xdg-open
+			On a '<https://…>' reference, '\r' opens it in the default browser
+			Bare paths like '~/notes/list.hl' or URLs work too
+			Try this URL: <https://isene.org/hyperlist/>
+			Press '\?' anywhere in this file to see the cheatsheet popup; ESC dismisses it
+		Toggle autonumbering of items
+			Press '\n' to toggle autonumbering on/off; Press '\n' now and go to next line
+				You should see the message "autonumber on"
+			1.1. Go to the end of this line and enter insert mode and press enter
+			1.3. You should now have a line "1.2." above this line
+				Place the cursor on that "1.2." line in normal mode and press 'CTRL-T'
+					Observe that it numbers the line as a child of "1.1." (1.1.1.)
+				On that line, press 'CTRL-D' to observe it goes back to "1.2."
+			Press '\n' to toggle off autonumbering; You should see the message "autonumber off"
+		Sort lines correctly
+			The following lines are incorrectly sorted
+				2 Item2
+				3 Item3
+					3.1 Child of Item3
+				1 Item1
+					1.1 Child of Item1
+			Mark the numbered lines visually ('V') and press '\s'
+				Observe that the lines are now sorted correctly with their children in the right places
+		Create and use checkboxes for items
+			With the cursor on this line, press '\v' to see a checkbox appear
+				With the cursor on the above line, press '\v' again to see an "x" appear in the checkbox
+			[_] With the cursor on this line, press '\o' to see the item marked as "in progress" = "[O]"
+			[_] With the cursor on this line, press '\V' to mark the checkbox with a time stamp
+		Show/hide items with specific words
+			This is an item with the word "simple"
+			This is an item with the word "amazing"
+			This is an item with the word "simple"
+			Now go to the word "simple" and press '\S' (or 'zs')
+			Observe that all items that don't contain "simple" are folded; Press '\H' (or 'zh')
+				Observe that items containing the word are hidden/folded
+				Go here and press '\N' (or 'z0') to clear all show/hide; Press '\a' to uncollapse the whole HyperList
+		Check presentation mode
+			Press '\p' to enter presentation mode; the statusline shows "presentation ON"
+			With the cursor on this item, press 'DOWN' to go to the next item and collapse all other items
+				Now again press 'DOWN' to go to the next item in presentation mode (see this line collapsed)
+			With the above line collapsed, again press 'DOWN' to go to the next item in presentation mode
+				Now again press 'DOWN' to go to the next item in presentation mode
+			Press 'UP' three times and 'DOWN' three times and observe the current line "presented"
+			Press '\p' again to exit presentation mode; statusline shows "presentation off"
+			Note: 'g<DOWN>' / 'g<UP>' work the same way regardless of the toggle
+		Check that filling out forms work correctly
+			Press '\<SPACE>' to jump to the next "open" template element on the line
+				Fill out the rest =
+		Encryption and decryption
+			Encryption uses AES-256-CBC + PBKDF2-HMAC-SHA256 (compatible with the Ruby hyperlist app's ENC: format)
+			With the cursor on this line, press '\ee' and enter the required password twice to encrypt
+			Mark the above encrypted lines visually and press '\ed' to decrypt with the same password
+			Press '\ek' on encrypted content to rekey it (decrypt with the old password, re-encrypt with a new one)
+			You can also save a HyperList as a dotfile (e.g. ".pass.hl")
+				When opening the encrypted dotfile, scribe will automatically prompt for a password — three attempts before quitting
+		Export to HTML
+			You can convert this whole HyperList to HTML and save the output to "test.html"
+			Pressing 'u' will undo the conversion, but you need to do ':set syntax=hyperlist' to set the right filetype again
+			Press '\xh' to convert this whole HyperList to HTML format
+		Export to LaTeX
+			You can convert this whole HyperList to LaTeX and save the output to "test.tex"
+			Pressing 'u' will undo the conversion, but you need to do ':set syntax=hyperlist' to set the right filetype again
+			Press '\xl' to convert this whole HyperList to LaTeX format
+		Export to Markdown
+			You can convert this whole HyperList to GitHub-flavored Markdown and save the output to "test.md"
+			Pressing 'u' will undo the conversion, but you need to do ':set syntax=hyperlist' to set the right filetype again
+			Press '\xm' to convert this whole HyperList to Markdown format
+		Export lines to your Google calendar
+			To use this feature, you need to have the program 'gcalcli' installed and properly set up
+				gcalcli: <https://github.com/insanum/gcalcli>
+				Now press '\g' to see that the below item appears in your Google calendar (or an .ics file is written)
+				2040-01-01 08.00: Item from the HyperList Test Suite
+		Show the complexity level of this HyperList
+			Press '\c' to see the count of items + references displayed in the statusline

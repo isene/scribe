@@ -38,6 +38,7 @@ fn main() {
     let mut start_line: Option<usize> = None;
     let mut path: Option<PathBuf> = None;
     let mut cli_theme: Option<String> = None;
+    let mut no_spell = false;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -50,6 +51,13 @@ fn main() {
         } else if let Some(rest) = arg.strip_prefix("--theme=") {
             cli_theme = Some(rest.to_string());
             i += 1;
+        } else if arg == "--no-spell" {
+            // Skip the auto-enable-on-Email branch in App::new. Used
+            // when an embedder (kastrup compose) wants the editor up
+            // fast and is happy to type `:set spell` manually if
+            // they want it later.
+            no_spell = true;
+            i += 1;
         } else if path.is_none() {
             path = Some(PathBuf::from(arg));
             i += 1;
@@ -58,39 +66,96 @@ fn main() {
         }
     }
     install_panic_hook();
-    // Auto-decrypt HL dotfiles before entering the alt-screen so the
-    // password prompt + any error messages stay on the regular tty.
-    // If decrypt fails, scribe exits cleanly with the openssl error.
-    let pre_decrypted: Option<(PathBuf, String, String)> = path.as_ref()
+    // Detect HL dotfile encryption. Don't pre-decrypt — defer to AFTER
+    // Crust::init so the password prompt happens in the editor's
+    // statusbar (showing the file path in the header) and the user
+    // gets up to 3 attempts with feedback.
+    let encrypted_path: Option<PathBuf> = path.as_ref()
         .filter(|p| buffer::is_encrypted_dotfile(p) && p.exists())
-        .and_then(|p| {
-            let cipher = std::fs::read_to_string(p).ok()?;
-            if cipher.is_empty() { return None; }
-            let pw = read_password_tty("Password: ").ok()?;
-            match buffer::decrypt(&cipher, &pw) {
-                Ok(plain) => Some((p.clone(), plain, pw)),
-                Err(e) => {
-                    eprintln!("scribe: decrypt failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        });
+        .cloned();
+    let app_path = if encrypted_path.is_some() { None } else { path.clone() };
+
     Crust::init();
     Crust::set_app_identity("Scribe");
-    // Bracketed paste: terminal wraps the pasted blob in `CSI 200~ ... 201~`
-    // and crossterm parses that into a single Event::Paste. Without it each
-    // pasted byte travels through the keystroke pipeline (buf.apply + new
-    // undo node + render_all per char), so a 1KB paste = 1000 undo nodes
-    // and 1000 renders.
     use std::io::Write;
     print!("\x1b[?2004h");
     let _ = std::io::stdout().flush();
 
-    let mut app = App::new(path, cli_theme);
-    // If we pre-decrypted, swap the buffer for the plaintext + path
-    // and remember the password so save() re-encrypts.
-    if let Some((p, plain, pw)) = pre_decrypted {
-        app.buf = buffer::Buffer::from_decrypted(p, plain, pw);
+    let mut app = App::new(app_path, cli_theme, no_spell);
+    // For encrypted files, attach the path to the empty buffer so the
+    // header shows it, then prompt for the password in the footer.
+    if let Some(ref p) = encrypted_path {
+        app.buf.path = Some(p.clone());
+    }
+    app.render_all();
+    if let Some(p) = encrypted_path.clone() {
+        let cipher = std::fs::read_to_string(&p).unwrap_or_default();
+        if !cipher.is_empty() {
+            let mut decrypted = false;
+            for attempt in 0..3 {
+                let label = if attempt == 0 {
+                    "Password: ".to_string()
+                } else {
+                    format!("Wrong — try again ({}/3): ", attempt + 1)
+                };
+                app.footer.secret = true;
+                let pw = app.footer.ask_with_bg(&label, "", 17);
+                app.footer.secret = false;
+                if pw.is_empty() {
+                    // ESC at the prompt → quit cleanly without
+                    // leaking the editor on a half-loaded buffer.
+                    save_cmd_history(&app.footer.history);
+                    Crust::cleanup();
+                    Crust::clear_screen();
+                    return;
+                }
+                match buffer::decrypt(&cipher, &pw) {
+                    Ok(plain) => {
+                        app.buf = buffer::Buffer::from_decrypted(p.clone(), plain, pw);
+                        // Defensive: force HL kind when the path's
+                        // extension says HL. `detect_kind` already
+                        // does this, but if the path got mangled
+                        // (e.g. some opener renames the tempfile)
+                        // we still want HL syntax + tabstop=3.
+                        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                            let lower = ext.to_lowercase();
+                            if lower == "hl" || lower == "woim" {
+                                app.buf.kind = buffer::FileKind::Source(lower);
+                            }
+                        }
+                        app.cur_line = 0;
+                        app.cur_col = 0;
+                        app.scroll = 0;
+                        app.want_col = 0;
+                        // Encrypted files are typically password
+                        // managers / secrets — collapse every fold
+                        // so opening doesn't flash the contents on
+                        // screen. User opens the branch they need
+                        // with <SPACE>.
+                        let total = app.buf.line_count();
+                        let all: Vec<String> = (0..total).map(|i| app.buf.line(i)).collect();
+                        app.folds.set_level(0, &all);
+                        app.set_status(" decrypted (folds collapsed)", 46);
+                        app.render_all();
+                        decrypted = true;
+                        break;
+                    }
+                    Err(_) => {
+                        app.set_status(&format!(" wrong password ({} of 3)", attempt + 1), 196);
+                        app.render_all();
+                    }
+                }
+            }
+            if !decrypted {
+                app.set_status(" too many failed attempts — quitting", 196);
+                app.render_all();
+                save_cmd_history(&app.footer.history);
+                Crust::cleanup();
+                Crust::clear_screen();
+                eprintln!("scribe: too many failed password attempts for {}", p.display());
+                return;
+            }
+        }
     }
     if let Some(n) = start_line {
         if n > 0 {
@@ -125,6 +190,7 @@ fn main() {
         let quit = match app.mode {
             Mode::Normal      => app.handle_normal(&key),
             Mode::Insert      => app.handle_insert(&key),
+            Mode::Replace     => app.handle_replace(&key),
             Mode::Command     => app.handle_command(&key),
             Mode::Visual      |
             Mode::VisualLine  |
@@ -361,6 +427,9 @@ enum ChangeMotion {
     Linewise { extra: usize },                // dd / yy / cc — `extra` lines below cursor
 }
 
+#[derive(Clone, Copy)]
+enum CaseOp { Lower, Upper, Toggle }
+
 impl Pending {
     fn count(&self) -> usize {
         let c1 = self.count1.unwrap_or(1);
@@ -393,6 +462,14 @@ struct App {
     visual_anchor: usize,
     visual_anchor_line: usize,
     visual_anchor_col: usize,
+    /// VisualBlock state: anchor + current display columns. Tracked
+    /// separately from `visual_anchor_col` / `cur_col` (byte offsets)
+    /// so the block stays a perfect rectangle through tabs and across
+    /// lines of unequal length — vim's behaviour. h/l shift the cursor
+    /// vcol by exactly one display column; j/k change the row, vcol
+    /// stays put. Past-line-end cells render as styled blanks.
+    vblock_anchor_vcol: usize,
+    vblock_cur_vcol: usize,
     /// Last completed change, for `.` repeat.
     last_change: Option<LastChange>,
     /// While true we're capturing keystrokes typed in Insert mode after a
@@ -404,11 +481,14 @@ struct App {
     /// `]` or `[` prefix: next key is a bracket motion (`]s`, `[s`, …).
     bracket_prefix: Option<char>,
     /// `\` (vim leader) prefix: next key is a leader-mapped command
-    /// (`\v` checkbox, `\h` highlight, `\0`..`\f` fold level, …).
+    /// (`\v` checkbox, `\h` highlight, `\0`..`\9` fold level, …).
     leader_prefix: bool,
-    /// `\a` is overloaded — single keypress = fold level 10, but
-    /// `\an` is the autonumber toggle. Track that we're mid-`\a…`.
-    leader_a_pending: bool,
+    /// Two-key leader sequence in progress: `\e?` (encryption) and
+    /// `\x?` (exports) read a second char before dispatching.
+    leader_sub: Option<char>,
+    /// `\p` toggle — when on, `UP`/`DOWN` arrows behave like
+    /// `g<up>`/`g<down>` (presentation_step). Session-only.
+    presentation: bool,
     /// Spellcheck — None until first enabled (or auto-on for email). When
     /// hunspell is missing, stays None and we set a status message.
     spell: Option<spell::Spell>,
@@ -419,6 +499,12 @@ struct App {
     spell_lang: String,
     /// Sorted by start byte, recomputed on Insert→Normal and on `:set spell`.
     misspellings: Vec<spell::MisspellRange>,
+    /// Insert-mode text expansions (Vim-style `:abbrev`). Trigger →
+    /// expansion. Fires when the user types a non-abbrev character
+    /// (space, punctuation, enter) right after the trigger. Loaded
+    /// from `~/.config/scribe/abbreviations`; runtime edits via
+    /// `:ab trigger expansion` / `:una trigger`.
+    abbrev: std::collections::HashMap<String, String>,
     /// `:set number` / `:set nonumber` — gutter with line numbers on the
     /// left of the main pane.
     show_numbers: bool,
@@ -509,12 +595,17 @@ struct App {
 }
 
 impl App {
-    fn new(path: Option<PathBuf>, cli_theme: Option<String>) -> Self {
+    fn new(path: Option<PathBuf>, cli_theme: Option<String>, suppress_spell: bool) -> Self {
         let (cols, rows) = Crust::terminal_size();
         let mut header = Pane::new(1, 1, cols, 1, 255, 236);
         header.wrap = false; header.scroll = false;
         let mut main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 231, 0);
         main_p.wrap = true;
+        // word_wrap stays true (the default) — prose-friendly
+        // line-breaks at spaces. `position_cursor` replays the
+        // word-wrap algorithm via `wrap_pos()` so the cursor lands
+        // on the actual rendered character, not the column that a
+        // naive `visual_col / pane_w` would give.
         let mut footer = Pane::new(1, rows, cols, 1, 255, 236);
         footer.wrap = false; footer.scroll = false;
 
@@ -538,7 +629,7 @@ impl App {
         footer.record = true;
         footer.history = load_cmd_history();
 
-        let auto_spell = matches!(buf.kind, FileKind::Email) || rc.spell;
+        let auto_spell = !suppress_spell && (matches!(buf.kind, FileKind::Email) || rc.spell);
         let mut app = Self {
             buf, mode: Mode::Normal,
             cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
@@ -550,17 +641,21 @@ impl App {
             visual_anchor: 0,
             visual_anchor_line: 0,
             visual_anchor_col: 0,
+            vblock_anchor_vcol: 0,
+            vblock_cur_vcol: 0,
             last_change: None,
             capturing_insert: false,
             captured_insert: String::new(),
             z_prefix: false,
             bracket_prefix: None,
             leader_prefix: false,
-            leader_a_pending: false,
+            leader_sub: None,
+            presentation: false,
             spell: None,
             spell_enabled: false,
             spell_lang: rc.spell_lang.clone().unwrap_or_else(|| "en_US".into()),
             misspellings: Vec::new(),
+            abbrev: load_abbreviations(),
             show_numbers: rc.number,
             relative_numbers: rc.relative_numbers,
             theme_name: active_theme.unwrap_or_else(|| "monokai".to_string()),
@@ -642,6 +737,12 @@ impl App {
     /// Spawn hunspell, load personal dict, mark enabled, run a first scan.
     fn spell_enable(&mut self) {
         if self.spell.is_none() {
+            // Hunspell dict load is the slowest step (300+ ms for
+            // nb_NO). Paint a status BEFORE the spawn so the user
+            // sees what's happening instead of a frozen UI.
+            self.set_status(&format!(" loading spell dict ({})…", self.spell_lang), 244);
+            self.render_footer();
+            std::io::Write::flush(&mut std::io::stdout()).ok();
             match spell::Spell::spawn(&self.spell_lang) {
                 Some(mut sp) => {
                     sp.load_personal(load_personal_dict());
@@ -657,6 +758,23 @@ impl App {
         }
         self.spell_enabled = true;
         self.recheck_spell();
+    }
+
+    /// `zN` / `zE` / `zO`: enable spell with a specific language, or
+    /// disable. Single keystroke for the common cases (Norwegian and
+    /// English) without going through `:set spelllang=…`.
+    fn quick_spell(&mut self, lang: &str) {
+        if self.spell_lang != lang {
+            // Drop any process running with the wrong dict.
+            self.spell = None;
+            self.spell_lang = lang.to_string();
+        }
+        self.spell_enable();
+        if self.spell_enabled {
+            self.set_status(
+                &format!(" spell on ({}) — {} flagged", self.spell_lang, self.misspellings.len()),
+                46);
+        }
     }
 
     /// Drop any existing hunspell process and re-spawn with `lang`. Called
@@ -849,6 +967,52 @@ fn load_personal_dict() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `~/.config/scribe/abbreviations` — Vim-style abbreviation map for
+/// insert-mode text expansion. Format: one entry per line, trigger
+/// and expansion separated by a TAB. Lines starting with `#` are
+/// comments. Example:
+///   -g\t/Geir
+///   mvh\tMed vennlig hilsen
+fn abbrev_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    home.join(".config/scribe/abbreviations")
+}
+
+fn load_abbreviations() -> std::collections::HashMap<String, String> {
+    let path = abbrev_path();
+    let mut map = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+            if let Some((trigger, expansion)) = line.split_once('\t') {
+                let t = trigger.trim();
+                if !t.is_empty() {
+                    map.insert(t.to_string(), expansion.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn save_abbreviations(map: &std::collections::HashMap<String, String>) {
+    let path = abbrev_path();
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let mut entries: Vec<(&String, &String)> = map.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+    let mut out = String::from("# scribe insert-mode abbreviations — trigger<TAB>expansion\n");
+    for (k, v) in entries { out.push_str(&format!("{}\t{}\n", k, v)); }
+    let _ = std::fs::write(&path, out);
+}
+
+/// True if `c` may be part of an abbreviation TRIGGER (e.g. `-g`,
+/// `mvh`, `omg2`). Anything else (whitespace, punctuation other than
+/// `-` / `_`, etc.) is a boundary that fires expansion.
+fn is_abbrev_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
 /// One user keymap. `mode` is "normal" / "insert" / "visual" (case-
 /// insensitive); LHS is the trigger sequence in the same notation
 /// macros use (`zr`, `<C-Space>`, `<Esc>`); RHS is the expanded
@@ -951,27 +1115,380 @@ fn strip_number_prefix(s: &str) -> (usize, &str) {
     (i, &s[i..])
 }
 
-/// Find the first `<…>` (or `<<…>>`) reference on `line` at or after
-/// byte offset `from`. Returns the matched substring incl. brackets.
+/// Visual-column count for a `\t`-bearing line. Tabs advance to the
+/// next multiple of `tabstop`; other chars count as 1. SGR escapes
+/// are NOT expected in `s` here — call only with raw buffer text.
+fn visual_width_of(s: &str, tabstop: usize) -> usize {
+    let mut col = 0usize;
+    for c in s.chars() {
+        if c == '\t' { col += tabstop - (col % tabstop); }
+        else { col += 1; }
+    }
+    col
+}
+
+/// Replay crust's word-wrap algorithm on a plain-text line to find
+/// where byte offset `byte_col` lands after wrapping at `width`.
+/// Returns `(row_in_line, col_in_row)`.
+///
+/// Crust's wrap is "delayed": chars are pushed onto the current row
+/// optimistically, and only when one would overflow does the
+/// algorithm look back for the last space and break there. This
+/// means a char at byte N might TENTATIVELY be on row 0, then get
+/// rolled to row 1 by a later wrap. Single-pass walk-and-peek
+/// can't see that future, so we run the full simulation: build the
+/// rows char-by-char, recording each rendered byte's final
+/// `(row, col)` in a map, then look up `byte_col`.
+///
+/// `gutter_w` occupies the start of row 0 only. Tabs expand to
+/// `tabstop` columns, recomputed per row.
+/// Run crust's word-wrap simulation on `line` and return the rows
+/// as `Vec<Vec<(char, byte_offset, col_in_row)>>`. Boundary spaces
+/// dropped by the wrap algorithm are absent from the output.
+/// Shared by `wrap_pos` (forward map) and `visual_to_byte` (inverse).
+fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
+    -> Vec<Vec<(char, usize, usize)>>
+{
+    let char_w = |c: char, at_col: usize| -> usize {
+        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) } else { 1 }
+    };
+    let mut rows: Vec<Vec<(char, usize, usize)>> = Vec::new();
+    let mut current: Vec<(char, usize, usize)> = Vec::new();
+    let mut col = gutter_w;
+    let mut byte_pos = 0;
+    if width == 0 {
+        rows.push(current);
+        return rows;
+    }
+    for c in line.chars() {
+        let cw = char_w(c, col);
+        if col + cw > width {
+            let space_idx = current.iter().rposition(|&(ch, _, _)| ch == ' ');
+            if let Some(sp) = space_idx {
+                let tail: Vec<(char, usize, usize)> = current.drain(sp + 1..).collect();
+                current.pop(); // drop boundary space
+                rows.push(std::mem::take(&mut current));
+                col = 0;
+                for (tc, tb, _) in tail {
+                    let tw = char_w(tc, col);
+                    current.push((tc, tb, col));
+                    col += tw;
+                }
+            } else {
+                rows.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            let cw2 = char_w(c, col);
+            current.push((c, byte_pos, col));
+            col += cw2;
+        } else {
+            current.push((c, byte_pos, col));
+            col += cw;
+        }
+        byte_pos += c.len_utf8();
+    }
+    rows.push(current);
+    rows
+}
+
+/// Inverse of `wrap_pos`: given a target visual `(row_in_line,
+/// col_in_row)`, return the byte offset in `line` whose char
+/// renders at (or just past, if `target_col` is past row end) that
+/// position. If `target_row` is past the last visual row, returns
+/// `line.len()` (cursor past end).
+fn visual_to_byte(line: &str, target_row: usize, target_col: usize, width: usize, gutter_w: usize, tabstop: usize) -> usize {
+    let rows = wrap_simulate(line, width, gutter_w, tabstop);
+    if target_row >= rows.len() { return line.len(); }
+    let row = &rows[target_row];
+    if row.is_empty() {
+        // Empty row — cursor lands at start of next char, or line end.
+        for r in rows.iter().skip(target_row + 1) {
+            if let Some(&(_, b, _)) = r.first() { return b; }
+        }
+        return line.len();
+    }
+    // Walk the row picking the LAST char whose col_in_row <= target_col.
+    let mut best = row[0].1;
+    for &(_, b, cc) in row {
+        if cc <= target_col { best = b; }
+        else { return best; }
+    }
+    // target_col is past row end — return one-past-last byte.
+    let &(c, b, _) = row.last().unwrap();
+    b + c.len_utf8()
+}
+
+/// Number of visual rows `line` occupies when rendered at `width`
+/// (with `gutter_w` on row 0 only).
+fn wrap_row_count(line: &str, width: usize, gutter_w: usize, tabstop: usize) -> usize {
+    let n = wrap_simulate(line, width, gutter_w, tabstop).len();
+    n.max(1)
+}
+
+/// Display column of a byte position on `line`, treating tabs as
+/// `tabstop`-aligned and every other char as 1 cell wide. Used by
+/// VisualBlock so the rectangle stays uniform across tabs and lines
+/// of unequal byte length. Pure ASCII / monospace assumption — same
+/// as the rest of scribe's column accounting.
+fn display_col(line: &str, byte_col: usize, tabstop: usize) -> usize {
+    let mut col = 0usize;
+    let mut byte = 0usize;
+    for c in line.chars() {
+        if byte >= byte_col { break; }
+        col += if c == '\t' { tabstop - (col % tabstop) } else { 1 };
+        byte += c.len_utf8();
+    }
+    col
+}
+
+/// Byte offset at (or just past) display column `target_col`. If
+/// `target_col` is past the last char's right edge, returns
+/// `line.len()`. If `target_col` falls inside a tab's expansion, the
+/// returned byte points at that tab. The companion display column is
+/// also returned so the caller can tell whether they hit the target
+/// exactly or fell short (line too short, e.g. for cursor placement).
+fn byte_at_or_past_col(line: &str, target_col: usize, tabstop: usize) -> (usize, usize) {
+    let mut col = 0usize;
+    let mut byte = 0usize;
+    for c in line.chars() {
+        if col >= target_col { return (byte, col); }
+        let cw = if c == '\t' { tabstop - (col % tabstop) } else { 1 };
+        if col + cw > target_col {
+            // target lands inside this tab's expansion → snap to tab.
+            return (byte, col);
+        }
+        col += cw;
+        byte += c.len_utf8();
+    }
+    (byte, col)
+}
+
+fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop: usize) -> (usize, usize) {
+    if width == 0 { return (0, gutter_w); }
+    let char_w = |c: char, at_col: usize| -> usize {
+        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) } else { 1 }
+    };
+    // Final position for each rendered byte. Boundary-dropped
+    // spaces are absent from this map.
+    let mut pos: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+    // Chars currently on the working row. Each entry: (char, byte_offset, col_in_row).
+    let mut current: Vec<(char, usize, usize)> = Vec::new();
+    let mut row: usize = 0;
+    let mut col: usize = gutter_w;
+    let mut byte_pos: usize = 0;
+
+    for c in line.chars() {
+        let cw = char_w(c, col);
+        if col + cw > width {
+            // Overflow → break. Prefer last space; else hard break.
+            let space_idx = current.iter().rposition(|&(ch, _, _)| ch == ' ');
+            if let Some(sp) = space_idx {
+                // Chars 0..sp finalise on current row.
+                for i in 0..sp {
+                    let (_, b, cc) = current[i];
+                    pos.insert(b, (row, cc));
+                }
+                // The space at `sp` is dropped (no rendered position).
+                // Tail moves to new row, re-laid from col 0.
+                let tail: Vec<(char, usize, usize)> = current.drain(sp + 1..).collect();
+                current.clear();
+                row += 1;
+                col = 0;
+                for (tc, tb, _) in tail {
+                    let tw = char_w(tc, col);
+                    current.push((tc, tb, col));
+                    col += tw;
+                }
+            } else {
+                // No space: hard break at width.
+                for &(_, b, cc) in &current { pos.insert(b, (row, cc)); }
+                current.clear();
+                row += 1;
+                col = 0;
+            }
+            let cw2 = char_w(c, col);
+            current.push((c, byte_pos, col));
+            col += cw2;
+        } else {
+            current.push((c, byte_pos, col));
+            col += cw;
+        }
+        byte_pos += c.len_utf8();
+    }
+    // Finalise the last row.
+    for &(_, b, cc) in &current { pos.insert(b, (row, cc)); }
+
+    // Direct hit: byte_col is the offset of a rendered char.
+    if let Some(&p) = pos.get(&byte_col) { return p; }
+
+    // Past end-of-line: cursor sits just past the last char.
+    if byte_col >= line.len() {
+        let last_col = current.last()
+            .map(|&(c, _, cc)| cc + char_w(c, cc))
+            .unwrap_or(col);
+        if last_col >= width { return (row + 1, 0); }
+        return (row, last_col);
+    }
+
+    // byte_col falls on a dropped boundary space. The cursor
+    // between the last char of row N and the first char of row N+1
+    // most naturally lives at the start of row N+1.
+    let mut probe = byte_col + 1;
+    while probe < line.len() {
+        if let Some(&p) = pos.get(&probe) { return p; }
+        probe += 1;
+    }
+    // Nothing further — return end of last row.
+    let last_col = current.last()
+        .map(|&(c, _, cc)| cc + char_w(c, cc))
+        .unwrap_or(col);
+    if last_col >= width { (row + 1, 0) } else { (row, last_col) }
+}
+
+
+/// Expand `\t` in a styled string (may contain `\e[...m` SGR sequences
+/// and OSC-8 hyperlinks) to the right number of spaces, accounting
+/// for visible-column tracking. SGR / OSC sequences pass through
+/// untouched and don't advance the column.
+fn expand_tabs_styled(s: &str, tabstop: usize) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut col = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            // CSI: ESC [ ... terminator ∈ @-~
+            // OSC: ESC ] ... BEL or ESC \
+            // For everything else (rare), just pass the next char.
+            if let Some(next) = chars.next() {
+                out.push(next);
+                match next {
+                    '[' => {
+                        // CSI: copy through final byte (ASCII alpha or `~`).
+                        for c2 in chars.by_ref() {
+                            out.push(c2);
+                            if (0x40..=0x7e).contains(&(c2 as u32)) { break; }
+                        }
+                    }
+                    ']' => {
+                        // OSC: copy through BEL or ESC \.
+                        let mut prev_esc = false;
+                        for c2 in chars.by_ref() {
+                            out.push(c2);
+                            if c2 == '\x07' { break; }
+                            if prev_esc && c2 == '\\' { break; }
+                            prev_esc = c2 == '\x1b';
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if c == '\t' {
+            let spaces = tabstop - (col % tabstop);
+            for _ in 0..spaces { out.push(' '); }
+            col += spaces;
+            continue;
+        }
+        if c == '\n' {
+            out.push(c);
+            col = 0;
+            continue;
+        }
+        out.push(c);
+        col += 1;
+    }
+    out
+}
+
+/// Find the `<…>` (or `<<…>>`) reference closest to byte offset
+/// `from` on `line`. Algorithm:
+///   1. If a reference brackets `from` (i.e. `<` is at or before
+///      `from` and matching `>` is at or after `from`), return it.
+///   2. Otherwise return the first reference at or after `from`.
+///   3. Otherwise return the first reference on the line.
+/// Returns the matched substring including the brackets.
+/// Sniff a token for URL-ish prefixes that xdg-open can dispatch.
+/// Conservative — only matches things that clearly aren't in-buffer
+/// references.
+/// Expand backslash escapes in a `:s/pat/rep/` replacement: `\t` →
+/// `\t`, `\n` → `\n`, `\r` → `\r`, `\\` → `\`. Anything else after
+/// `\` is passed through verbatim so the user can still write
+/// regex-crate expansions like `\$1` if they really want a literal
+/// `$1` in the output.
+fn expand_replacement_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t')  => out.push('\t'),
+                Some('n')  => out.push('\n'),
+                Some('r')  => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn looks_like_url(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("ftp://")
+        || s.starts_with("mailto:")
+        || s.starts_with("tel:")
+        || s.starts_with("file://")
+}
+
+/// Sniff a token for filesystem-path-ish shape: starts with `/`, `~/`,
+/// `./`, or `../`. Bare relative names are NOT treated as paths
+/// because they collide too easily with prose; require a directory
+/// separator or leading dot/tilde to be unambiguous.
+fn looks_like_path(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.starts_with("../")
+}
+
 fn find_reference(line: &str, from: usize) -> Option<String> {
     let bytes = line.as_bytes();
     let n = bytes.len();
-    let mut i = from.min(n);
+    let from = from.min(n);
+    // Collect all <...> spans on the line.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
     while i < n {
         if bytes[i] == b'<' {
-            // Find matching `>`. Allow one level of nesting for `<<…>>`.
+            let start = i;
             let mut j = i + 1;
+            if j < n && bytes[j] == b'<' { j += 1; }
             while j < n && bytes[j] != b'>' { j += 1; }
             if j < n {
                 let mut end = j + 1;
-                if end < n && bytes[end] == b'>' { end += 1; } // <<...>>
-                return Some(line[i..end].to_string());
+                if end < n && bytes[end] == b'>' { end += 1; }
+                if end - start >= 3 { spans.push((start, end)); }
+                i = end;
+                continue;
             }
-            return None;
         }
         i += 1;
     }
-    None
+    if spans.is_empty() { return None; }
+    // 1. enclosing
+    if let Some(&(s, e)) = spans.iter().find(|&&(s, e)| s <= from && from < e) {
+        return Some(line[s..e].to_string());
+    }
+    // 2. first at or after `from`
+    if let Some(&(s, e)) = spans.iter().find(|&&(s, _)| s >= from) {
+        return Some(line[s..e].to_string());
+    }
+    // 3. first on the line
+    let (s, e) = spans[0];
+    Some(line[s..e].to_string())
 }
 
 /// `YYYY-MM-DD HH.MM` for HL checkbox timestamps. Local time. No
@@ -1221,25 +1738,73 @@ impl App {
         let pane_x = self.main_p.x;
         let pane_y = self.main_p.y;
         let pane_w = self.main_p.w as usize;
-        // When line numbers are on, the gutter prepends each line's text
-        // before the pane wraps. The first wrap row of every line has
-        // gutter+content; subsequent wrap rows have content only. We
-        // approximate cursor placement assuming the cursor is on the first
-        // wrap row (typical for short lines); long-wrapped lines can be
-        // off by gutter_w on continuation rows — acceptable for v1.
         let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode);
+        let ts = self.tabstop();
 
+        // Walk visible lines from scroll to cur_line, skipping any
+        // line hidden by a closed fold. Without this skip, after
+        // `zs`/`zh` collapses most of the buffer the cursor's visual
+        // row points off-screen.
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
         let mut visual_row: usize = 0;
+        // Use `wrap_row_count` (NOT `wrap_pos` at line.len()) for the
+        // row tally: `wrap_pos` normalises the past-last-char cursor
+        // position to `(row+1, 0)` when the line fills the pane
+        // exactly, which is correct for cursor placement but
+        // overcounts the row by 1 for the row-count purpose. The
+        // dedicated counter walks the same wrap simulation and just
+        // reports the number of rows that actually got rendered.
         for ln in self.scroll..self.cur_line {
-            if ln >= self.buf.line_count() { break; }
-            let w = self.buf.line(ln).chars().count() + gutter_w;
-            visual_row += ((w.max(1) - 1) / pane_w) + 1;
+            if ln >= total { break; }
+            if !self.folds.is_visible(ln, &all) { continue; }
+            visual_row += wrap_row_count(&all[ln], pane_w, gutter_w, ts);
         }
-        let cur_disp_col = self.buf.line(self.cur_line)[..self.cur_col.min(self.current_line_len())]
-            .chars().count();
-        let visual_col = cur_disp_col + gutter_w;
-        let row_in_line = visual_col / pane_w;
-        let col_in_row = visual_col % pane_w;
+        let line = self.buf.line(self.cur_line);
+        let target_byte = self.cur_col.min(self.current_line_len());
+        let (mut row_in_line, mut col_in_row) = wrap_pos(&line, target_byte, pane_w, gutter_w, ts);
+
+        // VisualBlock: the cursor's screen column is the moving corner
+        // of the rectangle, which can sit past line-end or inside a
+        // tab. Override row/col with the vblock vcol on this line.
+        if matches!(self.mode, Mode::VisualBlock) {
+            let v = self.vblock_cur_vcol;
+            // The pane is wrap=true, but block mode is meaningful only
+            // when v fits on the first wrap row. If a tab pushed v
+            // past pane_w we still clamp so the cursor doesn't run
+            // off the right edge.
+            row_in_line = 0;
+            let cap = pane_w.saturating_sub(gutter_w + 1);
+            col_in_row = (gutter_w + v).min(gutter_w + cap);
+        }
+
+        // Insert/Replace bar-cursor at a soft-wrap seam: `wrap_pos` returns
+        // the position of the char AT `target_byte`, which after a word-
+        // break sits at column 0 of the next visual row. The bar-cursor's
+        // semantics is "between target_byte-1 and target_byte" though, so
+        // when the previous char is the last cell of the row above, snap
+        // the cursor up to that row's trailing edge — otherwise typing at
+        // the wrap seam looks like the cursor is stuck one row below the
+        // line you're editing (reported 2026-05-08).
+        if matches!(self.mode, Mode::Insert | Mode::Replace)
+            && col_in_row == 0
+            && row_in_line > 0
+            && target_byte > 0
+        {
+            // Walk back to the previous char's byte offset (handles multi-
+            // byte UTF-8 cleanly via char_indices).
+            if let Some((prev_byte, prev_ch)) = line[..target_byte].char_indices().next_back() {
+                let (prev_row, prev_col) = wrap_pos(&line, prev_byte, pane_w, gutter_w, ts);
+                if prev_row + 1 == row_in_line {
+                    let cw = if prev_ch == '\t' {
+                        ts.saturating_sub(prev_col % ts).max(1)
+                    } else { 1 };
+                    row_in_line = prev_row;
+                    col_in_row = (prev_col + cw).min(pane_w.saturating_sub(1));
+                }
+            }
+        }
+
         visual_row += row_in_line;
 
         let row = pane_y + visual_row as u16;
@@ -1249,8 +1814,9 @@ impl App {
         // escapes don't leak into scribe's source. Insert / Command get a
         // bar (6); everything else gets a steady block (2).
         let shape = match self.mode {
-            Mode::Insert | Mode::Command => 6,
-            _ => 2,
+            Mode::Insert | Mode::Command => 6, // bar
+            Mode::Replace                => 4, // underline
+            _                            => 2, // block
         };
         crust::Cursor::show();
         crust::Cursor::shape(shape);
@@ -1275,8 +1841,37 @@ impl App {
 
     fn render_main(&mut self) {
         let pane_h = self.main_p.h as usize;
+        let pane_w = self.main_p.w as usize;
+        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode);
+        let ts = self.tabstop();
+        let total = self.buf.line_count();
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        // If cursor is above scroll, snap scroll up to cursor.
         if self.cur_line < self.scroll { self.scroll = self.cur_line; }
-        if self.cur_line >= self.scroll + pane_h { self.scroll = self.cur_line + 1 - pane_h; }
+        // Compute how many VISIBLE visual rows the cursor sits below
+        // `scroll`. Hidden (folded) lines contribute zero rows; each
+        // visible logical line contributes its `wrap_row_count`. The
+        // cursor's own row within `cur_line` is `cur_row_in_line`.
+        let cur_buf_line = self.buf.line(self.cur_line);
+        let cur_target = self.cur_col.min(cur_buf_line.len());
+        let (cur_row_in_line, _) = wrap_pos(&cur_buf_line, cur_target, pane_w, gutter_w, ts);
+        loop {
+            let mut rows_used: usize = 0;
+            for ln in self.scroll..self.cur_line {
+                if !self.folds.is_visible(ln, &all) { continue; }
+                rows_used += wrap_row_count(&all[ln], pane_w, gutter_w, ts);
+                if rows_used >= pane_h { break; }
+            }
+            if rows_used + cur_row_in_line + 1 <= pane_h { break; }
+            // Cursor lives past the pane bottom — advance scroll to
+            // the next VISIBLE line.
+            let mut next_scroll = self.scroll + 1;
+            while next_scroll < total && !self.folds.is_visible(next_scroll, &all) {
+                next_scroll += 1;
+            }
+            if next_scroll >= total || next_scroll > self.cur_line { break; }
+            self.scroll = next_scroll;
+        }
 
         // Compute selection range for visual modes.
         let (sel_start, sel_end, sel_kind) = if self.mode.is_visual() {
@@ -1312,6 +1907,10 @@ impl App {
         // line-stateless, so this is line-count work — fast enough for the
         // file sizes a writer's editor sees. A future per-line cache
         // invalidated on edit would let big repos stay snappy.
+        // source_lines is indexed by ABSOLUTE file-line number so the
+        // render loop can fetch it via `source_lines[line_idx]`. With
+        // folding, line_idx advances past hidden lines and would be
+        // out of sync with a `skip(scroll).take(pane_h)` window.
         let source_lines: Vec<String> = match &self.buf.kind {
             FileKind::Source(ext) => {
                 let line_count = self.buf.line_count();
@@ -1320,12 +1919,45 @@ impl App {
                     all.push_str(&self.buf.line(i));
                     all.push('\n');
                 }
-                let rendered = highlight::highlight(&all, ext, line_count + 1);
-                rendered.split('\n')
-                    .skip(self.scroll)
-                    .take(pane_h)
-                    .map(str::to_string)
-                    .collect()
+                let rendered = match ext.as_str() {
+                    "hl" | "woim"      => highlight::highlight_hyperlist(&all, line_count + 1),
+                    "md" | "markdown"  => highlight::highlight_markdown_source(&all, line_count + 1),
+                    "tex"              => highlight::highlight_tex(&all, line_count + 1),
+                    _                  => highlight::highlight(&all, ext, line_count + 1),
+                };
+                let mut lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
+                // `\u` State / Transition underline cycle for HL only.
+                // Wrap ONLY the item content (post-indent) — leading
+                // TABs and `*` indent stay un-underlined to match
+                // hyperlist.vim's HLstate / HLtrans patterns which
+                // start AFTER the indent (`\(\(^\|\s\|\*\)\(S: \|...\)\)\@<=.*`).
+                if matches!(ext.as_str(), "hl" | "woim") && self.st_underline > 0 {
+                    let want_state = self.st_underline == 1;
+                    for (idx, styled) in lines.iter_mut().enumerate() {
+                        if idx >= line_count { break; }
+                        let raw = self.buf.line(idx);
+                        let trimmed = raw.trim_start_matches(|c: char| c == '\t' || c == '*');
+                        let is_state = trimmed.starts_with("S: ") || trimmed.starts_with("| ");
+                        let is_trans = trimmed.starts_with("T: ") || trimmed.starts_with("/ ");
+                        if (want_state && is_state) || (!want_state && is_trans) {
+                            // Find the byte offset where indent ends in
+                            // the styled string. emit_hl_line pushes the
+                            // raw indent verbatim before any SGR, so
+                            // counting leading TAB / `*` / space bytes
+                            // gives the right split point.
+                            let bytes = styled.as_bytes();
+                            let mut indent_end = 0;
+                            while indent_end < bytes.len()
+                                && (bytes[indent_end] == b'\t'
+                                    || bytes[indent_end] == b'*'
+                                    || bytes[indent_end] == b' ')
+                            { indent_end += 1; }
+                            let (head, tail) = styled.split_at(indent_end);
+                            *styled = format!("{}\x1b[4m{}\x1b[24m", head, tail);
+                        }
+                    }
+                }
+                lines
             }
             _ => Vec::new(),
         };
@@ -1333,9 +1965,10 @@ impl App {
         let line_count = self.buf.line_count();
         let show_numbers = self.show_numbers && !self.reading_mode;
         let relative_numbers = self.relative_numbers && !self.reading_mode;
-        // Limelight-style: dim every paragraph except the cursor's
-        // when reading_mode + paragraph_dim are both on.
-        let dim_others = self.reading_mode && self.paragraph_dim;
+        // Limelight-style: dim every paragraph except the cursor's.
+        // Gated on reading mode — outside it the source-mode colors
+        // fight the dim and the effect is jarring rather than focusing.
+        let dim_others = self.paragraph_dim && self.reading_mode;
         let (para_lo, para_hi) = if dim_others {
             self.current_paragraph_bounds()
         } else { (0, usize::MAX) };
@@ -1413,7 +2046,7 @@ impl App {
                     // emit path so curly underlines show; lines without
                     // misses keep their syntax colors.
                     if !source_lines.is_empty() && miss_ranges.is_empty() && !line_is_dim {
-                        if let Some(styled) = source_lines.get(i) {
+                        if let Some(styled) = source_lines.get(line_idx) {
                             out.push_str(styled);
                             break 'line;
                         }
@@ -1425,44 +2058,110 @@ impl App {
                 // Selection touches this line: char-by-char so we can apply
                 // selection bg precisely. (Email-mode fg is dropped on the
                 // selected slice — selection bg is the dominant signal.)
+                // For VisualBlock, also track display column so we can
+                // split tabs that straddle the rectangle's edge — without
+                // splitting, a tab whose expansion overlaps the v1/v2
+                // boundary lights up as one wide blob and the rectangle
+                // bulges visually.
+                let ts_render = self.tabstop();
                 let mut col = 0usize;
+                let mut disp_col = 0usize;
                 while col < line.len() {
                     if !line.is_char_boundary(col) { col += 1; continue; }
                     let mut ce = col + 1;
                     while ce < line.len() && !line.is_char_boundary(ce) { ce += 1; }
                     let glyph = &line[col..ce];
+                    let ch = glyph.chars().next().unwrap_or(' ');
+                    let cw = if ch == '\t' { ts_render - (disp_col % ts_render) } else { 1 };
                     let abs = line_byte_off + col;
-                    let in_sel = match (sel_start, sel_end, sel_kind) {
-                        (Some(s), Some(e), Some(Mode::Visual)) => abs >= s && abs < e,
-                        (_, _, Some(Mode::VisualLine)) => {
-                            let l1 = self.visual_anchor_line.min(self.cur_line);
-                            let l2 = self.visual_anchor_line.max(self.cur_line);
-                            line_idx >= l1 && line_idx <= l2
+
+                    // VisualBlock + tab → render the tab as `cw` per-cell
+                    // spaces, deciding selection per cell. Keeps the
+                    // rectangle perfect when v1 or v2 lands inside the
+                    // tab's expansion.
+                    if matches!(sel_kind, Some(Mode::VisualBlock)) && ch == '\t' {
+                        let l1 = self.visual_anchor_line.min(self.cur_line);
+                        let l2 = self.visual_anchor_line.max(self.cur_line);
+                        let in_block_line = line_idx >= l1 && line_idx <= l2;
+                        let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+                        let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+                        for i in 0..cw {
+                            let cell_col = disp_col + i;
+                            let cell_in = in_block_line && cell_col >= v1 && cell_col <= v2;
+                            if cell_in {
+                                out.push_str(&style::bg(" ", 238));
+                            } else {
+                                out.push(' ');
+                            }
                         }
-                        (_, _, Some(Mode::VisualBlock)) => {
-                            let l1 = self.visual_anchor_line.min(self.cur_line);
-                            let l2 = self.visual_anchor_line.max(self.cur_line);
-                            let c1 = self.visual_anchor_col.min(self.cur_col);
-                            let c2 = self.visual_anchor_col.max(self.cur_col);
-                            line_idx >= l1 && line_idx <= l2 && col >= c1 && col <= c2
-                        }
-                        _ => false,
-                    };
-                    if in_sel {
-                        out.push_str(&style::bg(glyph, 238));  // subtle gray
                     } else {
-                        out.push_str(glyph);
+                        let in_sel = match (sel_start, sel_end, sel_kind) {
+                            (Some(s), Some(e), Some(Mode::Visual)) => abs >= s && abs < e,
+                            (_, _, Some(Mode::VisualLine)) => {
+                                let l1 = self.visual_anchor_line.min(self.cur_line);
+                                let l2 = self.visual_anchor_line.max(self.cur_line);
+                                line_idx >= l1 && line_idx <= l2
+                            }
+                            (_, _, Some(Mode::VisualBlock)) => {
+                                let l1 = self.visual_anchor_line.min(self.cur_line);
+                                let l2 = self.visual_anchor_line.max(self.cur_line);
+                                if !(line_idx >= l1 && line_idx <= l2) { false }
+                                else {
+                                    let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+                                    let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+                                    disp_col >= v1 && disp_col <= v2
+                                }
+                            }
+                            _ => false,
+                        };
+                        if in_sel {
+                            out.push_str(&style::bg(glyph, 238));
+                        } else {
+                            out.push_str(glyph);
+                        }
                     }
+                    disp_col += cw;
                     col = ce;
                 }
                 // VisualLine extends selection past line end visually.
+                // Use VISUAL width (post-tab-expansion), not raw char
+                // count — otherwise tabs get under-counted and the bg
+                // overflows onto the next pane row.
                 if sel_kind == Some(Mode::VisualLine) {
                     let l1 = self.visual_anchor_line.min(self.cur_line);
                     let l2 = self.visual_anchor_line.max(self.cur_line);
                     if line_idx >= l1 && line_idx <= l2 {
-                        let pad_w = (self.cols as usize).saturating_sub(line.chars().count());
+                        let pane_w = self.main_p.w as usize;
+                        let used = visual_width_of(&line, self.tabstop());
+                        let pad_w = pane_w.saturating_sub(used);
                         if pad_w > 0 {
                             out.push_str(&style::bg(&" ".repeat(pad_w), 238));
+                        }
+                    }
+                }
+                // VisualBlock keeps a perfect rectangle: when this
+                // line's visual width is shorter than the block's
+                // right edge, paint blank cells from line-end up to
+                // and including v2 with the selection bg. Without
+                // this, short lines look like the rectangle has
+                // "bites" cut out of them.
+                if sel_kind == Some(Mode::VisualBlock) {
+                    let l1 = self.visual_anchor_line.min(self.cur_line);
+                    let l2 = self.visual_anchor_line.max(self.cur_line);
+                    if line_idx >= l1 && line_idx <= l2 {
+                        let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+                        let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+                        let used = visual_width_of(&line, self.tabstop());
+                        if v2 + 1 > used {
+                            let start = used.max(v1);
+                            let pad_w = (v2 + 1).saturating_sub(start);
+                            if pad_w > 0 {
+                                let pane_w = self.main_p.w as usize;
+                                let pad_w = pad_w.min(pane_w.saturating_sub(used));
+                                if pad_w > 0 {
+                                    out.push_str(&style::bg(&" ".repeat(pad_w), 238));
+                                }
+                            }
                         }
                     }
                 }
@@ -1483,12 +2182,11 @@ impl App {
             row += 1;
             line_idx_walk += 1;
         }
+        // Expand tabs in the styled output to the buffer's tabstop
+        // width (3 for HyperList, 8 elsewhere). SGR escapes are
+        // skipped during column accounting so colors are preserved.
+        let out = expand_tabs_styled(&out, self.tabstop());
         self.main_p.set_text(&out);
-        // Diff-render: only repaints rows whose rendered output actually
-        // changed. full_refresh used to be called here; on hold-down j/k
-        // that wipes-and-repaints the whole pane every keystroke, which
-        // shows up as a slight flash. Header/footer already use the diff
-        // path via Pane::say.
         self.main_p.refresh();
     }
 
@@ -1539,10 +2237,19 @@ impl App {
             } else {
                 "spell:off".to_string()
             };
-            let plain = format!(" {}w  {}c  {} ", words, chars, spell_lbl);
-            let styled = format!(" {}w  {}c  {}{} ",
+            // Filetype indicator: shows the kind scribe is treating
+            // this buffer as. Useful when troubleshooting why syntax
+            // highlighting / mode-specific bindings don't kick in.
+            let kind_lbl = match &self.buf.kind {
+                buffer::FileKind::Plain     => "plain".to_string(),
+                buffer::FileKind::Email     => "email".to_string(),
+                buffer::FileKind::Source(s) => s.clone(),
+            };
+            let plain = format!(" {}w  {}c  ft:{}  {} ", words, chars, kind_lbl, spell_lbl);
+            let styled = format!(" {}w  {}c  ft:{}  {}{} ",
                 style::fg(&words.to_string(), 252),
                 style::fg(&chars.to_string(), 244),
+                style::fg(&kind_lbl, 81),
                 style::fg(&spell_lbl, if self.spell_enabled { 35 } else { 244 }),
                 bg_on);
             (plain, styled)
@@ -1636,18 +2343,16 @@ impl App {
             Mode::VisualBlock => {
                 let l1 = self.visual_anchor_line.min(self.cur_line);
                 let l2 = self.visual_anchor_line.max(self.cur_line);
-                let c1 = self.visual_anchor_col.min(self.cur_col);
-                let c2 = self.visual_anchor_col.max(self.cur_col);
+                let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+                let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+                let ts = self.tabstop();
                 let mut chars = 0usize;
                 let mut words = 0usize;
                 for i in l1..=l2 {
                     let line = self.buf.line(i);
-                    let lo = c1.min(line.len());
-                    let hi = (c2 + 1).min(line.len());
-                    let mut a = lo;
-                    while a < hi && !line.is_char_boundary(a) { a += 1; }
-                    let mut b = hi;
-                    while b < line.len() && !line.is_char_boundary(b) { b += 1; }
+                    let (a, _) = byte_at_or_past_col(&line, v1, ts);
+                    let (b, _) = byte_at_or_past_col(&line, v2 + 1, ts);
+                    if a >= line.len() || b <= a { continue; }
                     let slice = &line[a..b];
                     chars += slice.chars().count();
                     words += slice.split_whitespace().count();
@@ -1715,7 +2420,9 @@ impl App {
     /// in Normal mode it can't (so `x` always deletes a real char).
     fn col_cap(&self) -> usize {
         let len = self.current_line_len();
-        if self.mode == Mode::Insert { len } else { len.saturating_sub(1) }
+        // Insert + Replace can sit one past last char so Append /
+        // Backspace / EOL append-extend work.
+        if matches!(self.mode, Mode::Insert | Mode::Replace) { len } else { len.saturating_sub(1) }
     }
 
     fn clamp_col_to_line(&mut self) {
@@ -1772,18 +2479,52 @@ impl App {
     }
 
     fn move_up(&mut self) {
-        if self.cur_line > 0 {
-            self.cur_line -= 1;
-            self.cur_col = self.want_col.min(self.col_cap());
-            self.snap_col_to_boundary();
+        if let Some(target) = self.visual_step(-1) {
+            self.cursor_to_byte(target);
         }
     }
 
     fn move_down(&mut self) {
-        if self.cur_line + 1 < self.buf.line_count() {
-            self.cur_line += 1;
-            self.cur_col = self.want_col.min(self.col_cap());
-            self.snap_col_to_boundary();
+        if let Some(target) = self.visual_step(1) {
+            self.cursor_to_byte(target);
+        }
+    }
+
+    /// One visual-row step in `dir` (-1 = up, +1 = down). Returns the
+    /// target byte offset, or `None` if already at the buffer edge.
+    /// On a soft-wrapped line this moves between visual rows of the
+    /// SAME logical line; at the line edge it crosses into the next /
+    /// previous line's first / last visual row.
+    fn visual_step(&self, dir: i32) -> Option<usize> {
+        let pane_w = self.main_p.w as usize;
+        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode);
+        let ts = self.tabstop();
+        let line = self.buf.line(self.cur_line);
+        let cur_byte = self.cur_col.min(line.len());
+        let (cur_row, want_col) = wrap_pos(&line, cur_byte, pane_w, gutter_w, ts);
+        if dir > 0 {
+            let total_rows = wrap_row_count(&line, pane_w, gutter_w, ts);
+            if cur_row + 1 < total_rows {
+                let nb = visual_to_byte(&line, cur_row + 1, want_col, pane_w, gutter_w, ts);
+                return Some(self.buf.line_byte_offset(self.cur_line) + nb);
+            }
+            let next_line = self.next_visible_line_down(self.cur_line, 1);
+            if next_line == self.cur_line { return None; }
+            let nl = self.buf.line(next_line);
+            let nb = visual_to_byte(&nl, 0, want_col, pane_w, gutter_w, ts);
+            Some(self.buf.line_byte_offset(next_line) + nb)
+        } else {
+            if cur_row > 0 {
+                let nb = visual_to_byte(&line, cur_row - 1, want_col, pane_w, gutter_w, ts);
+                return Some(self.buf.line_byte_offset(self.cur_line) + nb);
+            }
+            if self.cur_line == 0 { return None; }
+            let prev_line = self.next_visible_line_up(self.cur_line, 1);
+            if prev_line == self.cur_line { return None; }
+            let pl = self.buf.line(prev_line);
+            let last_row = wrap_row_count(&pl, pane_w, gutter_w, ts).saturating_sub(1);
+            let nb = visual_to_byte(&pl, last_row, want_col, pane_w, gutter_w, ts);
+            Some(self.buf.line_byte_offset(prev_line) + nb)
         }
     }
 
@@ -1919,7 +2660,7 @@ impl App {
         //   z=  suggest replacements for misspelled word
         //   zg  add word at cursor to personal dictionary
         //   zr  toggle :read (distraction-free reading mode)
-        //   zq  save + quit (equivalent to :wq)
+        //   zz  save + quit (equivalent to :wq)
         //   zn  jump to next misspelling (mirrors `]s`)
         //   zp  jump to previous misspelling (mirrors `[s`)
         if self.z_prefix {
@@ -1938,12 +2679,19 @@ impl App {
                         if self.reading_mode { " reading mode" } else { " reading mode off" },
                         244);
                 }
-                "q" => {
+                "z" => {
                     let _ = self.buf.save();
                     return true;
                 }
                 "n" => self.jump_next_misspelling(),
                 "p" => self.jump_prev_misspelling(),
+                // Quick spell toggles — pick lang and turn on, or off.
+                "N" => self.quick_spell("nb_NO"),
+                "E" => self.quick_spell("en_US"),
+                "O" => {
+                    self.spell_disable();
+                    self.set_status(" spell off", 244);
+                }
                 "s" => self.showhide_word(true),
                 "h" => self.showhide_word(false),
                 "0" => {
@@ -1962,25 +2710,19 @@ impl App {
             return false;
         }
 
-        // Leader (`\`) prefix dispatch.
-        if self.leader_a_pending {
-            self.leader_a_pending = false;
-            if key == "n" {
-                // `\an` — autonumber toggle. Match hyperlist.vim.
-                self.autonumber = !self.autonumber;
-                self.set_status(if self.autonumber { " autonumber on" } else { " autonumber off" }, 244);
-                return false;
-            }
-            // Anything else: re-dispatch as the original `\a` (fold 10),
-            // then process `key` as a fresh keystroke.
-            self.handle_leader("a");
-            return self.handle_normal(key);
+        // Leader (`\`) prefix dispatch. Two-letter sequences (`\e?`,
+        // `\x?`) set `leader_sub` and read the next char.
+        if let Some(group) = self.leader_sub.take() {
+            return self.handle_leader_sub(group, key);
         }
         if self.leader_prefix {
             self.leader_prefix = false;
-            if key == "a" {
-                // Defer: could be `\a` (fold 10) or `\an` (autonumber).
-                self.leader_a_pending = true;
+            if key == "e" || key == "x" {
+                self.leader_sub = Some(key.chars().next().unwrap());
+                self.set_status(
+                    if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown" },
+                    244);
                 return false;
             }
             return self.handle_leader(key);
@@ -1998,7 +2740,24 @@ impl App {
         {
             let total = self.buf.line_count();
             let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            // If the cursor is on a leaf, `toggle_at` may close the
+            // parent fold — in which case the cursor would land on a
+            // hidden line. Pre-compute the parent so we can hop the
+            // cursor up to it after the toggle.
+            let move_to_parent = !fold::is_foldable(self.cur_line, &all)
+                && self.folds.closed_folds_containing(self.cur_line, &all).is_empty();
+            let parent = if move_to_parent {
+                fold::find_parent(self.cur_line, &all)
+            } else { None };
             self.folds.toggle_at(self.cur_line, &all);
+            if let Some(p) = parent {
+                self.cur_line = p;
+                let line = self.buf.line(p);
+                self.cur_col = line.bytes()
+                    .position(|b| b != b'\t' && b != b' ' && b != b'*')
+                    .unwrap_or(0);
+                self.want_col = self.cur_col;
+            }
             return false;
         }
         if key == "C-SPACE" && self.pending.operator.is_none()
@@ -2135,11 +2894,23 @@ impl App {
             self.pending.g_prefix = false;
             match key {
                 "g" => {
-                    let target = 0;
+                    // `Ngg` jumps to line N (1-based, vim convention).
+                    // Bare `gg` (count=None) goes to the first line.
+                    let target_line = match self.pending.count1 {
+                        Some(n) if n > 0 => (n - 1).min(self.buf.line_count().saturating_sub(1)),
+                        _ => 0,
+                    };
                     if self.pending.operator.is_some() {
-                        self.execute_op_linewise(self.cur_line, 0);
+                        let extra = target_line.abs_diff(self.cur_line);
+                        let lo = self.cur_line.min(target_line);
+                        self.execute_op_linewise(lo, extra);
                     } else {
-                        self.cursor_to_byte(target);
+                        let off = self.buf.line_byte_offset(target_line);
+                        let line = self.buf.line(target_line);
+                        let first_nonblank = line.bytes()
+                            .position(|b| b != b'\t' && b != b' ' && b != b'*')
+                            .unwrap_or(0);
+                        self.cursor_to_byte(off + first_nonblank);
                     }
                     self.pending.clear();
                 }
@@ -2147,14 +2918,6 @@ impl App {
                     // Enter `gq` operator-pending. Don't clear pending — count
                     // and register survive into the next motion / `q` shortcut.
                     self.pending.operator = Some('Q');
-                }
-                "r" => {
-                    self.pending.clear();
-                    self.goto_reference();
-                }
-                "f" => {
-                    self.pending.clear();
-                    self.open_file_under_cursor();
                 }
                 "DOWN" | "j" => {
                     self.pending.clear();
@@ -2231,7 +2994,10 @@ impl App {
         // BEFORE parse_motion so the pending state survives and the next
         // key triggers the find. (Previously this was inside parse_motion
         // which returned None and let pending.clear() wipe the await flag.)
-        if matches!(key, "f" | "F" | "t" | "T") {
+        // Same trick for `r` (replace single char): without this branch the
+        // await flag handle_normal_action sets gets cleared on the way back
+        // out, so the next keypress doesn't trigger the replace.
+        if matches!(key, "f" | "F" | "t" | "T" | "r") {
             self.pending.awaiting_char = Some(key.chars().next().unwrap());
             return false;
         }
@@ -2252,6 +3018,15 @@ impl App {
         // Motion / action dispatch. With operator → range op; without → motion.
         let count = self.pending.count();
         let op = self.pending.operator;
+
+        // Presentation mode: bare UP/DOWN behave like g<UP>/g<DOWN>.
+        // Skip when an operator is pending — dy/dj/etc. should still
+        // delete by line, not jump by item.
+        if self.presentation && op.is_none() && (key == "UP" || key == "DOWN") {
+            self.pending.clear();
+            self.presentation_step(if key == "DOWN" { 1 } else { -1 });
+            return false;
+        }
 
         // Try as motion first.
         if let Some(target_byte) = self.parse_motion(key, count) {
@@ -2304,7 +3079,8 @@ impl App {
     fn parse_motion(&mut self, key: &str, count: usize) -> Option<usize> {
         let cur = self.cursor_byte();
         match key {
-            "h" | "LEFT" => {
+            "h" => {
+                // `h` stops at the line edge — vim default.
                 let mut b = cur;
                 for _ in 0..count {
                     let s = self.buf.rope.to_string();
@@ -2318,7 +3094,8 @@ impl App {
                 }
                 Some(b)
             }
-            "l" | "RIGHT" => {
+            "l" => {
+                // `l` stops at the line edge — vim default.
                 let mut b = cur;
                 let s = self.buf.rope.to_string();
                 for _ in 0..count {
@@ -2328,6 +3105,30 @@ impl App {
                     let next_line = if p < s.len() { self.buf.rope.byte_to_line(p) } else { self.buf.rope.byte_to_line(b) };
                     let cur_line = self.buf.rope.byte_to_line(b);
                     if next_line != cur_line { break; }
+                    b = p;
+                }
+                Some(b)
+            }
+            "LEFT" => {
+                // Arrow keys wrap across line boundaries (vim's
+                // `whichwrap=<,>` default).
+                let s = self.buf.rope.to_string();
+                let mut b = cur;
+                for _ in 0..count {
+                    if b == 0 { break; }
+                    let mut p = b - 1;
+                    while p > 0 && !s.is_char_boundary(p) { p -= 1; }
+                    b = p;
+                }
+                Some(b)
+            }
+            "RIGHT" => {
+                let s = self.buf.rope.to_string();
+                let mut b = cur;
+                for _ in 0..count {
+                    if b >= s.len() { break; }
+                    let mut p = b + 1;
+                    while p < s.len() && !s.is_char_boundary(p) { p += 1; }
                     b = p;
                 }
                 Some(b)
@@ -2534,6 +3335,9 @@ impl App {
                 let end = motion::line_end(&self.buf, from);
                 self.execute_op_charwise('c', from, end);
             }
+            // Replace mode — typed chars OVERWRITE existing text
+            // until ESC. Toggle back to Insert mid-stream with <Ins>.
+            "R" => self.enter_replace(),
             "Y" => {
                 let n = count.saturating_sub(1);
                 self.execute_op_linewise_yank(self.cur_line, self.cur_line + n);
@@ -2566,8 +3370,9 @@ impl App {
                 }
             }
 
-            // Replace single char.
-            "r" => self.pending.awaiting_char = Some('r'),
+            // (`r` — replace single char — is intercepted earlier in
+            // handle_normal so the awaiting_char flag survives the
+            // post-action `pending.clear()`.)
 
             // Paste.
             "p" => {
@@ -2669,7 +3474,7 @@ impl App {
     }
 
     /// Execute the RHS of a triggered keymap. RHS strings starting
-    /// with `:` run as ex commands (so a user can map `zq` to `:wq`).
+    /// with `:` run as ex commands (so a user can map `zz` to `:wq`).
     /// Other RHS strings are parsed via `parse_macro_text` and fed
     /// back through the current mode's handler with `map_depth`
     /// incremented so we don't infinite-loop on a mapping that
@@ -2685,6 +3490,7 @@ impl App {
             quit = match self.mode {
                 Mode::Normal      => self.handle_normal(&k),
                 Mode::Insert      => self.handle_insert(&k),
+                Mode::Replace     => self.handle_replace(&k),
                 Mode::Visual      |
                 Mode::VisualLine  |
                 Mode::VisualBlock => self.handle_visual(&k),
@@ -2705,6 +3511,7 @@ impl App {
         match self.mode {
             Mode::Normal      => { self.handle_normal(key); }
             Mode::Insert      => { self.handle_insert(key); }
+            Mode::Replace     => { self.handle_replace(key); }
             Mode::Visual      |
             Mode::VisualLine  |
             Mode::VisualBlock => { self.handle_visual(key); }
@@ -2729,8 +3536,9 @@ impl App {
         for key in keys {
             if key == "RESIZE" || key.starts_with("PASTE\x00") { continue; }
             match self.mode {
-                Mode::Normal => { self.handle_normal(&key); }
-                Mode::Insert => { self.handle_insert(&key); }
+                Mode::Normal  => { self.handle_normal(&key); }
+                Mode::Insert  => { self.handle_insert(&key); }
+                Mode::Replace => { self.handle_replace(&key); }
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => { self.handle_visual(&key); }
                 Mode::Command => {}
             }
@@ -2922,6 +3730,16 @@ impl App {
         if self.capturing_insert { self.captured_insert.push_str(&s); }
     }
 
+    /// Tab stop width for the current buffer. HyperList convention is
+    /// 3 (matches hyperlist.vim's `setlocal tabstop=3`); everything
+    /// else uses 8.
+    fn tabstop(&self) -> usize {
+        match &self.buf.kind {
+            buffer::FileKind::Source(s) if s == "hl" || s == "woim" => 3,
+            _ => 8,
+        }
+    }
+
     /// Leading-whitespace prefix of the current line (TAB/space/`*`),
     /// suitable for `o`/`O` to inherit on a new line. For HyperList
     /// buffers we honour the convention; for plain text we still
@@ -2933,15 +3751,15 @@ impl App {
             .collect()
     }
 
-    /// Vim-leader (`\`) dispatch. Handles fold-level `\0`..`\9`,
-    /// `\a`..`\f`, checkbox `\v`/`\V`/`\o`, highlight `\h`, and the
-    /// other HyperList-flavored leader maps. Returns true to quit
-    /// (none of these do, but keep the signature consistent).
+    /// Vim-leader (`\`) dispatch. All HyperList commands live behind
+    /// `\` — see `\?` for the in-editor cheatsheet. Two-letter
+    /// sequences (`\e?`, `\x?`) are routed via `handle_leader_sub`
+    /// from the caller; this function only sees single-key tails.
     fn handle_leader(&mut self, key: &str) -> bool {
         let total = self.buf.line_count();
         let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
         match key {
-            // Fold levels: \0..\9 = 0..9, \a..\f = 10..15
+            // Fold levels.
             "0" => self.folds.set_level(0, &all),
             "1" => self.folds.set_level(1, &all),
             "2" => self.folds.set_level(2, &all),
@@ -2952,28 +3770,29 @@ impl App {
             "7" => self.folds.set_level(7, &all),
             "8" => self.folds.set_level(8, &all),
             "9" => self.folds.set_level(9, &all),
-            "a" => self.folds.set_level(10, &all),
-            "b" => self.folds.set_level(11, &all),
-            "c" => self.folds.set_level(12, &all),
-            "d" => self.folds.set_level(13, &all),
-            "e" => self.folds.set_level(14, &all),
-            "f" => self.folds.set_level(15, &all),
-            // Checkboxes
+            // Fold-all-open.
+            "a" => self.folds.open_all(),
+            // Checkboxes.
             "v" => self.toggle_checkbox(false),
             "V" => self.toggle_checkbox(true),
             "o" => self.mark_in_progress(),
-            // Limelight reuse
+            // Limelight: dim every paragraph except the cursor's.
+            // Only meaningful in reading mode — outside it, source-mode
+            // syntax colors are still applied to dimmed lines and the
+            // effect is jarring rather than focusing.
             "h" => {
-                self.paragraph_dim = !self.paragraph_dim;
-                if !self.reading_mode { self.reading_mode = true; self.apply_layout(); }
-                self.set_status(if self.paragraph_dim { " highlight on" } else { " highlight off" }, 244);
+                if !self.reading_mode {
+                    self.set_status(" \\h needs reading mode (`:read` or `zr`)", 244);
+                } else {
+                    self.paragraph_dim = !self.paragraph_dim;
+                    self.set_status(if self.paragraph_dim { " highlight on" } else { " highlight off" }, 244);
+                }
             }
-            // Autonumbering toggle (\an / \#).
-            "#" => {
+            // Autonumber toggle.
+            "n" => {
                 self.autonumber = !self.autonumber;
                 self.set_status(if self.autonumber { " autonumber on" } else { " autonumber off" }, 244);
             }
-            "a" if false => {} // \a is a fold level — handled above; \an is keymap-resolved by user
             // Renumber visual selection.
             "R" => self.renumber_visual(),
             // State / Transition underline cycle.
@@ -2988,24 +3807,124 @@ impl App {
             }
             // Sort visual block by indent.
             "s" => self.sort_visual_by_indent(),
-            // Encryption.
-            "z" => self.encrypt_lines(false),
-            "Z" => self.encrypt_lines(true),
-            "x" => self.decrypt_lines(false),
-            "X" => self.decrypt_lines(true),
-            // Calendar (Phase 4 — wire here for forward compat).
-            "G" => self.calendar_add(),
-            // Complexity (Phase 4).
-            "C" => self.complexity_report(),
-            // Exports (Phase 3).
-            "H" => self.export_to("html"),
-            "L" => self.export_to("latex"),
-            "M" => self.export_to("markdown"),
+            // Reference jump — auto-detects in-file ref / file path / URL.
+            "r" => self.goto_reference(),
+            // Calendar.
+            "g" => self.calendar_add(),
+            // Complexity.
+            "c" => self.complexity_report(),
+            // Presentation mode toggle (Up/Down → presentation_step).
+            "p" => {
+                self.presentation = !self.presentation;
+                self.set_status(if self.presentation { " presentation ON" } else { " presentation off" }, 244);
+            }
+            // Show/hide-word aliases (\S = zs, \H = zh, \N = z0).
+            "S" => self.showhide_word(true),
+            "H" => self.showhide_word(false),
+            "N" => {
+                self.showhide = None;
+                self.folds.set_level(99, &all);
+                self.set_status(" show/hide cleared", 244);
+            }
+            // Cheatsheet popup.
+            "?" => self.show_hl_cheatsheet(),
             // Next template element ("=$" → append).
             " " => self.jump_next_template(),
             _ => { self.set_status(&format!(" leader \\{}: unknown", key), 244); }
         }
         false
+    }
+
+    /// Two-letter leader dispatch for `\e?` (encryption) and `\x?`
+    /// (exports). `group` is the first letter, `key` is the second.
+    fn handle_leader_sub(&mut self, group: char, key: &str) -> bool {
+        match (group, key) {
+            ('e', "e") => self.encrypt_lines(!self.mode.is_visual()),
+            ('e', "d") => self.decrypt_lines(!self.mode.is_visual()),
+            ('e', "k") => self.rekey_buffer(),
+            ('x', "h") => self.export_to("html"),
+            ('x', "l") => self.export_to("latex"),
+            ('x', "m") => self.export_to("markdown"),
+            ('e', "ESC") | ('x', "ESC") => self.set_status(" cancelled", 244),
+            _ => self.set_status(&format!(" leader \\{}{}: unknown", group, key), 244),
+        }
+        false
+    }
+
+    /// `\ek` — re-encrypt the buffer with a new password. Asks for the
+    /// old password first (to verify), then prompts for a new one. The
+    /// buffer is re-encrypted in place; user `:w`s to commit.
+    fn rekey_buffer(&mut self) {
+        // Detect: are we currently looking at ciphertext, or at a
+        // decrypted buffer that came from an encrypted file? In the
+        // first case we need to decrypt then re-encrypt; in the second
+        // we just swap the in-memory password.
+        let starts_with_enc = self.buf
+            .rope.byte_slice(0..self.buf.rope.len_bytes().min(4))
+            .to_string()
+            .starts_with("ENC:");
+        if starts_with_enc {
+            let old = match self.prompt_password("Old password: ") {
+                Some(p) => p, None => { self.set_status(" cancelled", 244); return; }
+            };
+            let cipher = self.buf.rope.byte_slice(0..self.buf.rope.len_bytes()).to_string();
+            let plain = match buffer::decrypt(&cipher, &old) {
+                Ok(p) => p,
+                Err(_) => { self.set_status(" wrong password", 196); return; }
+            };
+            let new_pw = match self.prompt_password_confirm("New password: ") {
+                Some(p) => p, None => { self.set_status(" cancelled", 244); return; }
+            };
+            match buffer::encrypt(&plain, &new_pw) {
+                Ok(c) => {
+                    self.buf.begin_compound();
+                    self.buf.apply(0, self.buf.rope.len_bytes(), &c);
+                    self.buf.end_compound();
+                    self.set_status(" rekeyed", 46);
+                }
+                Err(e) => self.set_status(&format!(" rekey failed: {}", e), 196),
+            }
+        } else {
+            // Plain buffer: re-encrypt the whole thing with the new
+            // password. Equivalent to `\eE` if we had one.
+            self.encrypt_lines(true);
+        }
+    }
+
+    /// `\?` cheatsheet popup. Modal; ESC dismisses.
+    fn show_hl_cheatsheet(&mut self) {
+        let popup_w = 64u16;
+        let popup_h = 22u16;
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        let key = |k: &str| style::fg(k, 220);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push(format!("  {}", style::bold("HyperList — leader bindings (\\)")));
+        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+        lines.push(format!("  {}        fold to level 0..9",                key("\\0..\\9")));
+        lines.push(format!("  {}           fold all open",                  key("\\a")));
+        lines.push(format!("  {}      checkbox / + timestamp / in-progress", key("\\v \\V \\o")));
+        lines.push(format!("  {}           autonumber toggle",              key("\\n")));
+        lines.push(format!("  {}           renumber selection (visual)",    key("\\R")));
+        lines.push(format!("  {}           sort by indent (visual)",        key("\\s")));
+        lines.push(format!("  {}           state/transition underline",     key("\\u")));
+        lines.push(format!("  {}           limelight highlight",            key("\\h")));
+        lines.push(format!("  {}           reference jump (ref/file/URL)",  key("\\r")));
+        lines.push(format!("  {}           presentation mode toggle",       key("\\p")));
+        lines.push(format!("  {}           complexity report",              key("\\c")));
+        lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
+        lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
+        lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
+        lines.push(format!("  {}        export HTML / LaTeX / Markdown",    key("\\xh \\xl \\xm")));
+        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
+        lines.push(format!("  {}  Close", key("ESC")));
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            if k == "ESC" || k == "q" { break; }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        self.render_all();
     }
 
     /// `\v` (no_stamp) / `\V` (stamp) toggle a checkbox at the start of
@@ -3086,11 +4005,26 @@ impl App {
         // Find the angle-bracketed reference at-or-after the cursor.
         let body = &line[self.cur_col.min(line.len())..];
         let abs_start_in_line = self.cur_col.min(line.len());
-        let ref_full = match find_reference(line.as_str(), abs_start_in_line)
-            .or_else(|| find_reference(body, 0))
-        {
+        let ref_full_opt = find_reference(line.as_str(), abs_start_in_line)
+            .or_else(|| find_reference(body, 0));
+        // Fallback: no <…> on the line — pick the first whitespace-
+        // separated token at/after the cursor and try to open it as a
+        // URL or file path. Lets `\r` work on bare URLs too.
+        let ref_full = match ref_full_opt {
             Some(r) => r,
-            None => { self.set_status(" no <reference> on this line", 244); return; }
+            None => {
+                let token = body.split_whitespace().next()
+                    .or_else(|| line.split_whitespace().next());
+                if let Some(t) = token {
+                    if looks_like_url(t) || looks_like_path(t) {
+                        self.marks.insert('\'', self.cursor_byte());
+                        self.open_path_external(t);
+                        return;
+                    }
+                }
+                self.set_status(" no reference on this line", 244);
+                return;
+            }
         };
         // Set mark `'` at current cursor.
         self.marks.insert('\'', self.cursor_byte());
@@ -3099,15 +4033,22 @@ impl App {
             self.open_path_external(path);
             return;
         }
+        if looks_like_url(inner) {
+            self.open_path_external(inner);
+            return;
+        }
         if let Some(rest) = inner.strip_prefix('+').or_else(|| inner.strip_prefix('-')) {
             if let Ok(n) = rest.parse::<i64>() {
                 let signed = if inner.starts_with('-') { -n } else { n };
                 let total = self.buf.line_count() as i64;
                 let target = (self.cur_line as i64 + signed).clamp(0, total - 1) as usize;
+                let line = self.buf.line(target);
                 self.cur_line = target;
-                self.cur_col = 0;
-                self.want_col = 0;
-                let _ = line_start; // silence
+                self.cur_col = line.bytes()
+                    .position(|b| b != b'\t' && b != b' ' && b != b'*')
+                    .unwrap_or(0);
+                self.want_col = self.cur_col;
+                let _ = line_start;
                 return;
             }
         }
@@ -3118,35 +4059,18 @@ impl App {
         let target_text = inner.rsplit('/').next().unwrap_or(inner);
         for i in 0..self.buf.line_count() {
             if i == self.cur_line { continue; }
-            if self.buf.line(i).contains(target_text) {
+            let line = self.buf.line(i);
+            if line.contains(target_text) {
                 self.cur_line = i;
-                self.cur_col = 0;
-                self.want_col = 0;
+                // Land on first non-blank (skip leading TABs / `*`).
+                self.cur_col = line.bytes()
+                    .position(|b| b != b'\t' && b != b' ' && b != b'*')
+                    .unwrap_or(0);
+                self.want_col = self.cur_col;
                 return;
             }
         }
         self.set_status(&format!(" reference not found: <{}>", inner), 196);
-    }
-
-    /// `gf` — open the file referenced under the cursor in an external
-    /// program. We just shell out to `xdg-open` and let the user's
-    /// MIME associations handle the extension dispatch (which is what
-    /// the original vim plugin's per-extension switch ultimately
-    /// approximated). Falls back to `open` on macOS.
-    fn open_file_under_cursor(&mut self) {
-        let line = self.buf.line(self.cur_line);
-        let body = &line[self.cur_col.min(line.len())..];
-        // Prefer an `<file:...>` reference if there's one on the line.
-        let path: String = if let Some(r) = find_reference(line.as_str(), 0) {
-            let inner = r.trim_start_matches('<').trim_end_matches('>');
-            if let Some(p) = inner.strip_prefix("file:") { p.to_string() }
-            else { inner.to_string() }
-        } else if let Some(word) = body.split_whitespace().next() {
-            word.to_string()
-        } else {
-            self.set_status(" nothing to open", 244); return;
-        };
-        self.open_path_external(&path);
     }
 
     /// Spawn an external opener (xdg-open on Linux, open on macOS) for
@@ -3312,11 +4236,12 @@ impl App {
     }
 
     fn prompt_password(&mut self, label: &str) -> Option<String> {
-        // Use the footer ask path — but mask via a placeholder. Crust
-        // doesn't have a no-echo prompt yet; the input WILL be visible
-        // mid-typing. Acceptable: privacy is mostly for shoulder-surfing,
-        // and the password is wiped on Enter.
+        // Footer pane masks each typed char with `•` while `secret`
+        // is set; cleared after so subsequent `:` prompts echo
+        // normally.
+        self.footer.secret = true;
         let s = self.footer.ask_with_bg(label, "", 17);
+        self.footer.secret = false;
         self.render_footer();
         if s.is_empty() { None } else { Some(s) }
     }
@@ -3362,33 +4287,52 @@ impl App {
         self.want_col = 0;
     }
 
-    /// `zs` / `zh` — show or hide all lines NOT containing / containing
-    /// the word under the cursor. Implemented by closing folds at every
-    /// line that fails the test.
+    /// `zs` / `zh` — show / hide items containing the word under the
+    /// cursor. Implementation:
+    ///   - `zs` (show): keep lines that match OR have any descendant
+    ///     that matches OR are an ancestor of a match. Fold every
+    ///     foldable subtree whose range contains NO match.
+    ///   - `zh` (hide): fold matching items themselves (closing them
+    ///     so their children disappear and the head becomes unmatched
+    ///     by virtue of being collapsed).
+    /// `zs` / `zh` — show / hide lines containing the word under the
+    /// cursor. Mirrors hyperlist.vim's foldexpr-based behaviour: each
+    /// line is independently classified, and CONSECUTIVE non-shown
+    /// lines collapse into a single fold whose head displays the
+    /// first line of the run. Standalone non-shown lines stay
+    /// visible (a one-line fold isn't worth closing).
     fn showhide_word(&mut self, show: bool) {
         let line = self.buf.line(self.cur_line);
         let off = self.cur_col.min(line.len());
         let bytes = line.as_bytes();
         let mut s = off;
-        while s > 0 && (bytes[s-1].is_ascii_alphanumeric() || bytes[s-1] == b'_') { s -= 1; }
+        while s > 0 && (bytes[s - 1].is_ascii_alphanumeric() || bytes[s - 1] == b'_') { s -= 1; }
         let mut e = off;
         while e < bytes.len() && (bytes[e].is_ascii_alphanumeric() || bytes[e] == b'_') { e += 1; }
         if s == e { self.set_status(" no word at cursor", 244); return; }
         let word = line[s..e].to_string();
         self.showhide = Some((word.clone(), show));
-        // Walk lines: any that fails the show/hide criterion AND has
-        // no children that match either — close it. For simplicity we
-        // just close every line that itself fails (children rendered
-        // as part of parent's fold).
+
         let total = self.buf.line_count();
-        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
         self.folds.clear();
-        for (i, l) in all.iter().enumerate() {
-            let contains = l.contains(&word);
-            let hide_this = if show { !contains } else { contains };
-            if hide_this && fold::is_foldable(i, &all) {
-                self.folds.toggle_at(i, &all);
+        // Walk lines, collapse maximal runs of "should-hide" lines
+        // into a fold whose head is the first line of the run.
+        let mut run_start: Option<usize> = None;
+        let mut close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
+            if end > start { folds.close_range(start, end); }
+        };
+        for i in 0..total {
+            let l = self.buf.line(i);
+            let matches = l.contains(&word);
+            let hide_this = if show { !matches } else { matches };
+            if hide_this {
+                if run_start.is_none() { run_start = Some(i); }
+            } else if let Some(start) = run_start.take() {
+                close_run(start, i - 1, &mut self.folds);
             }
+        }
+        if let Some(start) = run_start {
+            close_run(start, total - 1, &mut self.folds);
         }
         self.set_status(&format!(" {}: {}", if show { "show" } else { "hide" }, word), 244);
     }
@@ -3424,18 +4368,23 @@ impl App {
     /// Insert-mode `Ctrl-T`: indent right, append `.1` to the line's
     /// number prefix to make this a child level. (e.g. `1.2 foo` →
     /// indent + `1.2.1 foo`.)
+    /// Insert-mode `Ctrl-T`: indent right and renumber as a child of
+    /// what was the previous sibling. `1.2.` → `1.1.1.` (matches the
+    /// vim plugin's mapping which DECREMENTS the trailing index first
+    /// before appending `.1`).
     fn autonum_indent_in(&mut self) {
         let line = self.buf.line(self.cur_line);
         let indent: String = line.chars().take_while(|c| *c == '\t' || *c == '*').collect();
         let body = &line[indent.len()..];
         let line_off = self.buf.line_byte_offset(self.cur_line);
-        // Add one TAB.
+
+        self.buf.begin_compound();
         self.buf.apply(line_off, line_off, "\t");
-        // Append .1 to the existing number.
         if let Some((prefix, idx, trail)) = parse_number_prefix(body) {
             let old = format!("{}{}{}", prefix, idx, if trail { "." } else { "" });
-            let new = format!("{}{}.1{}", prefix, idx, if trail { "." } else { "" });
-            let abs = line_off + 1 + indent.len(); // +1 for the new TAB
+            let new_idx = idx.saturating_sub(1).max(1);
+            let new = format!("{}{}.1{}", prefix, new_idx, if trail { "." } else { "" });
+            let abs = line_off + 1 + indent.len(); // +1 for new TAB
             self.buf.apply(abs, abs + old.len(), &new);
             self.cur_col = indent.len() + 1 + new.len() + 1;
             self.want_col = self.cur_col;
@@ -3443,40 +4392,42 @@ impl App {
             self.cur_col += 1;
             self.want_col = self.cur_col;
         }
+        self.buf.end_compound();
     }
 
-    /// Insert-mode `Ctrl-D`: indent left, drop the trailing `.N` of
-    /// the line's number, increment what was the parent's index.
+    /// Insert-mode `Ctrl-D`: outdent and renumber as the next sibling
+    /// of what was the parent. `1.1.1.` → `1.2.` (drop the trailing
+    /// `.N` segment, increment what was the parent's index).
     fn autonum_indent_out(&mut self) {
         let line = self.buf.line(self.cur_line);
         let indent: String = line.chars().take_while(|c| *c == '\t' || *c == '*').collect();
         if indent.is_empty() { return; }
         let body = &line[indent.len()..];
         let line_off = self.buf.line_byte_offset(self.cur_line);
-        // Strip one TAB.
+
+        self.buf.begin_compound();
         self.buf.apply(line_off, line_off + 1, "");
-        // De-number: last segment dropped, parent index bumped.
         if let Some((prefix, _idx, trail)) = parse_number_prefix(body) {
-            // Strip trailing dot from prefix to access the parent index.
+            // prefix is "1.1." or "1." or "" — drop the LAST dot to
+            // access the parent index.
             let p = prefix.trim_end_matches('.');
-            let dot = p.rfind('.');
-            let (gp, parent_idx_str) = match dot {
-                Some(d) => (&p[..d+1], &p[d+1..]),
-                None    => ("", p),
+            let (gp, parent_idx) = match p.rfind('.') {
+                Some(d) => (&p[..d + 1], p[d + 1..].parse::<u64>().unwrap_or(0)),
+                None if !p.is_empty() => ("", p.parse::<u64>().unwrap_or(0)),
+                None => ("", 0),
             };
-            let parent_idx: u64 = parent_idx_str.parse().unwrap_or(0);
             let new = format!("{}{}{}", gp, parent_idx + 1, if trail { "." } else { "" });
-            let old_full = format!("{}", body);
-            let old_num_len = strip_number_prefix(body).0;
-            let old_num = &old_full[..old_num_len.saturating_sub(1)]; // drop trailing space
+            // Replace the entire old number-prefix (incl. trailing space).
+            let (old_num_len, _) = strip_number_prefix(body);
             let abs = line_off + indent.len() - 1; // -1 for stripped TAB
-            self.buf.apply(abs, abs + old_num.len(), &new);
-            self.cur_col = indent.len().saturating_sub(1) + new.len() + 1;
+            self.buf.apply(abs, abs + old_num_len.saturating_sub(1), &new);
+            self.cur_col = (indent.len() - 1) + new.len() + 1;
             self.want_col = self.cur_col;
         } else {
             self.cur_col = self.cur_col.saturating_sub(1);
             self.want_col = self.cur_col;
         }
+        self.buf.end_compound();
     }
 
     fn showhide_pattern(&mut self, pattern: &str, show: bool) {
@@ -3486,14 +4437,23 @@ impl App {
             Err(e) => { self.set_status(&format!(" bad regex: {}", e), 196); return; }
         };
         let total = self.buf.line_count();
-        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
         self.folds.clear();
-        for (i, l) in all.iter().enumerate() {
-            let m = re.is_match(l);
+        let mut run_start: Option<usize> = None;
+        let mut close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
+            if end > start { folds.close_range(start, end); }
+        };
+        for i in 0..total {
+            let l = self.buf.line(i);
+            let m = re.is_match(&l);
             let hide_this = if show { !m } else { m };
-            if hide_this && fold::is_foldable(i, &all) {
-                self.folds.toggle_at(i, &all);
+            if hide_this {
+                if run_start.is_none() { run_start = Some(i); }
+            } else if let Some(start) = run_start.take() {
+                close_run(start, i - 1, &mut self.folds);
             }
+        }
+        if let Some(start) = run_start {
+            close_run(start, total - 1, &mut self.folds);
         }
         self.showhide = Some((pattern.into(), show));
         self.set_status(&format!(" {}: /{}/", if show { "show" } else { "hide" }, pattern), 244);
@@ -3606,6 +4566,14 @@ impl App {
         self.captured_insert.clear();
     }
 
+    /// `R` from Normal — enter Replace mode. Same captured-keys
+    /// machinery as Insert so dot-repeat replays the typed chars.
+    fn enter_replace(&mut self) {
+        self.mode = Mode::Replace;
+        self.capturing_insert = true;
+        self.captured_insert.clear();
+    }
+
     /// Re-query terminal dimensions and resize the three panes. Triggered by
     /// the `RESIZE` event from crust (SIGWINCH wrapper). Without this scribe
     /// keeps drawing to the old pane width and the host terminal physically
@@ -3678,6 +4646,13 @@ impl App {
         self.visual_anchor = self.cursor_byte();
         self.visual_anchor_line = self.cur_line;
         self.visual_anchor_col = self.cur_col;
+        if matches!(kind, Mode::VisualBlock) {
+            let line = self.buf.line(self.cur_line);
+            let ts = self.tabstop();
+            let v = display_col(&line, self.cur_col.min(line.len()), ts);
+            self.vblock_anchor_vcol = v;
+            self.vblock_cur_vcol = v;
+        }
     }
 
     fn visual_range(&self) -> (usize, usize) {
@@ -3708,6 +4683,26 @@ impl App {
 
     fn handle_visual(&mut self, key: &str) -> bool {
         if let Some(q) = self.try_keymap("visual", key) { return q; }
+        // Leader (`\`) prefix dispatch — works in Visual just like in
+        // Normal so `\s` (sort), `\R` (renumber), `\z`/`\x`
+        // (encrypt/decrypt visual range), etc. fire instead of `s`
+        // being treated as substitute on the selection.
+        if let Some(group) = self.leader_sub.take() {
+            return self.handle_leader_sub(group, key);
+        }
+        if self.leader_prefix {
+            self.leader_prefix = false;
+            if key == "e" || key == "x" {
+                self.leader_sub = Some(key.chars().next().unwrap());
+                self.set_status(
+                    if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown" },
+                    244);
+                return false;
+            }
+            return self.handle_leader(key);
+        }
+        if key == "\\" { self.leader_prefix = true; return false; }
         // Esc / v(in same kind) returns to Normal.
         match (self.mode, key) {
             (_, "ESC") | (_, "C-[")
@@ -3738,7 +4733,15 @@ impl App {
                 return false;
             }
             "~" => {
-                self.apply_visual_case_toggle();
+                self.apply_visual_case(CaseOp::Toggle);
+                return false;
+            }
+            "u" => {
+                self.apply_visual_case(CaseOp::Lower);
+                return false;
+            }
+            "U" => {
+                self.apply_visual_case(CaseOp::Upper);
                 return false;
             }
             "p" | "P" => {
@@ -3760,12 +4763,66 @@ impl App {
             return false;
         }
 
+        // VisualBlock: h/l/j/k drive vcol/row directly so the block
+        // stays a perfect rectangle through tabs and short lines. Other
+        // motions (w/b/$/^/G/…) fall through to normal motion handling
+        // and we re-derive vcol from the resulting cur_col afterwards.
+        if matches!(self.mode, Mode::VisualBlock) {
+            let n = self.pending.count();
+            let consumed = match key {
+                "h" | "LEFT" => {
+                    self.vblock_cur_vcol = self.vblock_cur_vcol.saturating_sub(n);
+                    self.sync_vblock_cursor();
+                    true
+                }
+                "l" | "RIGHT" => {
+                    self.vblock_cur_vcol = self.vblock_cur_vcol.saturating_add(n);
+                    self.sync_vblock_cursor();
+                    true
+                }
+                "j" | "DOWN" => {
+                    let last = self.buf.line_count().saturating_sub(1);
+                    self.cur_line = (self.cur_line + n).min(last);
+                    self.sync_vblock_cursor();
+                    true
+                }
+                "k" | "UP" => {
+                    self.cur_line = self.cur_line.saturating_sub(n);
+                    self.sync_vblock_cursor();
+                    true
+                }
+                _ => false,
+            };
+            if consumed { self.pending.clear(); return false; }
+        }
+
         // Otherwise treat as motion to extend selection.
         if let Some(target) = self.parse_motion(key, self.pending.count()) {
             self.cursor_to_byte(target);
+            // After non-h/l/j/k motion in VisualBlock, the user moved
+            // by word/line/etc. — pin the new vcol to wherever cur_col
+            // landed so the rectangle picks up the new column.
+            if matches!(self.mode, Mode::VisualBlock) {
+                let line = self.buf.line(self.cur_line);
+                let ts = self.tabstop();
+                self.vblock_cur_vcol = display_col(&line, self.cur_col.min(line.len()), ts);
+            }
         }
         self.pending.clear();
         false
+    }
+
+    /// In VisualBlock, after changing `vblock_cur_vcol` or `cur_line`,
+    /// snap `cur_col` to the byte at (or just inside) the desired vcol
+    /// on the new line. The vcol field stays intact even if the line
+    /// is shorter — that's how the rectangle keeps its right edge
+    /// when the cursor passes through stubby lines.
+    fn sync_vblock_cursor(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let ts = self.tabstop();
+        let (b, _) = byte_at_or_past_col(&line, self.vblock_cur_vcol, ts);
+        self.cur_col = b.min(line.len());
+        self.want_col = self.cur_col;
     }
 
     fn apply_visual_op(&mut self, op: char) {
@@ -3791,19 +4848,25 @@ impl App {
         self.pending.clear();
     }
 
-    fn apply_visual_case_toggle(&mut self) {
+    /// Lower / upper / toggle every char in the active visual selection.
+    /// Linewise selection covers full lines; charwise is byte-exact.
+    fn apply_visual_case(&mut self, op: CaseOp) {
         let (s, e) = match self.mode {
             Mode::Visual => self.visual_range(),
             Mode::VisualLine => self.visual_line_range(),
             _ => return,
         };
         let text: String = self.buf.rope.byte_slice(s..e).to_string();
-        let toggled: String = text.chars().map(|c| {
-            if c.is_ascii_uppercase() { c.to_ascii_lowercase() }
-            else if c.is_ascii_lowercase() { c.to_ascii_uppercase() }
-            else { c }
+        let transformed: String = text.chars().map(|c| match op {
+            CaseOp::Lower => c.to_ascii_lowercase(),
+            CaseOp::Upper => c.to_ascii_uppercase(),
+            CaseOp::Toggle => {
+                if c.is_ascii_uppercase() { c.to_ascii_lowercase() }
+                else if c.is_ascii_lowercase() { c.to_ascii_uppercase() }
+                else { c }
+            }
         }).collect();
-        self.buf.apply(s, e, &toggled);
+        self.buf.apply(s, e, &transformed);
         self.cursor_to_byte(s);
         self.mode = Mode::Normal;
     }
@@ -3812,8 +4875,13 @@ impl App {
     fn apply_visual_block_op(&mut self, op: char) {
         let l1 = self.visual_anchor_line.min(self.cur_line);
         let l2 = self.visual_anchor_line.max(self.cur_line);
-        let c1 = self.visual_anchor_col.min(self.cur_col);
-        let c2 = self.visual_anchor_col.max(self.cur_col);
+        // Display-column bounds — the block is a rectangle in screen
+        // space, not in byte space. Per-line we resolve these to byte
+        // ranges, accepting that a tab may be partially covered and
+        // that short lines may contribute the empty string.
+        let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+        let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+        let ts = self.tabstop();
         // Group all per-line edits into one undo node so a single `u`
         // reverses the entire block op.
         if op != 'y' { self.buf.begin_compound(); }
@@ -3821,15 +4889,23 @@ impl App {
         // Walk lines from bottom up so earlier byte offsets remain valid.
         for line in (l1..=l2).rev() {
             let line_text = self.buf.line(line);
-            if c1 >= line_text.len() { yanked.push(String::new()); continue; }
-            let start_col = c1;
-            let mut end_col = (c2 + 1).min(line_text.len());
-            while end_col < line_text.len() && !line_text.is_char_boundary(end_col) { end_col += 1; }
-            let chunk = line_text[start_col..end_col].to_string();
-            yanked.push(chunk.clone());
-            if op != 'y' {
+            let (start_byte, start_vcol) = byte_at_or_past_col(&line_text, v1, ts);
+            let (end_byte, _)            = byte_at_or_past_col(&line_text, v2 + 1, ts);
+            // Pad the yanked chunk on the left when the line is too
+            // short to reach v1 — keeps the block rectangular when
+            // the user later pastes it elsewhere.
+            let left_pad = v1.saturating_sub(start_vcol);
+            let chunk = if start_byte >= line_text.len() {
+                " ".repeat(left_pad)
+            } else {
+                let mut s = " ".repeat(left_pad);
+                s.push_str(&line_text[start_byte..end_byte]);
+                s
+            };
+            yanked.push(chunk);
+            if op != 'y' && end_byte > start_byte {
                 let line_off = self.buf.line_byte_offset(line);
-                self.buf.apply(line_off + start_col, line_off + end_col, "");
+                self.buf.apply(line_off + start_byte, line_off + end_byte, "");
             }
         }
         yanked.reverse();
@@ -3845,9 +4921,12 @@ impl App {
         let verb = if op == 'y' { "yanked" } else if op == 'c' { "changed" } else { "deleted" };
         self.say_yank(verb, reg, YankKind::Block, &combined_for_msg);
         if op != 'y' { self.buf.end_compound(); }
+        // Snap cursor to the block's top-left corner in byte terms.
         self.cur_line = l1;
-        self.cur_col = c1;
-        self.want_col = c1;
+        let top_line = self.buf.line(self.cur_line);
+        let (b, _) = byte_at_or_past_col(&top_line, v1, ts);
+        self.cur_col = b.min(top_line.len());
+        self.want_col = self.cur_col;
         if op == 'c' { self.enter_insert(); }
     }
 
@@ -3870,8 +4949,13 @@ impl App {
             'c' => {
                 self.regs.cut(reg_name, text, YankKind::Charwise);
                 self.buf.apply(start, end, "");
-                self.cursor_to_byte(start);
+                // Enter insert FIRST so col_cap allows landing one past
+                // the last char. Otherwise `C` on "TEST" with cursor on
+                // E deletes ESC(EST), leaves "T", then cursor_to_byte(1)
+                // gets clamped to len-1=0 (Normal mode cap) and the
+                // cursor sits on T instead of after it.
                 self.enter_insert();
+                self.cursor_to_byte(start);
                 verb = Some("changed");
             }
             'y' => {
@@ -4031,43 +5115,67 @@ impl App {
             Some(y) => y.clone(),
             None    => { self.set_status(" register empty", 244); return; }
         };
-        // Block paste: lay each line of the yank at the cursor column on
-        // consecutive buffer lines, padding short lines with spaces. Append
-        // a new buffer line if we run out.
+        // Block paste: lay each line of the yank at the same DISPLAY
+        // column on consecutive buffer lines, padding short lines with
+        // spaces so the rectangle keeps its shape regardless of tabs
+        // on the destination lines. Append new buffer lines if we run
+        // out. Cursor lands at the top-left of the inserted block.
         if yank.kind == YankKind::Block {
             self.buf.begin_compound();
+            let ts = self.tabstop();
             let lines: Vec<&str> = yank.text.split('\n').collect();
-            let target_col = if after { self.cur_col + 1 } else { self.cur_col };
+            // Target display column. `p` (after) inserts to the right
+            // of the cursor cell; `P` (before) inserts at the cursor
+            // cell. End-of-line sticks to the cell's display col.
+            let cur_line_text = self.buf.line(self.cur_line);
+            let cur_disp = display_col(&cur_line_text, self.cur_col.min(cur_line_text.len()), ts);
+            let target_v = if after && self.cur_col < cur_line_text.len() {
+                cur_disp + 1
+            } else {
+                cur_disp
+            };
             for (i, chunk) in lines.iter().enumerate() {
-                // Repeat per count.
                 let mut chunk_n = String::new();
                 for _ in 0..count.max(1) { chunk_n.push_str(chunk); }
                 let bl = self.cur_line + i;
                 if bl >= self.buf.line_count() {
+                    // Append a brand new line. No tabs to worry about,
+                    // so target_v == byte count of leading spaces.
                     let end = self.buf.rope.len_bytes();
                     let mut payload = String::new();
                     if !self.buf.rope.to_string().ends_with('\n') { payload.push('\n'); }
-                    for _ in 0..target_col { payload.push(' '); }
+                    payload.push_str(&" ".repeat(target_v));
                     payload.push_str(&chunk_n);
                     self.buf.apply(end, end, &payload);
                     continue;
                 }
                 let line_text = self.buf.line(bl);
                 let line_off = self.buf.line_byte_offset(bl);
-                if target_col > line_text.len() {
-                    let pad = target_col - line_text.len();
-                    let mut payload = " ".repeat(pad);
+                let line_disp_w = display_col(&line_text, line_text.len(), ts);
+                if line_disp_w >= target_v {
+                    // Destination already reaches target_v — insert
+                    // chunk at byte that aligns with target_v. If
+                    // target_v lands inside a tab's expansion, snap
+                    // to the tab's start (vim behaviour).
+                    let (b, _) = byte_at_or_past_col(&line_text, target_v, ts);
+                    let insert_at = line_off + b;
+                    self.buf.apply(insert_at, insert_at, &chunk_n);
+                } else {
+                    // Destination line shorter than target_v — pad
+                    // with spaces from end-of-line up to target_v,
+                    // then append chunk.
+                    let pad_w = target_v - line_disp_w;
+                    let mut payload = " ".repeat(pad_w);
                     payload.push_str(&chunk_n);
                     let end_byte = line_off + line_text.len();
                     self.buf.apply(end_byte, end_byte, &payload);
-                } else {
-                    let insert_at = line_off + target_col;
-                    self.buf.apply(insert_at, insert_at, &chunk_n);
                 }
             }
-            // Cursor lands at the start of the inserted block.
-            self.cur_col = target_col;
-            self.want_col = target_col;
+            // Cursor lands at the byte for target_v on the top line.
+            let top_line = self.buf.line(self.cur_line);
+            let (b, _) = byte_at_or_past_col(&top_line, target_v, ts);
+            self.cur_col = b.min(top_line.len());
+            self.want_col = self.cur_col;
             self.buf.end_compound();
             return;
         }
@@ -4185,9 +5293,66 @@ impl App {
     }
 
     // ── Insert mode ────────────────────────────────────────────────────
+    /// After the user just typed a boundary character (space, punct,
+    /// enter — anything not in the abbrev-char set), look back at the
+    /// preceding sequence of abbrev chars and, if it matches a stored
+    /// trigger, replace it with the expansion. Cursor follows so the
+    /// boundary char stays at the new end of the expanded text.
+    /// Returns true if an expansion fired.
+    fn try_expand_abbrev(&mut self, boundary_byte_len: usize) -> bool {
+        if self.abbrev.is_empty() { return false; }
+        let cur_off = self.cursor_byte();
+        if cur_off < boundary_byte_len { return false; }
+        let pre_boundary = cur_off - boundary_byte_len;
+        let s = self.buf.rope.to_string();
+        // Walk backwards from pre_boundary over abbrev chars to find
+        // the trigger's start. Stop on the first non-abbrev byte.
+        let mut start = pre_boundary;
+        while start > 0 {
+            // Step back to the start of the previous char.
+            let mut p = start - 1;
+            while p > 0 && !s.is_char_boundary(p) { p -= 1; }
+            let ch = match s[p..start].chars().next() {
+                Some(c) => c,
+                None => break,
+            };
+            if !is_abbrev_char(ch) { break; }
+            start = p;
+        }
+        if start == pre_boundary { return false; }
+        let trigger = &s[start..pre_boundary];
+        let expansion = match self.abbrev.get(trigger) {
+            Some(e) => e.clone(),
+            None => return false,
+        };
+        // Splice: replace [start, pre_boundary) with expansion. The
+        // boundary char already in [pre_boundary, cur_off) stays in
+        // place — re-attached at the new tail.
+        self.buf.apply(start, pre_boundary, &expansion);
+        let new_cursor = start + expansion.len() + boundary_byte_len;
+        let (line, col) = self.buf.byte_to_line_col(new_cursor);
+        self.cur_line = line;
+        self.cur_col = col;
+        self.want_col = self.cur_col;
+        // Reflect the expanded text in the captured insert so dot
+        // replays the expansion (not the trigger).
+        if self.capturing_insert {
+            // Find the most-recent occurrence of trigger in the
+            // captured stream and replace the LAST one. Simplest
+            // correct heuristic: rfind on the whole captured text.
+            if let Some(pos) = self.captured_insert.rfind(trigger) {
+                let end = pos + trigger.len();
+                self.captured_insert.replace_range(pos..end, &expansion);
+            }
+        }
+        true
+    }
+
     fn handle_insert(&mut self, key: &str) -> bool {
         if let Some(q) = self.try_keymap("insert", key) { return q; }
         match key {
+            // <Ins> toggles to Replace mode mid-stream (vim parity).
+            "INS" => { self.mode = Mode::Replace; return false; }
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
                 self.clamp_col_to_line();
@@ -4262,6 +5427,9 @@ impl App {
                 self.cur_col = 0;
                 self.want_col = 0;
                 if self.capturing_insert { self.captured_insert.push('\n'); }
+                // Newline is an abbrev boundary too — fire expansion
+                // for the trigger that ended on the previous column.
+                self.try_expand_abbrev(1);
             }
             "TAB" | "\t" => {
                 let off = self.cursor_byte();
@@ -4279,6 +5447,13 @@ impl App {
                         self.cur_col += other.len();
                         self.want_col = self.cur_col;
                         if self.capturing_insert { self.captured_insert.push_str(other); }
+                        // Abbreviation expansion: when the just-typed
+                        // char is a boundary (anything not a-z, 0-9,
+                        // `-`, `_`), check if the preceding word is a
+                        // registered trigger and substitute.
+                        if !is_abbrev_char(c) {
+                            self.try_expand_abbrev(other.len());
+                        }
                         // Auto-wrap on space when the line outgrew tw.
                         // Only fires when the user just typed a space —
                         // breaking on every char would cut words.
@@ -4290,6 +5465,112 @@ impl App {
             }
         }
         false
+    }
+
+    // ── Replace mode ───────────────────────────────────────────────────
+    /// Like Insert mode but typed printable chars OVERWRITE the char
+    /// at the cursor (extending the line if cursor is past EOL).
+    /// `<Ins>` toggles back to Insert. ESC / Ctrl-[ / Ctrl-C exit
+    /// to Normal. Backspace moves the cursor left without restoring
+    /// the original char (vim's exact "restore previous content"
+    /// behavior would require tracking each overwritten byte; not
+    /// worth the bookkeeping — `u` undoes the whole replace turn).
+    fn handle_replace(&mut self, key: &str) -> bool {
+        if let Some(q) = self.try_keymap("insert", key) { return q; }
+        match key {
+            "INS" => { self.mode = Mode::Insert; return false; }
+            "ESC" | "C-[" | "C-C" => {
+                self.mode = Mode::Normal;
+                self.clamp_col_to_line();
+                if self.capturing_insert {
+                    let captured = std::mem::take(&mut self.captured_insert);
+                    self.capturing_insert = false;
+                    if !captured.is_empty() {
+                        self.last_change = Some(LastChange::Insert {
+                            text: captured,
+                            append: false,
+                        });
+                    }
+                }
+                if self.spell_enabled { self.recheck_spell(); }
+            }
+            "LEFT"  => self.move_left_wrap(),
+            "RIGHT" => self.move_right_wrap(),
+            "UP"    => self.move_up(),
+            "DOWN"  => self.move_down(),
+            "HOME"  => { self.cur_col = 0; self.want_col = 0; }
+            "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
+            "BACK" | "BACKSPACE" | "C-H" => {
+                // Step the cursor back without restoring; user can `u`
+                // to revert the whole replace turn.
+                if self.cur_col > 0 {
+                    let line = self.buf.line(self.cur_line);
+                    let mut p = self.cur_col - 1;
+                    while p > 0 && !line.is_char_boundary(p) { p -= 1; }
+                    self.cur_col = p;
+                    self.want_col = self.cur_col;
+                } else if self.cur_line > 0 {
+                    self.cur_line -= 1;
+                    self.cur_col = self.col_cap();
+                    self.want_col = self.cur_col;
+                }
+            }
+            "DEL" => {
+                let off = self.cursor_byte();
+                let total = self.buf.rope.len_bytes();
+                if off < total {
+                    let s = self.buf.rope.to_string();
+                    let mut end = off + 1;
+                    while end < s.len() && !s.is_char_boundary(end) { end += 1; }
+                    self.buf.apply(off, end, "");
+                }
+            }
+            "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
+                // Newline always inserts (no char to overwrite makes sense).
+                let off = self.cursor_byte();
+                self.buf.apply(off, off, "\n");
+                self.cur_line += 1;
+                self.cur_col = 0;
+                self.want_col = 0;
+                if self.capturing_insert { self.captured_insert.push('\n'); }
+            }
+            "TAB" | "\t" => {
+                // Treat like a printable char — overwrites at cursor.
+                self.replace_char_at_cursor("\t");
+                if self.capturing_insert { self.captured_insert.push('\t'); }
+            }
+            other => {
+                if other.chars().count() == 1 {
+                    let c = other.chars().next().unwrap();
+                    if !c.is_control() {
+                        self.replace_char_at_cursor(other);
+                        if self.capturing_insert { self.captured_insert.push_str(other); }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Overwrite the char at the cursor with `s` (which is one
+    /// grapheme — single keystroke in practice). If the cursor is
+    /// at or past EOL, append instead. Cursor moves to just past
+    /// the inserted/replaced char.
+    fn replace_char_at_cursor(&mut self, s: &str) {
+        let line = self.buf.line(self.cur_line);
+        let off = self.cursor_byte();
+        if self.cur_col >= line.len() {
+            // Past EOL — append.
+            self.buf.apply(off, off, s);
+        } else {
+            // Find end of char at cursor, replace it.
+            let mut end_col = self.cur_col + 1;
+            while end_col < line.len() && !line.is_char_boundary(end_col) { end_col += 1; }
+            let line_off = self.buf.line_byte_offset(self.cur_line);
+            self.buf.apply(off, line_off + end_col, s);
+        }
+        self.cur_col += s.len();
+        self.want_col = self.cur_col;
     }
 
     /// If the current line exceeds `textwidth` characters, replace
@@ -4703,6 +5984,72 @@ impl App {
                 }
                 false
             }
+            "ab" | "abbrev" => {
+                if self.abbrev.is_empty() {
+                    self.set_status(" no abbreviations defined", 244);
+                } else {
+                    let mut names: Vec<&String> = self.abbrev.keys().collect();
+                    names.sort();
+                    let preview: Vec<String> = names.iter()
+                        .take(6)
+                        .map(|k| format!("{}→{}", k, self.abbrev[*k]))
+                        .collect();
+                    let suffix = if names.len() > 6 { format!(" (+{} more)", names.len() - 6) } else { String::new() };
+                    self.set_status(&format!(" abbrev: {}{}", preview.join("  "), suffix), 244);
+                }
+                false
+            }
+            "abclear" | "abc" => {
+                let n = self.abbrev.len();
+                self.abbrev.clear();
+                save_abbreviations(&self.abbrev);
+                self.set_status(&format!(" cleared {n} abbreviations"), 244);
+                false
+            }
+            other if other.starts_with("ab ") || other.starts_with("abbrev ") => {
+                // `:ab trigger expansion words go here`. The first
+                // token after the keyword is the trigger; everything
+                // else is the expansion (verbatim, including spaces).
+                let body = if let Some(rest) = other.strip_prefix("abbrev ") { rest }
+                           else { other.strip_prefix("ab ").unwrap_or("") };
+                let body = body.trim_start();
+                if let Some((trigger, expansion)) = body.split_once(char::is_whitespace) {
+                    let trigger = trigger.trim();
+                    let expansion = expansion.trim_end_matches('\n');
+                    if trigger.is_empty() {
+                        self.set_status(" :ab needs a trigger", 196);
+                    } else if !trigger.chars().all(is_abbrev_char) {
+                        self.set_status(
+                            " trigger must contain only letters, digits, '-', '_'",
+                            196,
+                        );
+                    } else {
+                        self.abbrev.insert(trigger.to_string(), expansion.to_string());
+                        save_abbreviations(&self.abbrev);
+                        self.set_status(&format!(" abbrev: {} → {}", trigger, expansion), 244);
+                    }
+                } else if !body.is_empty() {
+                    // Single-token form `:ab trigger` shows current value
+                    let key = body.trim();
+                    match self.abbrev.get(key) {
+                        Some(v) => self.set_status(&format!(" {} → {}", key, v), 244),
+                        None => self.set_status(&format!(" no abbrev for {}", key), 244),
+                    }
+                }
+                false
+            }
+            other if other.starts_with("una ") || other.starts_with("unabbrev ") => {
+                let body = if let Some(rest) = other.strip_prefix("unabbrev ") { rest }
+                           else { other.strip_prefix("una ").unwrap_or("") };
+                let key = body.trim();
+                if self.abbrev.remove(key).is_some() {
+                    save_abbreviations(&self.abbrev);
+                    self.set_status(&format!(" removed abbrev: {}", key), 244);
+                } else {
+                    self.set_status(&format!(" no abbrev for {}", key), 244);
+                }
+                false
+            }
             "set spell" => {
                 self.spell_enable();
                 if self.spell_enabled {
@@ -4923,10 +6270,15 @@ impl App {
             return;
         }
         let pattern = parts[0];
-        let replacement = parts[1];
+        let replacement_raw = parts[1];
         let flags = parts.get(2).copied().unwrap_or("");
         let global = flags.contains('g');
         let case_insensitive = flags.contains('i');
+        // Expand backslash escapes in the replacement: `\t` → TAB,
+        // `\n` → newline, `\r` → CR, `\\` → literal `\`. Capture
+        // groups still use `$1`, `$2` (regex-crate convention).
+        let replacement = expand_replacement_escapes(replacement_raw);
+        let replacement = replacement.as_str();
 
         let mut re_str = String::new();
         if case_insensitive { re_str.push_str("(?i)"); }

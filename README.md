@@ -29,6 +29,21 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 **v0.1.28** — daily-driveable for prose AND HyperList. Full feature reference below.
 
+## Screenshots
+
+**HyperList editing** — full hyperlist.vim parity with the new `\`-grouped keymap. Syntax highlighting tracks the spec: red Properties, blue Operators, green Qualifiers, magenta References, teal Comments / Quotes, yellow Hashtags, multi-line `+` markers, underlined State/Transition items.
+
+![HyperList in scribe](img/scribe-hyperlist.png)
+
+**Reading mode + Limelight** — `:read` (or `zr`) for distraction-free prose, `:set pdim` to dim every paragraph except the cursor's. Header collapses, gutter hides, focus follows you.
+
+![Reading mode with paragraph dim](img/scribe-reading.png)
+
+**Long-form Markdown** — soft-wrap by default, syntax highlighting, sub-10 ms startup. The same modal core that powers HyperList editing handles prose, code, email, and source.
+
+![Markdown editing](img/scribe-prose.png)
+
+
 ## Reference
 
 ### Motion
@@ -218,7 +233,7 @@ Drop a `[keymap]` section into scriberc to define your own bindings. Format per 
 ```
 [keymap]
 normal  zr  :read
-normal  zq  :wq
+normal  zz  :wq
 insert  jk  <Esc>
 normal  qq  :q!
 ```
@@ -227,14 +242,14 @@ normal  qq  :q!
 - `LHS` is 1- or 2-key — single chars or vim-style escapes (`<Esc>`, `<C-Space>`, `<CR>`, `<C-Up>`).
 - `RHS` starting with `:` runs as an ex command. Anything else is fed back through the input layer as if you typed it.
 
-User maps take precedence over scribe's built-in `zr`/`zq`/`zn`/`zp` shortcuts (which stay as defaults if you don't define your own).
+User maps take precedence over scribe's built-in `zr`/`zz`/`zn`/`zp` shortcuts (which stay as defaults if you don't define your own).
 
 ### Quick keys (Z prefix)
 
 | Keys | Action |
 |---|---|
 | `zr` | toggle reading mode |
-| `zq` | save + quit (= `:wq`) |
+| `zz` | save + quit (= `:wq`) |
 | `zn` | next misspelling |
 | `zp` | previous misspelling |
 | `z=` | spell suggestions |
@@ -261,7 +276,7 @@ Always shows:
 |---|---|
 | `q` | quit when buffer is clean; refuses + warns if dirty |
 | `Q` | quit, **discard** unsaved changes |
-| `zq` / `:wq` / `:x` | save + quit |
+| `zz` / `:wq` / `:x` | save + quit |
 | `:q!` | quit without saving |
 
 Every save first writes `<path>.scribe-bak` so an accidental `:wq` after a destructive `:claude` is recoverable.
@@ -376,7 +391,23 @@ Scribe accepts `+N` for line-jump (vim convention), so kastrup's compose flow dr
 
 ## HyperList
 
-Scribe ships with full `hyperlist.vim` parity for `.hl` and `.woim` files: indent folding, autonumbering, encryption (incl. dotfile auto-encrypt with byte-for-byte compatibility with the Ruby `hyperlist` app's `ENC:` format), references, exports, and more. See [HYPERLIST.md](HYPERLIST.md) or `:h hl` inside scribe.
+Scribe ships with full `hyperlist.vim` parity for `.hl` and `.woim` files: indent folding, autonumbering, encryption (incl. dotfile auto-encrypt, byte-for-byte compatible with the Ruby `hyperlist` app's `ENC:` format), references, presentation mode, calendar export, HTML / LaTeX / Markdown export, and more.
+
+All HyperList commands live behind the `\` leader. Highlights:
+
+| Group | Keys |
+|---|---|
+| Folding | `\0`..`\9` level · `\a` open all · `<SPACE>` / `<C-SPACE>` toggle |
+| Items   | `\v` checkbox · `\V` +stamp · `\o` in-progress · `\n` autonumber |
+| Nav     | `\r` reference jump (in-buffer / file / URL) · `\p` presentation toggle |
+| Filter  | `\S` / `\H` / `\N` show / hide / reset (also `zs` / `zh` / `z0`) |
+| Look    | `\h` limelight · `\u` state/transition underline |
+| Export  | `\xh` HTML · `\xl` LaTeX · `\xm` Markdown |
+| Crypto  | `\ee` encrypt · `\ed` decrypt · `\ek` rekey |
+| Other   | `\s` sort · `\c` complexity · `\g` calendar add |
+| Help    | `\?` cheatsheet popup (ESC dismisses) |
+
+Run scribe on the bundled [`HyperListTestSuite.hl`](HyperListTestSuite.hl) to learn (and verify) every feature interactively. Full reference: [HYPERLIST.md](HYPERLIST.md) or `:h hl` inside scribe.
 
 ## Roadmap
 
