@@ -30,12 +30,18 @@ use std::path::PathBuf;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    // CLI: scribe [+N] [--theme NAME] [path]
+    // CLI: scribe [+N] [--col N] [--insert] [--theme NAME] [--no-spell] [path]
     // `+N` opens the file with the cursor on line N (vim convention; used
     // by kastrup's compose flow to jump straight to the message body).
+    // `--col N` puts the cursor on column N of that line (1-indexed,
+    // counted in chars). `--insert` boots straight into Insert mode so an
+    // embedder (kastrup `m`) can land the user one keystroke from typing
+    // the recipient.
     // `--theme NAME` overrides the rcfile theme for this session only.
     let args: Vec<String> = std::env::args().collect();
     let mut start_line: Option<usize> = None;
+    let mut start_col: Option<usize> = None;
+    let mut start_insert = false;
     let mut path: Option<PathBuf> = None;
     let mut cli_theme: Option<String> = None;
     let mut no_spell = false;
@@ -50,6 +56,15 @@ fn main() {
             i += 2;
         } else if let Some(rest) = arg.strip_prefix("--theme=") {
             cli_theme = Some(rest.to_string());
+            i += 1;
+        } else if arg == "--col" && i + 1 < args.len() {
+            if let Ok(n) = args[i + 1].parse::<usize>() { start_col = Some(n); }
+            i += 2;
+        } else if let Some(rest) = arg.strip_prefix("--col=") {
+            if let Ok(n) = rest.parse::<usize>() { start_col = Some(n); }
+            i += 1;
+        } else if arg == "--insert" {
+            start_insert = true;
             i += 1;
         } else if arg == "--no-spell" {
             // Skip the auto-enable-on-Email branch in App::new. Used
@@ -164,6 +179,22 @@ fn main() {
             app.cur_col = 0;
             app.want_col = 0;
         }
+    }
+    if let Some(c) = start_col {
+        if c > 0 {
+            // `cur_col` is a byte offset; treat the requested column as
+            // a 1-indexed char position and map it to the byte boundary.
+            // Bound by the current line length (clamp, don't error).
+            let line = app.buf.line(app.cur_line);
+            let target_chars = c - 1;
+            let byte_off = line.char_indices().nth(target_chars).map(|(b, _)| b)
+                .unwrap_or(line.len());
+            app.cur_col = byte_off;
+            app.want_col = byte_off;
+        }
+    }
+    if start_insert {
+        app.mode = Mode::Insert;
     }
     app.render_all();
 
