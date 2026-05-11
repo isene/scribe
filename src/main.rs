@@ -5975,6 +5975,81 @@ impl App {
     fn handle_command(&mut self, _key: &str) -> bool { false }
 
     /// Returns true to quit the editor.
+    /// Vim's `:r filename` — read file contents and insert AFTER the
+    /// current line. Each line in the file becomes a new buffer line;
+    /// the cursor moves to the first inserted line. Goes through
+    /// `buf.apply` so the read is a single undo step.
+    fn read_file_into_buffer(&mut self, raw_path: &str) {
+        if raw_path.is_empty() {
+            self.set_status(" :r needs a filename", 196);
+            return;
+        }
+        // Expand `~/` → $HOME.
+        let path: PathBuf = if let Some(rest) = raw_path.strip_prefix("~/") {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from).unwrap_or_default();
+            home.join(rest)
+        } else if raw_path == "~" {
+            std::env::var_os("HOME")
+                .map(PathBuf::from).unwrap_or_default()
+        } else {
+            PathBuf::from(raw_path)
+        };
+        let mut text = match std::fs::read_to_string(&path) {
+            Ok(s)  => s,
+            Err(e) => {
+                self.set_status(&format!(" :r failed: {}", e), 196);
+                return;
+            }
+        };
+        // Ensure inserted content ends with a newline so the read file's
+        // last line doesn't merge with the buffer's next line.
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+
+        // Insertion point: byte just past line N's trailing newline
+        // (i.e. start of line N+1), so the file content lands as
+        // brand-new lines immediately below the cursor's line. ropey's
+        // line(N).len_bytes() includes the trailing \n when present.
+        let cur_line = self.cur_line;
+        let line_start = self.buf.line_byte_offset(cur_line);
+        let line_len_bytes = self.buf.line(cur_line).len();
+        let mut insert_pos = line_start + line_len_bytes;
+
+        // If we're at the last line and the buffer doesn't end with a
+        // newline, the insertion point sits flush with the last char —
+        // prepend a newline to the read text so we don't merge.
+        let buf_len = self.buf.rope.len_bytes();
+        if insert_pos >= buf_len {
+            insert_pos = buf_len;
+            let ends_with_nl = if buf_len == 0 {
+                true
+            } else {
+                let last_char_byte = buf_len - 1;
+                self.buf.rope.byte_slice(last_char_byte..buf_len)
+                    .chars().any(|c| c == '\n')
+            };
+            if !ends_with_nl && !text.is_empty() {
+                text.insert(0, '\n');
+            }
+        }
+
+        // Count inserted lines so we can report and so the cursor lands
+        // on the first one.
+        let inserted_lines = text.matches('\n').count();
+        self.buf.apply(insert_pos, insert_pos, &text);
+
+        // Move the cursor onto the first inserted line.
+        let target_line = (cur_line + 1).min(self.buf.line_count().saturating_sub(1));
+        self.cur_line = target_line;
+        self.cur_col = 0;
+        self.set_status(
+            &format!(" \"{}\"  {}L read", path.display(), inserted_lines),
+            244,
+        );
+    }
+
     fn execute_command(&mut self, cmd: &str) -> bool {
         match cmd {
             "w" | "W" => {
@@ -6013,6 +6088,22 @@ impl App {
                         self.set_status(" open failed", 196);
                     }
                 }
+                false
+            }
+            // Vim's `:r filename` — read the contents of a file and
+            // insert them AFTER the current line. Each line of the file
+            // lands as a new buffer line; the cursor moves to the first
+            // inserted line. `~/` is expanded to $HOME. Also accepts
+            // `:read filename` (the longer form). `:read` with no
+            // argument continues to toggle reading mode (handled below).
+            other if other.starts_with("r ")
+                    || (other.starts_with("read ") && !other.eq("reading"))
+                    || other.starts_with("read!") =>
+            {
+                let arg = if let Some(rest) = other.strip_prefix("read ") { rest }
+                          else if let Some(rest) = other.strip_prefix("r ") { rest }
+                          else { other.strip_prefix("read!").unwrap_or("") };
+                self.read_file_into_buffer(arg.trim());
                 false
             }
             "ab" | "abbrev" => {
