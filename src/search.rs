@@ -20,7 +20,13 @@ impl SearchState {
 
     pub fn set(&mut self, pattern: &str, dir: Direction) {
         self.pattern = pattern.into();
-        self.regex = Regex::new(pattern).ok();
+        // Multi-line on so `^` / `$` match line bounds (vim semantics).
+        // Rust's `regex` crate defaults to `^` = start-of-string, which
+        // silently broke `^foo` searches against the buffer's body.
+        self.regex = regex::RegexBuilder::new(pattern)
+            .multi_line(true)
+            .build()
+            .ok();
         self.direction = dir;
     }
 

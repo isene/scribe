@@ -2595,6 +2595,21 @@ impl App {
         if let Some(q) = self.try_keymap("normal", key) { return q; }
         self.status = None;
 
+        // Ctrl-y in Normal mode: yank the whole buffer to the system
+        // clipboard. Equivalent to `ggVG"+y` in vim and obeys the same
+        // OSC-52 broadcast every other yank goes through, so it lands
+        // on the X selection / Wayland clipboard without external help
+        // (xclip / wl-copy / etc.). The key string is `C-Y` — scribe
+        // encodes every Ctrl-letter chord in uppercase regardless of
+        // shift state, matching the convention used by every other
+        // `C-A` / `C-D` / `C-V` binding in this file.
+        if key == "C-Y" && self.pending.operator.is_none() {
+            self.pending.clear();
+            let last = self.buf.line_count().saturating_sub(1);
+            self.execute_op_linewise_yank(0, last);
+            return false;
+        }
+
         // Macro register-prefix dispatch. Done first so a count / operator
         // already in flight (which we don't want anyway) is not considered.
         if self.macro_prefix {
@@ -2658,6 +2673,33 @@ impl App {
             if let Some(c) = key.chars().next() {
                 if c.is_ascii_alphabetic() {
                     if let Some(&byte) = self.marks.get(&c) {
+                        // Operator-pending: `d'a` / `y'a` / `c'a` (and
+                        // ``-variants) act as a range from the cursor's
+                        // current position to the mark. `'` selects a
+                        // linewise range (the full lines on both ends),
+                        // `` ` `` selects a charwise range (exact byte
+                        // bounds). Matches vim semantics — these are
+                        // common in user macros that anchor a region
+                        // and then operate on it.
+                        if let Some(opc) = self.pending.operator {
+                            let cur_byte = self.cursor_byte();
+                            if exact {
+                                let (start, end) = if byte <= cur_byte {
+                                    (byte, cur_byte)
+                                } else {
+                                    (cur_byte, byte)
+                                };
+                                self.execute_op_charwise(opc, start, end);
+                            } else {
+                                let cur_line = self.cur_line;
+                                let mark_line = self.buf.byte_to_line_col(byte).0;
+                                let lo = cur_line.min(mark_line);
+                                let hi = cur_line.max(mark_line);
+                                self.execute_op_linewise(lo, hi - lo);
+                            }
+                            self.pending.clear();
+                            return false;
+                        }
                         self.cursor_to_byte(byte);
                         if !exact {
                             // `'a` lands on first non-blank of the
@@ -2668,6 +2710,7 @@ impl App {
                         }
                     } else {
                         self.set_status(&format!(" mark '{} not set", c), 196);
+                        self.pending.clear();
                     }
                 }
             }
@@ -2679,7 +2722,12 @@ impl App {
             self.mark_set_prefix = true;
             return false;
         }
-        if (key == "'" || key == "`") && self.pending.operator.is_none()
+        // `'<mark>` / `` `<mark> `` enter mark-jump prefix even when an
+        // operator is pending — `d'd`, `y'a`, `c'b` are linewise (`'`)
+        // or charwise (`` ` ``) deletes / yanks / changes from the
+        // current position to the mark. The actual op completion
+        // happens in the mark_jump_prefix dispatch above.
+        if (key == "'" || key == "`")
             && self.pending.count1.is_none() && self.pending.text_object.is_none()
         {
             self.mark_jump_prefix = true;
@@ -3154,12 +3202,23 @@ impl App {
                 Some(b)
             }
             "RIGHT" => {
+                // Arrows wrap across line boundaries (vim's whichwrap=<,>
+                // default). At end of line, step into the first char of
+                // the next line rather than snapping back via the Normal
+                // mode col cap. `l` (no wrap) is a separate binding above.
                 let s = self.buf.rope.to_string();
                 let mut b = cur;
                 for _ in 0..count {
                     if b >= s.len() { break; }
                     let mut p = b + 1;
                     while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+                    // If p sits on a `\n`, advance one more so the
+                    // cursor lands at col 0 of the next line, not on
+                    // the newline (where Normal-mode clamp would push
+                    // it back to end-of-line).
+                    if p < s.len() && s.as_bytes()[p] == b'\n' {
+                        p += 1;
+                    }
                     b = p;
                 }
                 Some(b)
@@ -3178,6 +3237,20 @@ impl App {
             }
             "0" | "HOME" => Some(motion::line_start(&self.buf, cur)),
             "^"          => Some(motion::line_first_nonblank(&self.buf, cur)),
+            // `-` — move to first non-blank of the previous line (vim
+            // linewise motion). With a count, jumps N lines up.
+            // Operator-pending it acts linewise: `d-` deletes the
+            // current line + previous line. Symmetric to `+` (next line)
+            // which scribe doesn't have either yet; add when needed.
+            "-" => {
+                let target_line = self.cur_line.saturating_sub(count.max(1));
+                let off = self.buf.line_byte_offset(target_line);
+                let line = self.buf.line(target_line);
+                let first_nonblank = line.bytes()
+                    .position(|b| b != b'\t' && b != b' ')
+                    .unwrap_or(0);
+                Some(off + first_nonblank)
+            }
             "$" | "END"  => {
                 let mut end = motion::line_end(&self.buf, cur);
                 // For motion (no operator), step back one char so we don't
@@ -3242,6 +3315,14 @@ impl App {
     /// quit.
     fn handle_normal_action(&mut self, key: &str, count: usize, _reg: Option<char>) -> bool {
         match key {
+            // Vim's `K` — keyword lookup. Hands the word under the
+            // cursor (with a paragraph of surrounding context) to
+            // `claude -p` and shows the answer in a centred popup.
+            // Same path as `\w`; both bindings exist because the
+            // muscle-memory for `K` is too strong to give up but the
+            // leader cheatsheet only lists letter mnemonics.
+            "K" => self.lookup_word_with_claude(),
+
             // Page motion (not currently used as motion-target for ops).
             "PgDOWN" | "C-D" => {
                 let step = (self.main_p.h as usize) / 2;
@@ -3517,17 +3598,57 @@ impl App {
         let keys = parse_macro_text(rhs);
         self.map_depth += 1;
         let mut quit = false;
-        for k in keys {
+        let mut i = 0;
+        while i < keys.len() {
+            let k = &keys[i];
+            // When a macro fires `/` or `?` in Normal mode, vim drains
+            // subsequent keys into the search pattern until <CR> (submit)
+            // or <Esc> (cancel). The interactive `footer.ask()` path
+            // would instead block on stdin and ignore the rest of the
+            // macro — so consume the pattern here directly and call
+            // `search.set()` without prompting.
+            if (k == "/" || k == "?") && matches!(self.mode, Mode::Normal) {
+                let dir = if k == "/" { Direction::Forward } else { Direction::Backward };
+                let mut pattern = String::new();
+                let mut cancelled = false;
+                i += 1;
+                while i < keys.len() {
+                    let tk = &keys[i];
+                    i += 1;
+                    if tk == "ENTER" { break; }
+                    if tk == "ESC" { cancelled = true; break; }
+                    // BS / DEL inside the pattern erase the last char.
+                    if tk == "BACKSPACE" || tk == "DEL" {
+                        pattern.pop();
+                        continue;
+                    }
+                    // Single-char tokens append literally; named-key
+                    // tokens (arrows, etc.) are ignored.
+                    if tk.chars().count() == 1 {
+                        pattern.push_str(tk);
+                    }
+                }
+                if !cancelled && !pattern.is_empty() {
+                    self.search.set(&pattern, dir);
+                    if let Some(byte) = self.search_next_at(self.cursor_byte(), dir) {
+                        self.cursor_to_byte(byte);
+                    } else {
+                        self.set_status(&format!(" pattern not found: {}", pattern), 196);
+                    }
+                }
+                continue;
+            }
             quit = match self.mode {
-                Mode::Normal      => self.handle_normal(&k),
-                Mode::Insert      => self.handle_insert(&k),
-                Mode::Replace     => self.handle_replace(&k),
+                Mode::Normal      => self.handle_normal(k),
+                Mode::Insert      => self.handle_insert(k),
+                Mode::Replace     => self.handle_replace(k),
                 Mode::Visual      |
                 Mode::VisualLine  |
-                Mode::VisualBlock => self.handle_visual(&k),
+                Mode::VisualBlock => self.handle_visual(k),
                 Mode::Command     => false,
             };
             if quit { break; }
+            i += 1;
         }
         self.map_depth -= 1;
         quit
@@ -3859,6 +3980,12 @@ impl App {
             }
             // Cheatsheet popup.
             "?" => self.show_hl_cheatsheet(),
+            // Word lookup: send the word under the cursor plus a few
+            // lines of surrounding context to `claude -p` and show the
+            // response in a popup. Vim's `K` is also wired up, but
+            // `\w` is the discoverable variant from the leader
+            // cheatsheet (mnemonic: **w**ord).
+            "w" => self.lookup_word_with_claude(),
             // Next template element ("=$" → append).
             " " => self.jump_next_template(),
             _ => { self.set_status(&format!(" leader \\{}: unknown", key), 244); }
@@ -4763,6 +4890,33 @@ impl App {
                 self.apply_visual_op('y');
                 return false;
             }
+            // `<` / `>` shift the selection. In vim these are always
+            // linewise even when the visual selection is charwise —
+            // partial-line indenting isn't a concept. apply_visual_op
+            // handles the VisualLine / VisualBlock dispatch already;
+            // for charwise Visual we widen the range to whole lines
+            // here so the user sees the same behaviour vim ships.
+            ">" | "<" => {
+                let opc = key.chars().next().unwrap();
+                if matches!(self.mode, Mode::Visual) {
+                    // Force linewise: snap to line bounds and call
+                    // execute_op_linewise directly so the charwise
+                    // selection edge cases don't slip through.
+                    self.pending.operator = Some(opc);
+                    let cur = self.cursor_byte();
+                    let lo_byte = cur.min(self.visual_anchor);
+                    let hi_byte = cur.max(self.visual_anchor);
+                    let l1 = self.buf.byte_to_line_col(lo_byte).0;
+                    let l2 = self.buf.byte_to_line_col(hi_byte).0;
+                    self.cur_line = l1;
+                    self.execute_op_linewise(l1, l2 - l1);
+                    self.mode = Mode::Normal;
+                    self.pending.clear();
+                } else {
+                    self.apply_visual_op(opc);
+                }
+                return false;
+            }
             "~" => {
                 self.apply_visual_case(CaseOp::Toggle);
                 return false;
@@ -4826,6 +4980,18 @@ impl App {
             };
             if consumed { self.pending.clear(); return false; }
         }
+
+        // Selection wraps across line boundaries on `h`/`l` in
+        // Visual / VisualLine. Vim defaults stop at the line edge
+        // here, which is annoying when marking a sentence that
+        // straddles a soft wrap: you can't extend past the line
+        // end without a separate `j` step. Map `h` → `LEFT` and
+        // `l` → `RIGHT` (already wrap-aware) in the non-block
+        // visual modes only — VisualBlock still wants column-locked
+        // semantics, handled above.
+        let key = if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            match key { "h" => "LEFT", "l" => "RIGHT", k => k }
+        } else { key };
 
         // Otherwise treat as motion to extend selection.
         if let Some(target) = self.parse_motion(key, self.pending.count()) {
@@ -5412,6 +5578,13 @@ impl App {
             "RIGHT" => self.move_right_wrap(),
             "UP"    => self.move_up(),
             "DOWN"  => self.move_down(),
+            // Ctrl-Up / Ctrl-Down move the current line (parity with
+            // Normal mode). Capturing-insert recording sees this as
+            // an opaque action; replay via dot still works because
+            // the line motion is part of LastChange::Insert's text
+            // boundary, not its content.
+            "C-UP"   => self.move_line_up(),
+            "C-DOWN" => self.move_line_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
             "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
             "BACK" | "BACKSPACE" | "C-H" => {
@@ -6482,6 +6655,179 @@ impl App {
     ///
     /// All edits go through one `begin_compound` / `end_compound` pair so
     /// a single `u` reverses the entire Claude turn.
+    /// Term lookup. Picks what to send Claude based on mode:
+    ///   * Visual / VisualLine — the current selection (the user
+    ///     deliberately marked the phrase, send it whole). Lets the
+    ///     user explain multi-word expressions, idioms, or full
+    ///     sentences without leaving Normal mode just to widen the
+    ///     `word_at_cursor` span.
+    ///   * Normal — the WORD-style token under the cursor: the
+    ///     contiguous non-whitespace span, with surrounding paired
+    ///     punctuation trimmed. Catches compound terms like `F&O`,
+    ///     `C++`, `user@host`, `bin/scribe` that `iskeyword`-style
+    ///     extraction would split. Falls back to `word_at_cursor`
+    ///     for spell-misflag matches.
+    /// Always pairs the term with ±5 lines of surrounding context
+    /// and asks for a one- or two-sentence explanation. The reply
+    /// lands in a centred read-only popup; ESC / q / Enter dismisses.
+    /// Bound to `\w` (leader; mnemonic: **w**ord) and `K` (vim
+    /// muscle memory).
+    fn lookup_word_with_claude(&mut self) {
+        // Pull the term + a label for the popup heading. Visual modes
+        // win even if the selection contains only a single word — the
+        // user's explicit gesture beats heuristics.
+        let (term, popup_label) = if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            let (a, b) = if matches!(self.mode, Mode::VisualLine) {
+                self.visual_line_range()
+            } else {
+                self.visual_range()
+            };
+            let text: String = self.buf.rope.byte_slice(a..b).to_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                self.set_status(" empty selection", 244);
+                return;
+            }
+            let label = if trimmed.chars().count() > 40 {
+                let mut t: String = trimmed.chars().take(37).collect();
+                t.push_str("…");
+                t
+            } else {
+                trimmed.to_string()
+            };
+            (trimmed.to_string(), label)
+        } else {
+            let Some(token) = self.token_at_cursor() else {
+                self.set_status(" no token under cursor", 244);
+                return;
+            };
+            let label = token.clone();
+            (token, label)
+        };
+
+        let total = self.buf.line_count();
+        if total == 0 { return; }
+        let lo = self.cur_line.saturating_sub(5);
+        let hi = (self.cur_line + 5).min(total.saturating_sub(1));
+        let context: String = (lo..=hi)
+            .map(|i| self.buf.line(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        self.set_status(&format!(" looking up “{}”…", popup_label), 244);
+        self.render_footer();
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+
+        // Phrase the prompt so multi-word expressions and full
+        // sentences read naturally; "the word X" works fine for a
+        // single token and still parses correctly for "the phrase X".
+        let prompt = format!(
+            "Explain \"{term}\" as it is used in the snippet below. \
+             One or two short sentences. Stay specific to *this* sense / \
+             usage — if it's technical, give the technical reading; if \
+             it's a name, identify it; if it's an idiom or phrase, gloss \
+             the whole expression. No preamble, no quoting back the \
+             snippet, no closing pleasantries.",
+            term = term
+        );
+        let answer = match claude_run(&prompt, &context) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                self.set_status(&format!(" claude: {}", e), 196);
+                return;
+            }
+        };
+        if answer.is_empty() {
+            self.set_status(" claude returned empty response", 196);
+            return;
+        }
+
+        // Size the popup to the response, capped to terminal bounds.
+        let (cols, rows) = Crust::terminal_size();
+        let pad: u16 = 4;
+        let popup_w = cols.saturating_sub(pad).min(80).max(40);
+        let inner_w = (popup_w as usize).saturating_sub(4).max(20);
+        let wrapped = wrap_to_width(&answer, inner_w);
+        let popup_h = (wrapped.len() as u16 + 6).min(rows.saturating_sub(pad)).max(8);
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push(format!("  {}", crust::style::bold(&crust::style::fg(&popup_label, 220))));
+        lines.push(format!("  {}", crust::style::fg(&"-".repeat(inner_w), 238)));
+        for ln in &wrapped {
+            lines.push(format!("  {}", ln));
+        }
+        lines.push(String::new());
+        lines.push(format!("  {}  Close", crust::style::fg("ESC / q", 244)));
+
+        // Hide the terminal cursor while the popup is up. Without
+        // this the cursor stays parked at the buffer position behind
+        // the popup and renders as a stray red block — visible
+        // through the popup's interior.
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            if k == "ESC" || k == "q" || k == "ENTER" { break; }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        // Show the cursor again. `render_all` repositions it via
+        // `position_cursor` which also emits `\x1b[?25h`, but the
+        // explicit show here covers the (rare) case where rendering
+        // is short-circuited by a pending mode change.
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+        self.set_status("", 244);
+        self.render_all();
+    }
+
+    /// WORD-style token at the cursor: the contiguous non-whitespace
+    /// span around `cur_col`, stripped of paired punctuation that
+    /// almost never belongs to the term being looked up
+    /// (`,.;:!?)]}` at the tail, `([{` at the head). Used by `K` /
+    /// `\w` so compound terms like `F&O`, `C++`, `user@host.com`,
+    /// `bin/scribe` come through whole. Falls back to the narrower
+    /// `word_at_cursor` when the WORD heuristic comes up empty
+    /// (cursor on whitespace, etc.).
+    fn token_at_cursor(&self) -> Option<String> {
+        // Prefer a misspelling range if the cursor sits on one — the
+        // spell checker already isolated the exact word the user is
+        // likely staring at.
+        if let Some(m) = self.misspelling_at_cursor() {
+            return Some(m.word);
+        }
+        let line = self.buf.line(self.cur_line);
+        if line.is_empty() { return self.word_at_cursor(); }
+        let bytes = line.as_bytes();
+        let cur = self.cur_col.min(bytes.len());
+        // Walk backwards over non-whitespace bytes.
+        let mut s = cur;
+        while s > 0 && !bytes[s - 1].is_ascii_whitespace() { s -= 1; }
+        let mut e = cur;
+        while e < bytes.len() && !bytes[e].is_ascii_whitespace() { e += 1; }
+        if s >= e { return self.word_at_cursor(); }
+        while s > 0 && !line.is_char_boundary(s) { s -= 1; }
+        while e < bytes.len() && !line.is_char_boundary(e) { e += 1; }
+        let mut token = line[s..e].to_string();
+        // Trim wrappers: outer parens / brackets / quotes / trailing
+        // sentence punctuation. Stops as soon as a non-strippable
+        // char appears, so `f(x)` stays `f(x)` (closing paren is
+        // balanced by the opening one inside).
+        while let Some(c) = token.chars().last() {
+            if matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'') {
+                token.pop();
+            } else { break; }
+        }
+        while let Some(c) = token.chars().next() {
+            if matches!(c, '(' | '[' | '{' | '"' | '\'') {
+                token.remove(0);
+            } else { break; }
+        }
+        if token.is_empty() { self.word_at_cursor() } else { Some(token) }
+    }
+
     fn run_claude_command(&mut self, raw_prompt: &str) {
         let (input_start, input_end, input_text, replace) = self.claude_input(raw_prompt);
         let prompt = self.claude_prompt(raw_prompt);
@@ -6641,6 +6987,38 @@ impl App {
 /// Spawn `claude -p PROMPT` with `input` on stdin, return the captured
 /// stdout on success or a short error message on failure. Synchronous —
 /// blocks until claude exits.
+/// Simple greedy word-wrap. Preserves explicit line breaks from the
+/// input (newline → new wrapped line) and splits on whitespace within
+/// each paragraph. Width is in visible columns; ANSI escapes are not
+/// expected in the input (claude responses are plain text).
+fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out: Vec<String> = Vec::new();
+    for paragraph in s.split('\n') {
+        if paragraph.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let wlen = word.chars().count();
+            if line.is_empty() {
+                // Long word that exceeds the column on its own: take
+                // it whole and rely on the renderer's pane to clip.
+                line.push_str(word);
+            } else if line.chars().count() + 1 + wlen <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line.push_str(word);
+            }
+        }
+        if !line.is_empty() { out.push(line); }
+    }
+    out
+}
+
 fn claude_run(prompt: &str, input: &str) -> Result<String, String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
