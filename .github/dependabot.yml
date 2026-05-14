@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # GitHub Actions versions only. Cargo is omitted on purpose: this
+  # crate depends on sibling path-deps (../crust, ../glow, etc.)
+  # which the dependabot updater container can't resolve, so
+  # every Cargo scan fails. Security alerts still surface via the
+  # repo Security tab (GitHub-side, not dependabot).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
