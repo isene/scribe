@@ -6090,7 +6090,10 @@ impl App {
         // ~100 chars, so cap width there and let height take the rest.
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(110).max(50);
-        let popup_h = (rows.saturating_sub(2)).max(12);
+        // saturating_sub(4) leaves 2 rows top + 2 rows bottom so the
+        // popup's top border clears scribe's header bar and the bottom
+        // border clears the footer/status line.
+        let popup_h = (rows.saturating_sub(4)).max(12);
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
 
         let topic_label = match topic.trim().to_lowercase().as_str() {
@@ -6135,7 +6138,10 @@ impl App {
         use std::io::Write as _;
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(78).max(50);
-        let popup_h = (rows.saturating_sub(2)).max(12);
+        // saturating_sub(4) leaves 2 rows top + 2 rows bottom so the
+        // popup's top border clears scribe's header bar and the bottom
+        // border clears the footer/status line.
+        let popup_h = (rows.saturating_sub(4)).max(12);
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
 
         let head = |s: &str| style::bold(&style::fg(s, 81));
