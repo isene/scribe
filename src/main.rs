@@ -4051,6 +4051,7 @@ impl App {
 
     /// `\?` cheatsheet popup. Modal; ESC dismisses.
     fn show_hl_cheatsheet(&mut self) {
+        use std::io::Write as _;
         let popup_w = 64u16;
         let popup_h = 22u16;
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -4076,12 +4077,19 @@ impl App {
         lines.push(format!("  {}        export HTML / LaTeX / Markdown",    key("\\xh \\xl \\xm")));
         lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
         lines.push(format!("  {}  Close", key("ESC")));
+        // Hide the terminal cursor — otherwise it stays parked on the
+        // buffer beneath the popup and renders as a stray block (visible
+        // through the popup's interior).
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
             if k == "ESC" || k == "q" { break; }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
         self.render_all();
     }
 
@@ -5938,10 +5946,17 @@ impl App {
     /// helper is shared with the rest of the editor so it inherits all
     /// the editline niceties (history, cursor position, ESC-restore).
     fn show_config_popup(&mut self) {
+        use std::io::Write as _;
         let themes = highlight::available_themes();
         let popup_w = 60u16;
         let popup_h = 18u16;
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+
+        // Hide the terminal cursor — otherwise it stays parked on the
+        // buffer beneath the popup and renders as a stray block
+        // through the popup's interior.
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
 
         loop {
             let theme_idx = themes.iter().position(|t| **t == self.theme_name).unwrap_or(0);
@@ -6017,6 +6032,8 @@ impl App {
         }
         // Wipe the popup, repaint everything underneath.
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
         self.render_all();
     }
 
@@ -6049,28 +6066,277 @@ impl App {
         }
     }
 
-    /// Open the bundled README as an in-memory help buffer. The text is
-    /// embedded at compile time (`include_str!`) so `:help` works
-    /// without filesystem access. Buffer has no path → `:w` would
-    /// fail safely; users searching for terms use `/`, `n`, `N` as
-    /// usual. Close with `q` (clean — no save warning) to return.
+    /// Modal `:help` popup. Renders the embedded README (or HYPERLIST.md
+    /// when `topic` is `hl` / `hyperlist`) with the markdown highlighter
+    /// and shows it in a near-full-screen scrollable popup. ESC / `q`
+    /// dismisses and returns to the current buffer untouched — no save,
+    /// no buffer swap, no friction.
     fn open_help(&mut self, topic: &str) {
+        use std::io::Write as _;
         const HELP_MAIN: &str = include_str!("../README.md");
         const HELP_HL:   &str = include_str!("../HYPERLIST.md");
-        if self.buf.dirty {
-            self.set_status(" save current buffer first (or Q to discard)", 196);
-            return;
-        }
         let text = match topic.trim().to_lowercase().as_str() {
             "hl" | "hyperlist" => HELP_HL,
             _ => HELP_MAIN,
         };
-        self.buf = Buffer::from_str(text, FileKind::Source("md".into()));
-        self.cur_line = 0;
-        self.cur_col = 0;
-        self.scroll = 0;
-        self.want_col = 0;
-        self.set_status(" :help — / to search, q to close, :e <file> to return", 244);
+        // Run the markdown highlighter over the embedded text. The
+        // `highlight_markdown` (not `_source`) variant formats tables
+        // into aligned column rules, which is what we want for a
+        // read-only viewer.
+        let line_count = text.lines().count();
+        let rendered = highlight::highlight_markdown(text, line_count + 1);
+
+        // Near-full-screen popup. The README has tables sized up to
+        // ~100 chars, so cap width there and let height take the rest.
+        let (cols, rows) = Crust::terminal_size();
+        let popup_w = (cols.saturating_sub(2)).min(110).max(50);
+        let popup_h = (rows.saturating_sub(2)).max(12);
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+
+        let topic_label = match topic.trim().to_lowercase().as_str() {
+            "hl" | "hyperlist" => "HyperList",
+            _ => "README",
+        };
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("  {}",
+            style::bold(&style::fg(&format!(":help — {} (ESC/q close, j/k scroll)", topic_label), 220))));
+        lines.push(String::new());
+        for ln in rendered.lines() {
+            lines.push(ln.to_string());
+        }
+
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            match k.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN"   => { popup.pane.ix = popup.pane.ix.saturating_add(1); popup.pane.refresh(); }
+                "k" | "UP"     => { popup.pane.ix = popup.pane.ix.saturating_sub(1); popup.pane.refresh(); }
+                "PgDOWN" | " " => popup.pane.pagedown(),
+                "PgUP"         => popup.pane.pageup(),
+                "g" | "HOME"   => popup.pane.top(),
+                "G" | "END"    => popup.pane.bottom(),
+                _ => {}
+            }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+        self.render_all();
+    }
+
+    /// `:keys` popup — comprehensive keybinding cheatsheet, grouped by
+    /// category. Modal, scrollable, ESC / `q` to close. Built once per
+    /// invocation so adding a binding only requires updating one spot
+    /// in this function (not regenerating the README first).
+    fn show_keys_popup(&mut self) {
+        use std::io::Write as _;
+        let (cols, rows) = Crust::terminal_size();
+        let popup_w = (cols.saturating_sub(2)).min(78).max(50);
+        let popup_h = (rows.saturating_sub(2)).max(12);
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+
+        let head = |s: &str| style::bold(&style::fg(s, 81));
+        let key  = |s: &str| style::fg(s, 220);
+        let rule = style::fg(&"-".repeat(popup_w as usize - 4), 238);
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push(format!("  {}",
+            style::bold(&style::fg("Scribe — keybindings (:keys)", 220))));
+        lines.push(format!("  {}", rule));
+
+        let row = |k: &str, desc: &str| -> String {
+            format!("  {:<22}  {}", key(k), desc)
+        };
+
+        // MOTION
+        lines.push(format!("  {}", head("MOTION")));
+        for (k, d) in [
+            ("h j k l",        "left / down / up / right"),
+            ("0  ^  $",        "line start / first non-blank / end"),
+            ("HOME / END",     "line start / end"),
+            ("gg  G  12G",     "first / last line / line N"),
+            ("w b e",          "next / prev word, end of word"),
+            ("W B",            "WORD (whitespace-delimited)"),
+            ("f{c} F{c}",      "jump on next / prev c on line"),
+            ("t{c} T{c}",      "jump before next / prev c on line"),
+            ("Ctrl-D / Ctrl-U","half-page down / up"),
+            ("PgDn / PgUp",    "full page down / up"),
+            ("*  #",           "search word under cursor"),
+            ("n  N",           "next / prev search match"),
+            ("K",              "Claude lookup for word under cursor"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // MODES
+        lines.push(format!("  {}", head("MODES")));
+        for (k, d) in [
+            ("i  a",           "insert before / after cursor"),
+            ("I  A",           "insert at line start / end"),
+            ("o  O",           "open new line below / above"),
+            ("s  S",           "substitute char / line, enter Insert"),
+            ("v  V  Ctrl-V",   "visual char / line / block"),
+            (":",              "command mode"),
+            ("Esc",            "return to Normal"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // EDIT
+        lines.push(format!("  {}", head("EDIT")));
+        for (k, d) in [
+            ("x  X",           "delete char fwd / back"),
+            ("r{c}",           "replace char under cursor"),
+            ("J  ~",           "join below / toggle case"),
+            ("p  P",           "paste after / before"),
+            ("u  Ctrl-R",      "undo / redo"),
+            ("Ctrl-A / Ctrl-X","increment / decrement number or ISO date"),
+            ("Ctrl-Up/Down",   "swap current line with above / below"),
+            (".",              "dot-repeat last change"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // OPERATORS
+        lines.push(format!("  {}", head("OPERATORS  +  motion / text-object")));
+        for (k, d) in [
+            ("d  c  y",        "delete / change / yank"),
+            (">  <",           "indent / outdent"),
+            ("gq",             "text-wrap"),
+            ("dd cc yy",       "linewise (also  >>  <<  gqq)"),
+            ("D  C  Y",        "to end of line"),
+            ("(examples)",     "5dw  d3w  cgg  yG  c$  >ap  gqap"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // TEXT OBJECTS
+        lines.push(format!("  {}", head("TEXT OBJECTS")));
+        for (k, d) in [
+            ("iw  aw",         "word (inner / around)"),
+            ("i\"  a\"",        "string (also '  `)"),
+            ("i(  a(",         "parens (also [ { <)"),
+            ("ib  iB",         "shortcut for ()  / {}"),
+            ("ip  ap",         "paragraph"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // REGISTERS
+        lines.push(format!("  {}", head("REGISTERS")));
+        for (k, d) in [
+            ("\"a ... \"z",     "named slots ( \"ay$ → yank into a )"),
+            ("\"0",             "last yank only"),
+            ("\"\"",             "unnamed (default for p / P)"),
+            ("\"+  \"*",         "system clipboard (OSC 52)"),
+            (":reg",           "inspector popup"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // SEARCH + SUBSTITUTE
+        lines.push(format!("  {}", head("SEARCH / SUBSTITUTE")));
+        for (k, d) in [
+            ("/pat  ?pat",     "regex forward / backward"),
+            (":s/p/r/[gi]",    "substitute on current line"),
+            (":%s/p/r/[gi]",   "substitute on whole buffer"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // MARKS
+        lines.push(format!("  {}", head("MARKS")));
+        for (k, d) in [
+            ("m{a-z}",         "set mark"),
+            ("'{a-z}",         "jump to mark (line start, first non-blank)"),
+            ("`{a-z}",         "jump to mark (exact column)"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // MACROS
+        lines.push(format!("  {}", head("MACROS")));
+        for (k, d) in [
+            ("M{reg}",         "start recording; M to stop"),
+            ("@{reg}  @@",     "replay (last)"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // SPELL
+        lines.push(format!("  {}", head("SPELL")));
+        for (k, d) in [
+            ("]s  [s",         "next / prev misspelling"),
+            ("z=",             "suggestions (numbered)"),
+            ("zg",             "add word at cursor to personal dict"),
+            (":set spell",     "toggle (also  :set nospell)"),
+            (":set spelllang=","switch dictionary (en_US, nb_NO, …)"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // FOLDS
+        lines.push(format!("  {}", head("FOLDS")));
+        for (k, d) in [
+            ("zo  zc  za",     "open / close / toggle fold"),
+            ("zR  zM",         "open all / close all"),
+            ("zs  zh",         "fold by section / heading"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // LEADER
+        lines.push(format!("  {}", head("LEADER  \\   (HyperList — full list via \\?)")));
+        for (k, d) in [
+            ("\\?",            "HyperList leader cheatsheet popup"),
+            ("\\w",            "Claude word lookup (same as K)"),
+            ("\\v  \\V  \\o",  "checkbox / +timestamp / in-progress"),
+            ("\\0 .. \\9",     "fold to level"),
+            ("\\e[ekd]",       "encrypt / decrypt / rekey"),
+            ("\\x[hlm]",       "export HTML / LaTeX / Markdown"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // COMMANDS
+        lines.push(format!("  {}", head("COMMANDS")));
+        for (k, d) in [
+            (":w  :wq  :q  :q!","save / save-quit / quit (! discards)"),
+            (":e <file>",      "edit file"),
+            (":help [topic]",  "README in a popup (topic: hl)"),
+            (":keys",          "this popup"),
+            (":reg",           "registers inspector"),
+            (":config",        "preferences popup"),
+            (":chat",          "launch Claude session"),
+            (":set ...",       "runtime settings (spell, lang, theme, …)"),
+            (":export <fmt>",  "html / latex / markdown / pdf"),
+        ] { lines.push(row(k, d)); }
+        lines.push(String::new());
+
+        // UI
+        lines.push(format!("  {}", head("UI")));
+        for (k, d) in [
+            ("Ctrl-L",         "redraw"),
+        ] { lines.push(row(k, d)); }
+
+        lines.push(String::new());
+        lines.push(format!("  {}", rule));
+        lines.push(format!("  {}  {}  {}  {}",
+            key("j/k"), key("PgUp/PgDn"), key("g/G"),
+            style::fg("scroll   ESC / q  close", 244)));
+
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            match k.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN"   => { popup.pane.ix = popup.pane.ix.saturating_add(1); popup.pane.refresh(); }
+                "k" | "UP"     => { popup.pane.ix = popup.pane.ix.saturating_sub(1); popup.pane.refresh(); }
+                "PgDOWN" | " " => popup.pane.pagedown(),
+                "PgUP"         => popup.pane.pageup(),
+                "g" | "HOME"   => popup.pane.top(),
+                "G" | "END"    => popup.pane.bottom(),
+                _ => {}
+            }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+        self.render_all();
     }
 
     /// `:reg` popup — list contents of all named registers (and the
@@ -6079,6 +6345,7 @@ impl App {
     /// Preview text is escaped (`<Esc>`, `<CR>`, …) so macros stay
     /// human-readable; long content is truncated at 60 chars.
     fn show_reg_popup(&mut self) {
+        use std::io::Write as _;
         let popup_w = 70u16;
         let popup_h = 22u16;
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -6121,6 +6388,8 @@ impl App {
         lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
         lines.push(format!("  {}  Close", style::fg("ESC", 220)));
 
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -6136,6 +6405,8 @@ impl App {
             }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
         self.render_all();
     }
 
@@ -6372,6 +6643,10 @@ impl App {
             }
             "reg" | "registers" | "display" => {
                 self.show_reg_popup();
+                false
+            }
+            "keys" | "keybindings" | "cheat" => {
+                self.show_keys_popup();
                 false
             }
             other if other.starts_with("show ") || other.starts_with("hide ") => {
