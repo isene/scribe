@@ -6307,6 +6307,7 @@ impl App {
             (":e <file>",      "edit file"),
             (":help [topic]",  "README in a popup (topic: hl)"),
             (":keys",          "this popup"),
+            (":map",           "your personal keymaps (scriberc [keymap])"),
             (":reg",           "registers inspector"),
             (":config",        "preferences popup"),
             (":chat",          "launch Claude session"),
@@ -6326,6 +6327,119 @@ impl App {
         lines.push(format!("  {}  {}  {}  {}",
             key("j/k"), key("PgUp/PgDn"), key("g/G"),
             style::fg("scroll   ESC / q  close", 244)));
+
+        print!("\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        popup.show(&lines.join("\n"));
+        loop {
+            let Some(k) = Input::getchr(None) else { break };
+            match k.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN"   => { popup.pane.ix = popup.pane.ix.saturating_add(1); popup.pane.refresh(); }
+                "k" | "UP"     => { popup.pane.ix = popup.pane.ix.saturating_sub(1); popup.pane.refresh(); }
+                "PgDOWN" | " " => popup.pane.pagedown(),
+                "PgUP"         => popup.pane.pageup(),
+                "g" | "HOME"   => popup.pane.top(),
+                "G" | "END"    => popup.pane.bottom(),
+                _ => {}
+            }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+        self.render_all();
+    }
+
+    /// `:map` popup — list the user's personal keymaps loaded from the
+    /// `[keymap]` section of `~/.config/scribe/scriberc`. Each map is
+    /// shown as a `mode  lhs` header followed by its `rhs` on an
+    /// indented next line so long RHS strings (typical for signature
+    /// templates with embedded `<CR>` / `<Esc>` tokens) don't have to
+    /// wrap inside a narrow column. Aliases: `:maps`, `:mappings`.
+    fn show_maps_popup(&mut self) {
+        use std::io::Write as _;
+        let (cols, rows) = Crust::terminal_size();
+        let popup_w = (cols.saturating_sub(2)).min(100).max(50);
+        let popup_h = (rows.saturating_sub(6)).max(12);
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        popup.pane.y = popup.pane.y.saturating_add(1);
+
+        let head = |s: &str| style::bold(&style::fg(s, 81));
+        let rule = style::fg(&"-".repeat(popup_w as usize - 4), 238);
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        lines.push(format!("  {}",
+            style::bold(&style::fg("Scribe — your personal keymaps (:map)", 220))));
+        lines.push(format!("  {}", rule));
+
+        if self.keymaps.is_empty() {
+            lines.push(format!("  {}",
+                style::fg("(no user keymaps defined)", 244)));
+            lines.push(String::new());
+            lines.push(format!("  {}", head("Add bindings to your scriberc")));
+            lines.push(format!("  {}", style::fg(
+                "~/.config/scribe/scriberc — start the section with `[keymap]`,", 244)));
+            lines.push(format!("  {}", style::fg(
+                "then one mapping per line:", 244)));
+            lines.push(String::new());
+            lines.push(format!("  {}", style::fg(
+                "    MODE  LHS  RHS", 81)));
+            lines.push(String::new());
+            lines.push(format!("  {}", style::fg(
+                "MODE is normal / insert / visual (case-insensitive).", 244)));
+            lines.push(format!("  {}", style::fg(
+                "LHS uses macro notation: literal chars, plus <CR>, <Esc>,", 244)));
+            lines.push(format!("  {}", style::fg(
+                "<C-Space>, etc. RHS keeps internal spaces; an RHS that starts", 244)));
+            lines.push(format!("  {}", style::fg(
+                "with `:` is fed straight to the command executor.", 244)));
+            lines.push(String::new());
+            lines.push(format!("  {}", head("Example")));
+            lines.push(format!("  {}",
+                style::fg("    normal  ø  ddO<CR><CR><Up>", 81)));
+        } else {
+            // Group by mode so the user sees normal-mode maps together,
+            // insert-mode together, etc.
+            let modes = ["normal", "insert", "visual"];
+            let mut shown_any_mode = false;
+            for mode in &modes {
+                let in_mode: Vec<&KeyMap> = self.keymaps.iter()
+                    .filter(|m| m.mode.eq_ignore_ascii_case(mode))
+                    .collect();
+                if in_mode.is_empty() { continue; }
+                if shown_any_mode { lines.push(String::new()); }
+                shown_any_mode = true;
+                lines.push(format!("  {}", head(&mode.to_uppercase())));
+                for m in &in_mode {
+                    let lhs_str = m.lhs.join("");
+                    lines.push(format!("  {}    {}",
+                        style::fg(&format!("{:<8}", lhs_str), 220),
+                        style::fg(&m.rhs, 81)));
+                }
+            }
+            // Catch any mode label not in the canonical three (defensive).
+            let other: Vec<&KeyMap> = self.keymaps.iter()
+                .filter(|m| !modes.iter().any(|x| m.mode.eq_ignore_ascii_case(x)))
+                .collect();
+            if !other.is_empty() {
+                if shown_any_mode { lines.push(String::new()); }
+                lines.push(format!("  {}", head("OTHER")));
+                for m in &other {
+                    let lhs_str = m.lhs.join("");
+                    lines.push(format!("  {:<10}  {:<8}  {}",
+                        style::fg(&m.mode, 244),
+                        style::fg(&lhs_str, 220),
+                        style::fg(&m.rhs, 81)));
+                }
+            }
+        }
+
+        lines.push(String::new());
+        lines.push(format!("  {}", rule));
+        lines.push(format!("  {}   {}",
+            style::fg(&format!("{} mapping(s)", self.keymaps.len()), 244),
+            style::fg("j/k scroll   ESC / q  close", 244)));
 
         print!("\x1b[?25l");
         let _ = std::io::stdout().flush();
@@ -6657,6 +6771,10 @@ impl App {
             }
             "keys" | "keybindings" | "cheat" => {
                 self.show_keys_popup();
+                false
+            }
+            "map" | "maps" | "mappings" => {
+                self.show_maps_popup();
                 false
             }
             other if other.starts_with("show ") || other.starts_with("hide ") => {
