@@ -20,7 +20,7 @@ mod spell;
 mod textobj;
 
 use buffer::{Buffer, FileKind};
-use crust::{Crust, Input, Pane, Popup};
+use crust::{Crust, Cursor, Input, Pane, Popup};
 use crust::style;
 use mode::Mode;
 use register::{Registers, Yank, YankKind};
@@ -2764,13 +2764,13 @@ impl App {
                 }
                 "n" => self.jump_next_misspelling(),
                 "p" => self.jump_prev_misspelling(),
-                // Quick spell toggles — pick lang and turn on, or off.
-                "N" => self.quick_spell("nb_NO"),
-                "E" => self.quick_spell("en_US"),
-                "O" => {
-                    self.spell_disable();
-                    self.set_status(" spell off", 244);
-                }
+                // Per-language quick toggles (`zN`, `zE`, etc.) and the
+                // off-switch (`zO`) live in the user's scriberc
+                // [keymap] section now, not here. Building the
+                // language picks into scribe baked one user's choices
+                // (en_US + nb_NO) into the source; user maps via
+                // `:spell <LANG>` and `:set nospell` keep it
+                // configurable and discoverable via `:map`.
                 "s" => self.showhide_word(true),
                 "h" => self.showhide_word(false),
                 "0" => {
@@ -4051,7 +4051,6 @@ impl App {
 
     /// `\?` cheatsheet popup. Modal; ESC dismisses.
     fn show_hl_cheatsheet(&mut self) {
-        use std::io::Write as _;
         let popup_w = 64u16;
         let popup_h = 22u16;
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -4080,16 +4079,14 @@ impl App {
         // Hide the terminal cursor — otherwise it stays parked on the
         // buffer beneath the popup and renders as a stray block (visible
         // through the popup's interior).
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
             if k == "ESC" || k == "q" { break; }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -5946,7 +5943,6 @@ impl App {
     /// helper is shared with the rest of the editor so it inherits all
     /// the editline niceties (history, cursor position, ESC-restore).
     fn show_config_popup(&mut self) {
-        use std::io::Write as _;
         let themes = highlight::available_themes();
         let popup_w = 60u16;
         let popup_h = 18u16;
@@ -5955,8 +5951,7 @@ impl App {
         // Hide the terminal cursor — otherwise it stays parked on the
         // buffer beneath the popup and renders as a stray block
         // through the popup's interior.
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
 
         loop {
             let theme_idx = themes.iter().position(|t| **t == self.theme_name).unwrap_or(0);
@@ -6032,8 +6027,7 @@ impl App {
         }
         // Wipe the popup, repaint everything underneath.
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -6072,7 +6066,6 @@ impl App {
     /// dismisses and returns to the current buffer untouched — no save,
     /// no buffer swap, no friction.
     fn open_help(&mut self, topic: &str) {
-        use std::io::Write as _;
         const HELP_MAIN: &str = include_str!("../README.md");
         const HELP_HL:   &str = include_str!("../HYPERLIST.md");
         let text = match topic.trim().to_lowercase().as_str() {
@@ -6110,8 +6103,7 @@ impl App {
             lines.push(ln.to_string());
         }
 
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -6127,8 +6119,7 @@ impl App {
             }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -6137,7 +6128,6 @@ impl App {
     /// invocation so adding a binding only requires updating one spot
     /// in this function (not regenerating the README first).
     fn show_keys_popup(&mut self) {
-        use std::io::Write as _;
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(78).max(50);
         // Height fits two rows of chrome top+bottom. After centering,
@@ -6158,8 +6148,14 @@ impl App {
             style::bold(&style::fg("Scribe — keybindings (:keys)", 220))));
         lines.push(format!("  {}", rule));
 
+        // Pad the plain key string to a fixed visible width, then
+        // apply the color. `{:<N}` would count ANSI escape bytes
+        // toward the width and leave the column jagged; using
+        // `crust::display_width` measures actual on-screen cells.
         let row = |k: &str, desc: &str| -> String {
-            format!("  {:<22}  {}", key(k), desc)
+            const KEY_COL: usize = 18;
+            let pad = " ".repeat(KEY_COL.saturating_sub(crust::display_width(k)));
+            format!("  {}{}  {}", key(k), pad, desc)
         };
 
         // MOTION
@@ -6271,11 +6267,15 @@ impl App {
         // SPELL
         lines.push(format!("  {}", head("SPELL")));
         for (k, d) in [
-            ("]s  [s",         "next / prev misspelling"),
+            ("]s  [s",         "next / prev misspelling (also  zn / zp)"),
             ("z=",             "suggestions (numbered)"),
             ("zg",             "add word at cursor to personal dict"),
+            ("zs  zh  z0",     "show / hide word, clear show-hide"),
+            (":spell <LANG>",  "enable + set language atomically (en_US, nb_NO, …)"),
+            (":spell",         "enable with the current language"),
             (":set spell",     "toggle (also  :set nospell)"),
-            (":set spelllang=","switch dictionary (en_US, nb_NO, …)"),
+            (":set spelllang=","switch dictionary without enabling"),
+            ("(per-lang)",     "wire quick keys in scriberc [keymap]  →  :map"),
         ] { lines.push(row(k, d)); }
         lines.push(String::new());
 
@@ -6328,8 +6328,7 @@ impl App {
             key("j/k"), key("PgUp/PgDn"), key("g/G"),
             style::fg("scroll   ESC / q  close", 244)));
 
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -6345,8 +6344,7 @@ impl App {
             }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -6357,7 +6355,6 @@ impl App {
     /// templates with embedded `<CR>` / `<Esc>` tokens) don't have to
     /// wrap inside a narrow column. Aliases: `:maps`, `:mappings`.
     fn show_maps_popup(&mut self) {
-        use std::io::Write as _;
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(100).max(50);
         let popup_h = (rows.saturating_sub(6)).max(12);
@@ -6441,8 +6438,7 @@ impl App {
             style::fg(&format!("{} mapping(s)", self.keymaps.len()), 244),
             style::fg("j/k scroll   ESC / q  close", 244)));
 
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -6458,8 +6454,7 @@ impl App {
             }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -6469,7 +6464,6 @@ impl App {
     /// Preview text is escaped (`<Esc>`, `<CR>`, …) so macros stay
     /// human-readable; long content is truncated at 60 chars.
     fn show_reg_popup(&mut self) {
-        use std::io::Write as _;
         let popup_w = 70u16;
         let popup_h = 22u16;
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -6512,8 +6506,7 @@ impl App {
         lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
         lines.push(format!("  {}  Close", style::fg("ESC", 220)));
 
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -6529,8 +6522,7 @@ impl App {
             }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.render_all();
     }
 
@@ -6750,6 +6742,30 @@ impl App {
             "set nospell" => {
                 self.spell_disable();
                 self.set_status(" spell off", 244);
+                false
+            }
+            // `:spell <LANG>` — atomic enable + set lang. Equivalent to
+            // `:set spelllang=LANG` followed by `:set spell` but in one
+            // shot, which is what user keymaps want for a single-key
+            // quick-toggle. `:spell` alone (no arg) just enables with
+            // the current lang.
+            "spell" => {
+                self.spell_enable();
+                if self.spell_enabled {
+                    self.set_status(
+                        &format!(" spell on ({}) — {} flagged",
+                            self.spell_lang, self.misspellings.len()),
+                        46);
+                }
+                false
+            }
+            other if other.starts_with("spell ") => {
+                let lang = other[6..].trim();
+                if lang.is_empty() {
+                    self.spell_enable();
+                } else {
+                    self.quick_spell(lang);
+                }
                 false
             }
             "help" | "h" => {
@@ -7168,8 +7184,7 @@ impl App {
         // this the cursor stays parked at the buffer position behind
         // the popup and renders as a stray red block — visible
         // through the popup's interior.
-        print!("\x1b[?25l");
-        let _ = std::io::stdout().flush();
+        Cursor::hide();
         popup.show(&lines.join("\n"));
         loop {
             let Some(k) = Input::getchr(None) else { break };
@@ -7180,8 +7195,7 @@ impl App {
         // `position_cursor` which also emits `\x1b[?25h`, but the
         // explicit show here covers the (rare) case where rendering
         // is short-circuited by a pending mode change.
-        print!("\x1b[?25h");
-        let _ = std::io::stdout().flush();
+        Cursor::show();
         self.set_status("", 244);
         self.render_all();
     }
