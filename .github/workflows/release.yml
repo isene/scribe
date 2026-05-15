@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scribe-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scribe-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: scribe-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: scribe-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scribe
+
+      - name: Checkout crust
+        uses: actions/checkout@v4
+        with:
+          repository: isene/crust
+          path: crust
+
+      - name: Checkout highlight
+        uses: actions/checkout@v4
+        with:
+          repository: isene/highlight
+          path: highlight
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build
+        working-directory: scribe
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        working-directory: scribe
+        run: |
+          cp target/${{ matrix.target }}/release/scribe ../${{ matrix.artifact }}
+          chmod +x ../${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download the binary for your platform:
+            ```bash
+            chmod +x scribe-*
+            ./scribe-linux-x86_64    # or your platform
+            ```
+
+            Optionally copy to your PATH:
+            ```bash
+            sudo cp scribe-linux-x86_64 /usr/local/bin/scribe
+            ```
+
+            ## Platforms
+            - `scribe-linux-x86_64` - Linux (Intel/AMD 64-bit)
+            - `scribe-linux-aarch64` - Linux (ARM 64-bit, Raspberry Pi)
+            - `scribe-macos-x86_64` - macOS (Intel)
+            - `scribe-macos-aarch64` - macOS (Apple Silicon)

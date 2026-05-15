@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  check:
+    name: Check & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scribe
+
+      - name: Checkout crust
+        uses: actions/checkout@v4
+        with:
+          repository: isene/crust
+          path: crust
+
+      - name: Checkout highlight
+        uses: actions/checkout@v4
+        with:
+          repository: isene/highlight
+          path: highlight
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: scribe
+        run: cargo build --release
+
+      - name: Test
+        working-directory: scribe
+        run: cargo test --release
+
+      - name: Binary size
+        working-directory: scribe
+        run: ls -lh target/release/scribe
