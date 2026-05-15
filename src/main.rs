@@ -6090,12 +6090,13 @@ impl App {
         // ~100 chars, so cap width there and let height take the rest.
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(110).max(50);
-        // saturating_sub(6) puts the centered popup top border one row
-        // below the header (y=3) instead of right under it, giving a
-        // bit of visual breathing room. Bottom border stays above the
-        // footer/status line.
+        // Height fits two rows of chrome top+bottom. After centering,
+        // shift y down one more row so the popup's top border doesn't
+        // sit immediately below the header (otherwise the two visually
+        // "melt" together).
         let popup_h = (rows.saturating_sub(6)).max(12);
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        popup.pane.y = popup.pane.y.saturating_add(1);
 
         let topic_label = match topic.trim().to_lowercase().as_str() {
             "hl" | "hyperlist" => "HyperList",
@@ -6139,12 +6140,13 @@ impl App {
         use std::io::Write as _;
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(78).max(50);
-        // saturating_sub(6) puts the centered popup top border one row
-        // below the header (y=3) instead of right under it, giving a
-        // bit of visual breathing room. Bottom border stays above the
-        // footer/status line.
+        // Height fits two rows of chrome top+bottom. After centering,
+        // shift y down one more row so the popup's top border doesn't
+        // sit immediately below the header (otherwise the two visually
+        // "melt" together).
         let popup_h = (rows.saturating_sub(6)).max(12);
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        popup.pane.y = popup.pane.y.saturating_add(1);
 
         let head = |s: &str| style::bold(&style::fg(s, 81));
         let key  = |s: &str| style::fg(s, 220);
