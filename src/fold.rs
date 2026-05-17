@@ -112,6 +112,18 @@ impl Folds {
     /// Total number of currently-closed folds.
     pub fn count(&self) -> usize { self.closed.len() }
 
+    /// True iff the fold starting at `line` is currently closed.
+    /// (Distinct from `is_visible`, which asks the inverse question
+    /// about a child line.)
+    pub fn is_closed(&self, line: usize) -> bool { self.closed.contains(&line) }
+
+    /// Force-close the fold at `line`. No-op if it's already closed
+    /// or not foldable — callers should check `is_foldable` first.
+    pub fn close(&mut self, line: usize) { self.closed.insert(line); }
+
+    /// Force-open the fold at `line`. No-op if it's not closed.
+    pub fn open(&mut self, line: usize) { self.closed.remove(&line); }
+
     /// True if `line` is hidden by some closed fold above it.
     pub fn is_visible(&self, line: usize, lines: &[String]) -> bool {
         // Explicit range hides lines strictly inside (start..=end].

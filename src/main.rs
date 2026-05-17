@@ -507,6 +507,10 @@ struct App {
     /// change-op for dot-repeat replay.
     capturing_insert: bool,
     captured_insert: String,
+    /// Insert-mode `Ctrl-R` register prefix — when set, the next key is
+    /// the register name to paste from (or `=` to evaluate an
+    /// arithmetic expression and insert the result).
+    insert_reg_prefix: bool,
     /// `z` prefix: next key is a spell action (`z=`, `zg`).
     z_prefix: bool,
     /// `]` or `[` prefix: next key is a bracket motion (`]s`, `[s`, …).
@@ -677,6 +681,7 @@ impl App {
             last_change: None,
             capturing_insert: false,
             captured_insert: String::new(),
+            insert_reg_prefix: false,
             z_prefix: false,
             bracket_prefix: None,
             leader_prefix: false,
@@ -1042,6 +1047,97 @@ fn save_abbreviations(map: &std::collections::HashMap<String, String>) {
 /// `-` / `_`, etc.) is a boundary that fires expansion.
 fn is_abbrev_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+// ── Tiny arithmetic evaluator (used by the `=` register) ──────────
+// Recursive-descent over `+ - * / ( )` and unary `-`/`+`, decimal
+// numbers (`1`, `2.5`, `.5`). Returns `None` on any malformed input,
+// division by zero, or trailing junk.
+
+fn eval_math(input: &str) -> Option<f64> {
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    let v = parse_expr(bytes, &mut pos)?;
+    skip_ws(bytes, &mut pos);
+    if pos != bytes.len() { return None; }
+    if !v.is_finite() { return None; }
+    Some(v)
+}
+
+fn skip_ws(b: &[u8], p: &mut usize) {
+    while *p < b.len() && b[*p].is_ascii_whitespace() { *p += 1; }
+}
+
+fn parse_expr(b: &[u8], p: &mut usize) -> Option<f64> {
+    let mut acc = parse_term(b, p)?;
+    loop {
+        skip_ws(b, p);
+        match b.get(*p).copied() {
+            Some(c @ (b'+' | b'-')) => {
+                *p += 1;
+                let r = parse_term(b, p)?;
+                acc = if c == b'+' { acc + r } else { acc - r };
+            }
+            _ => return Some(acc),
+        }
+    }
+}
+
+fn parse_term(b: &[u8], p: &mut usize) -> Option<f64> {
+    let mut acc = parse_factor(b, p)?;
+    loop {
+        skip_ws(b, p);
+        match b.get(*p).copied() {
+            Some(c @ (b'*' | b'/' | b'%')) => {
+                *p += 1;
+                let r = parse_factor(b, p)?;
+                acc = match c {
+                    b'*' => acc * r,
+                    b'/' => { if r == 0.0 { return None; } acc / r }
+                    _    => { if r == 0.0 { return None; } acc % r }
+                };
+            }
+            _ => return Some(acc),
+        }
+    }
+}
+
+fn parse_factor(b: &[u8], p: &mut usize) -> Option<f64> {
+    skip_ws(b, p);
+    match b.get(*p).copied() {
+        Some(b'-') => { *p += 1; Some(-parse_factor(b, p)?) }
+        Some(b'+') => { *p += 1; parse_factor(b, p) }
+        Some(b'(') => {
+            *p += 1;
+            let v = parse_expr(b, p)?;
+            skip_ws(b, p);
+            if b.get(*p).copied() != Some(b')') { return None; }
+            *p += 1;
+            Some(v)
+        }
+        Some(c) if c.is_ascii_digit() || c == b'.' => {
+            let start = *p;
+            while *p < b.len() && (b[*p].is_ascii_digit() || b[*p] == b'.') {
+                *p += 1;
+            }
+            std::str::from_utf8(&b[start..*p]).ok()?.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Format an `eval_math` result for insertion: integer if it lands on
+/// a whole number under 15 digits, else a fixed-point decimal with
+/// trailing zeros (and trailing `.`) trimmed.
+fn fmt_math(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let mut s = format!("{:.10}", v);
+        while s.ends_with('0') { s.pop(); }
+        if s.ends_with('.') { s.pop(); }
+        s
+    }
 }
 
 /// One user keymap. `mode` is "normal" / "insert" / "visual" (case-
@@ -2848,6 +2944,32 @@ impl App {
             return false;
         }
 
+        // HyperList: <RIGHT> on a closed foldable line opens it,
+        // <LEFT> on an open foldable line closes it. Falls through to
+        // the regular wrap-motion otherwise — so navigating across a
+        // non-foldable line still works, and a count prefix still
+        // routes through motion (`5l`-style use is unchanged).
+        if (key == "LEFT" || key == "RIGHT")
+            && self.is_hyperlist()
+            && self.pending.operator.is_none()
+            && self.pending.count1.is_none()
+            && self.pending.text_object.is_none()
+        {
+            let total = self.buf.line_count();
+            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            if fold::is_foldable(self.cur_line, &all) {
+                let closed = self.folds.is_closed(self.cur_line);
+                if key == "RIGHT" && closed {
+                    self.folds.open(self.cur_line);
+                    return false;
+                }
+                if key == "LEFT" && !closed {
+                    self.folds.close(self.cur_line);
+                    return false;
+                }
+            }
+        }
+
         // `]` / `[` prefix: dispatch on the follow-up key.
         if let Some(open) = self.bracket_prefix.take() {
             match (open, key) {
@@ -3890,6 +4012,13 @@ impl App {
             buffer::FileKind::Source(s) if s == "hl" || s == "woim" => 3,
             _ => 8,
         }
+    }
+
+    /// True iff the current buffer is a HyperList (.hl / .woim) file.
+    /// Used to gate HyperList-specific keybindings like LEFT/RIGHT
+    /// fold-toggle without polluting the generic motion handler.
+    fn is_hyperlist(&self) -> bool {
+        matches!(&self.buf.kind, buffer::FileKind::Source(s) if s == "hl" || s == "woim")
     }
 
     /// Leading-whitespace prefix of the current line (TAB/space/`*`),
@@ -5552,9 +5681,23 @@ impl App {
 
     fn handle_insert(&mut self, key: &str) -> bool {
         if let Some(q) = self.try_keymap("insert", key) { return q; }
+        // <C-R> prefix: next keystroke is the register to paste from.
+        // ESC / Ctrl-C cancels. Consumed before keymap-aware dispatch
+        // so user-registered Insert keymaps can't accidentally swallow
+        // a register letter.
+        if self.insert_reg_prefix {
+            self.insert_reg_prefix = false;
+            if key == "ESC" || key == "C-C" { return false; }
+            if let Some(c) = key.chars().next() {
+                self.insert_from_register(c);
+            }
+            return false;
+        }
         match key {
             // <Ins> toggles to Replace mode mid-stream (vim parity).
             "INS" => { self.mode = Mode::Replace; return false; }
+            // <C-R>: arm the register-paste prefix (vim parity).
+            "C-R" => { self.insert_reg_prefix = true; return false; }
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
                 self.clamp_col_to_line();
@@ -5674,6 +5817,61 @@ impl App {
             }
         }
         false
+    }
+
+    /// Insert at cursor from register `name` (Insert-mode `<C-R>{c}`
+    /// dispatch). `=` evaluates an arithmetic expression typed in
+    /// the footer prompt and inserts the result. `+` / `*` are the
+    /// system-clipboard slots, the rest are named/numbered/unnamed
+    /// slots as in Normal-mode paste.
+    fn insert_from_register(&mut self, name: char) {
+        let text = if name == '=' {
+            match self.eval_expr_prompt() { Some(s) => s, None => return }
+        } else {
+            match self.regs.get(name) {
+                Some(y) => y.text.clone(),
+                None    => {
+                    self.set_status(&format!(" register {} empty", name), 244);
+                    return;
+                }
+            }
+        };
+        if text.is_empty() { return; }
+        self.insert_text_at_cursor(&text);
+    }
+
+    /// Prompt for an arithmetic expression and return its formatted
+    /// value. None on empty / invalid input (with a status hint in
+    /// the latter case).
+    fn eval_expr_prompt(&mut self) -> Option<String> {
+        let raw = self.footer.ask_with_bg("=", "", 17);
+        self.render_footer();
+        let s = raw.trim();
+        if s.is_empty() { return None; }
+        match eval_math(s) {
+            Some(v) => Some(fmt_math(v)),
+            None    => {
+                self.set_status(&format!(" bad expression: {}", s), 196);
+                None
+            }
+        }
+    }
+
+    /// Splice `text` at the current cursor as one compound undo and
+    /// advance the cursor past the insertion. Updates capturing_insert
+    /// so a dot-repeat after a `c`-op replays the inserted text too.
+    fn insert_text_at_cursor(&mut self, text: &str) {
+        if text.is_empty() { return; }
+        let off = self.cursor_byte();
+        self.buf.begin_compound();
+        self.buf.apply(off, off, text);
+        self.buf.end_compound();
+        let new_off = off + text.len();
+        let (line, col) = self.buf.byte_to_line_col(new_off);
+        self.cur_line = line;
+        self.cur_col  = col;
+        self.want_col = self.cur_col;
+        if self.capturing_insert { self.captured_insert.push_str(text); }
     }
 
     // ── Replace mode ───────────────────────────────────────────────────
@@ -6234,6 +6432,8 @@ impl App {
             ("\"0",             "last yank only"),
             ("\"\"",             "unnamed (default for p / P)"),
             ("\"+  \"*",         "system clipboard (OSC 52)"),
+            ("Ctrl-R {reg}",   "Insert-mode paste from register"),
+            ("Ctrl-R =",       "Insert-mode eval expr and paste result"),
             (":reg",           "inspector popup"),
         ] { lines.push(row(k, d)); }
         lines.push(String::new());
