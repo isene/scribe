@@ -200,6 +200,28 @@ fn main() {
 
     loop {
         let Some(key) = Input::getchr(None) else { continue };
+        // External-change check. Runs on every keystroke (one stat()
+        // per key — sub-microsecond). When another writer touched the
+        // file (kastrup triage appending to a hyperlist, git checkout,
+        // etc.) and our buffer is clean, silently reload so the user
+        // sees the appended lines immediately. When the buffer is
+        // dirty, surface a status warning so they don't accidentally
+        // overwrite the external change on next :w.
+        if app.buf.external_changed() {
+            if !app.buf.dirty {
+                if app.buf.reload().is_ok() {
+                    // Clamp the cursor in case the file shrank
+                    let lc = app.buf.line_count().saturating_sub(1).max(0);
+                    if app.cur_line > lc { app.cur_line = lc; }
+                    app.clamp_col_to_line();
+                    app.set_status("File reloaded (changed on disk)", 2);
+                }
+            } else {
+                app.set_status(
+                    "External change detected — buffer dirty. :e to reload, :w to overwrite",
+                    3);
+            }
+        }
         if key == "RESIZE" {
             app.handle_resize();
             app.render_all();
@@ -6819,6 +6841,43 @@ impl App {
                 }
                 false
             }
+            // Vim's `:w <path>` — write the current buffer to that
+            // path without renaming the open file or clearing the
+            // dirty flag (the current file is still unsaved). `~/`
+            // is expanded to $HOME. Refuses on encrypted buffers
+            // because writing cleartext to an arbitrary path defeats
+            // the point.
+            other if other.starts_with("w ") || other.starts_with("W ") => {
+                let raw = &other[2..];
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    self.set_status(" :w needs a path", 196);
+                    return false;
+                }
+                if self.buf.encrypted {
+                    self.set_status(
+                        " refusing :w <path> on encrypted buffer (would write cleartext)",
+                        196);
+                    return false;
+                }
+                let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+                    let home = std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default();
+                    home.join(rest)
+                } else {
+                    std::path::PathBuf::from(trimmed)
+                };
+                let mut s = String::new();
+                for chunk in self.buf.rope.chunks() { s.push_str(chunk); }
+                match std::fs::write(&expanded, s) {
+                    Ok(_) => self.set_status(
+                        &format!(" written to {}", expanded.display()), 46),
+                    Err(e) => self.set_status(
+                        &format!(" save failed: {}", e), 196),
+                }
+                false
+            }
             "q"  => { if self.buf.dirty { self.set_status(" unsaved changes (use :q! to force)", 196); false } else { true } }
             "q!" => true,
             // `:Wq` / `:WQ` / `:wQ` accepted as aliases for `:wq` so a
@@ -6829,6 +6888,43 @@ impl App {
                 true
             }
             "" => false,
+            // Bare `:e` (vim's `:edit`) reloads the current file from disk.
+            // Refuse if buffer is dirty unless forced (`:e!`), so the user
+            // can't lose edits to a typo. The external-change reload prompt
+            // in the main loop points users here when the on-disk file
+            // differs from the buffer.
+            "e" | "edit" => {
+                if self.buf.dirty {
+                    self.set_status(" unsaved changes (use :e! to force reload)", 196);
+                } else if self.buf.path.is_some() {
+                    if self.buf.reload().is_ok() {
+                        let lc = self.buf.line_count().saturating_sub(1);
+                        if self.cur_line > lc { self.cur_line = lc; }
+                        self.clamp_col_to_line();
+                        self.set_status(" reloaded", 2);
+                    } else {
+                        self.set_status(" reload failed", 196);
+                    }
+                } else {
+                    self.set_status(" no file to reload", 196);
+                }
+                false
+            }
+            "e!" | "edit!" => {
+                if self.buf.path.is_some() {
+                    if self.buf.reload().is_ok() {
+                        let lc = self.buf.line_count().saturating_sub(1);
+                        if self.cur_line > lc { self.cur_line = lc; }
+                        self.clamp_col_to_line();
+                        self.set_status(" reloaded (force)", 2);
+                    } else {
+                        self.set_status(" reload failed", 196);
+                    }
+                } else {
+                    self.set_status(" no file to reload", 196);
+                }
+                false
+            }
             other if other.starts_with("e ") => {
                 let path = other[2..].trim();
                 if !path.is_empty() {

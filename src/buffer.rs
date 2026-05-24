@@ -75,6 +75,11 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub kind: FileKind,
+    /// Snapshot of the file's mtime at last load / save. Used by the
+    /// main-loop external-change check: if the on-disk mtime no longer
+    /// matches this, another writer (kastrup triage, git, etc.) touched
+    /// the file and we need to reload (or warn if our buffer is dirty).
+    pub last_mtime: Option<std::time::SystemTime>,
     nodes: Vec<UndoNode>,
     head: Option<usize>,
     /// When > 0, `apply()` accumulates edits into `pending_compound` instead
@@ -95,6 +100,7 @@ impl Buffer {
         Self {
             rope: Rope::new(),
             path: None, dirty: false, kind: FileKind::Plain,
+            last_mtime: None,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: false,
@@ -105,9 +111,11 @@ impl Buffer {
     pub fn from_path(path: PathBuf) -> std::io::Result<Self> {
         let s = std::fs::read_to_string(&path).unwrap_or_default();
         let kind = detect_kind(&path, &s);
+        let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(Self {
             rope: Rope::from_str(&s),
             path: Some(path), dirty: false, kind,
+            last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: false,
@@ -118,14 +126,43 @@ impl Buffer {
     /// Used by the dotfile auto-decrypt path in main().
     pub fn from_decrypted(path: PathBuf, plaintext: String, password: String) -> Self {
         let kind = detect_kind(&path, &plaintext);
+        let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Self {
             rope: Rope::from_str(&plaintext),
             path: Some(path), dirty: false, kind,
+            last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: true,
             password: Some(password),
         }
+    }
+
+    /// Re-read the file from disk, replacing the rope content + resetting
+    /// dirty / mtime. Undo history is preserved (caller may still want to
+    /// undo back into the pre-reload state). Returns Err if the file is
+    /// gone or unreadable, leaving the buffer untouched.
+    pub fn reload(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "no file"));
+        };
+        let s = std::fs::read_to_string(&path)?;
+        self.rope = Rope::from_str(&s);
+        self.dirty = false;
+        self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        Ok(())
+    }
+
+    /// Returns true when the on-disk mtime differs from what we last
+    /// observed at load / save. Cheap — one stat() syscall. Safe to call
+    /// every keystroke. Errors (file removed, permissions) report false
+    /// so we don't spam the user with reload prompts for transient races.
+    pub fn external_changed(&self) -> bool {
+        let Some(ref path) = self.path else { return false };
+        let Some(last) = self.last_mtime else { return false };
+        let Ok(meta) = std::fs::metadata(path) else { return false };
+        let Ok(now) = meta.modified() else { return false };
+        now != last
     }
 
     /// Begin grouping subsequent `apply()` calls into a single undo node.
@@ -170,6 +207,9 @@ impl Buffer {
             std::fs::write(&path, s)?;
         }
         self.dirty = false;
+        // Refresh the cached mtime so the external-change check after
+        // our own save doesn't fire as a false positive.
+        self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(())
     }
 
