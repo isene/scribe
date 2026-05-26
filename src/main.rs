@@ -3501,10 +3501,24 @@ impl App {
             "I" => { self.cur_col = 0; self.enter_insert(); }
             "A" => { self.cur_col = self.current_line_len(); self.enter_insert(); }
             "o" => {
-                let off = self.buf.line_byte_offset(self.cur_line) + self.current_line_len();
+                // Fold-aware: if the cursor sits on a closed-fold
+                // anchor, the new line goes AFTER the entire fold
+                // body, not directly under the anchor (which would
+                // bury it inside the fold and hide it on render).
+                // Indent still inherits from the anchor so the new
+                // line ends up as a sibling, not nested deeper.
+                let target_line = if self.folds.is_closed(self.cur_line) {
+                    let total = self.buf.line_count();
+                    let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+                    fold::fold_end(self.cur_line, &all)
+                } else {
+                    self.cur_line
+                };
+                let line_len = self.buf.line(target_line).len();
+                let off = self.buf.line_byte_offset(target_line) + line_len;
                 let indent = self.indent_to_inherit();
                 self.buf.apply(off, off, &format!("\n{}", indent));
-                self.cur_line += 1;
+                self.cur_line = target_line + 1;
                 self.cur_col = indent.len();
                 self.want_col = self.cur_col;
                 self.enter_insert();
@@ -3842,49 +3856,80 @@ impl App {
         self.replay_depth -= 1;
     }
 
-    /// Swap the current line with the one above. One compound undo node.
-    fn move_line_up(&mut self) {
-        if self.cur_line == 0 { return; }
+    /// Inclusive line range that should move as a unit when the cursor
+    /// is at `line`. For a normal line, that's just `(line, line)`.
+    /// For a closed-fold anchor, it spans the anchor + every hidden
+    /// child up to the end of the fold (so `move_line_up/down` swap
+    /// the entire collapsed block, not just the head line).
+    fn fold_aware_block(&self, line: usize) -> (usize, usize) {
         let total = self.buf.line_count();
-        let a = self.cur_line - 1;
-        let b = self.cur_line;
-        let line_a = self.buf.line(a);
-        let line_b = self.buf.line(b);
-        let start = self.buf.line_byte_offset(a);
-        let end = if b + 1 < total {
-            self.buf.line_byte_offset(b + 1)
+        if line >= total { return (line, line); }
+        if self.folds.is_closed(line) {
+            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            let end = fold::fold_end(line, &all);
+            (line, end.min(total - 1))
         } else {
-            self.buf.rope.len_bytes()
-        };
-        let block_has_trailing_nl = {
-            let cs = self.buf.rope.byte_to_char(start);
-            let ce = self.buf.rope.byte_to_char(end);
-            let span: String = self.buf.rope.slice(cs..ce).into();
-            span.ends_with('\n')
-        };
-        let mut rep = String::with_capacity(line_a.len() + line_b.len() + 2);
-        rep.push_str(&line_b);
-        rep.push('\n');
-        rep.push_str(&line_a);
-        if block_has_trailing_nl { rep.push('\n'); }
-        self.buf.begin_compound();
-        self.buf.apply(start, end, &rep);
-        self.buf.end_compound();
-        self.cur_line -= 1;
-        self.clamp_col_to_line();
+            (line, line)
+        }
     }
 
-    /// Swap the current line with the one below. One compound undo node.
+    /// Swap the block at the cursor with the block above. Fold-aware:
+    /// either side can be a single line OR a closed-fold range; the
+    /// swap treats whichever side is folded as one unit.
+    fn move_line_up(&mut self) {
+        if self.cur_line == 0 { return; }
+        let (b_start, b_end) = self.fold_aware_block(self.cur_line);
+        // The "block above" starts at b_start-1 and might itself be a
+        // closed fold — walk back from b_start-1 to find its head.
+        let upper_end = b_start - 1;
+        let upper_start = self.fold_anchor_for_member(upper_end);
+        self.swap_blocks(upper_start, upper_end, b_start, b_end);
+    }
+
+    /// Swap the block at the cursor with the block below. Fold-aware
+    /// in the same way as `move_line_up`.
     fn move_line_down(&mut self) {
         let total = self.buf.line_count();
-        if self.cur_line + 1 >= total { return; }
-        let a = self.cur_line;
-        let b = self.cur_line + 1;
-        let line_a = self.buf.line(a);
-        let line_b = self.buf.line(b);
-        let start = self.buf.line_byte_offset(a);
-        let end = if b + 1 < total {
-            self.buf.line_byte_offset(b + 1)
+        let (a_start, a_end) = self.fold_aware_block(self.cur_line);
+        if a_end + 1 >= total { return; }
+        let lower_start = a_end + 1;
+        let lower_end = self.fold_aware_block(lower_start).1;
+        self.swap_blocks(a_start, a_end, lower_start, lower_end);
+    }
+
+    /// If `line` is the closed-fold head, return `line`. If it's
+    /// hidden inside a closed fold, return that fold's head. Otherwise
+    /// return `line` itself.
+    fn fold_anchor_for_member(&self, line: usize) -> usize {
+        let total = self.buf.line_count();
+        if line >= total { return line; }
+        let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+        // Already a fold head?
+        if self.folds.is_closed(line) { return line; }
+        // Otherwise walk back looking for a closed fold whose body
+        // covers this line. Stop at the first one — they don't nest
+        // for our purposes (we just want the outermost visible head).
+        for head in (0..line).rev() {
+            if self.folds.is_closed(head) {
+                let end = fold::fold_end(head, &all);
+                if end >= line { return head; }
+                break;
+            }
+        }
+        line
+    }
+
+    /// Swap two adjacent line ranges `[a_start..=a_end]` and
+    /// `[b_start..=b_end]` where `a_end + 1 == b_start`. Both ranges
+    /// must be non-empty. Cursor lands on the new position of the
+    /// originally-active block.
+    fn swap_blocks(&mut self, a_start: usize, a_end: usize, b_start: usize, b_end: usize) {
+        debug_assert_eq!(a_end + 1, b_start);
+        let total = self.buf.line_count();
+        if b_end >= total { return; }
+        let start = self.buf.line_byte_offset(a_start);
+        let end = if b_end + 1 < total {
+            self.buf.line_byte_offset(b_end + 1)
         } else {
             self.buf.rope.len_bytes()
         };
@@ -3894,16 +3939,47 @@ impl App {
             let span: String = self.buf.rope.slice(cs..ce).into();
             span.ends_with('\n')
         };
-        let mut rep = String::with_capacity(line_a.len() + line_b.len() + 2);
-        rep.push_str(&line_b);
+        // Build text for each side.
+        let collect = |lo: usize, hi: usize| -> String {
+            let mut s = String::new();
+            for i in lo..=hi {
+                if !s.is_empty() { s.push('\n'); }
+                s.push_str(&self.buf.line(i));
+            }
+            s
+        };
+        let upper = collect(a_start, a_end);
+        let lower = collect(b_start, b_end);
+        // Result: lower block first, then upper block.
+        let mut rep = String::with_capacity(upper.len() + lower.len() + 4);
+        rep.push_str(&lower);
         rep.push('\n');
-        rep.push_str(&line_a);
+        rep.push_str(&upper);
         if block_has_trailing_nl { rep.push('\n'); }
+        // The relative offsets of the cursor's line within its block
+        // are preserved. Compute where the cursor's line lands.
+        let cur_was_in_upper = self.cur_line >= a_start && self.cur_line <= a_end;
+        let cur_offset_in_block = if cur_was_in_upper {
+            self.cur_line - a_start
+        } else {
+            self.cur_line - b_start
+        };
+        let upper_len = a_end - a_start + 1;
+        let lower_len = b_end - b_start + 1;
+        let new_cur = if cur_was_in_upper {
+            // Upper block now starts at a_start + lower_len
+            a_start + lower_len + cur_offset_in_block
+        } else {
+            // Lower block now starts at a_start
+            a_start + cur_offset_in_block
+        };
+
         self.buf.begin_compound();
         self.buf.apply(start, end, &rep);
         self.buf.end_compound();
-        self.cur_line += 1;
+        self.cur_line = new_cur.min(self.buf.line_count().saturating_sub(1));
         self.clamp_col_to_line();
+        let _ = upper_len; // (suppress unused warning — kept for symmetry)
     }
 
     /// Increment or decrement the first number / date at-or-after the
