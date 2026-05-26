@@ -1471,11 +1471,18 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
     if let Some(&p) = pos.get(&byte_col) { return p; }
 
     // Past end-of-line: cursor sits just past the last char.
+    //
+    // Wrap to (row + 1, 0) not just when last_col == width (cursor
+    // genuinely off the edge) but ALSO when last_col == width - 1
+    // (cursor would render in the cell immediately right of the last
+    // char). The latter case visually merges with the last char in
+    // terminals that draw the bar cursor at the LEFT edge of a cell —
+    // glass and many others. Wrapping makes "I'm past-end" obvious.
     if byte_col >= line.len() {
         let last_col = current.last()
             .map(|&(c, _, cc)| cc + char_w(c, cc))
             .unwrap_or(col);
-        if last_col >= width { return (row + 1, 0); }
+        if last_col + 1 >= width { return (row + 1, 0); }
         return (row, last_col);
     }
 
@@ -1487,11 +1494,13 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
         if let Some(&p) = pos.get(&probe) { return p; }
         probe += 1;
     }
-    // Nothing further — return end of last row.
+    // Nothing further — return end of last row. Same one-cell slack
+    // as the past-end branch above for the same bar-cursor-rendering
+    // reason.
     let last_col = current.last()
         .map(|&(c, _, cc)| cc + char_w(c, cc))
         .unwrap_or(col);
-    if last_col >= width { (row + 1, 0) } else { (row, last_col) }
+    if last_col + 1 >= width { (row + 1, 0) } else { (row, last_col) }
 }
 
 
