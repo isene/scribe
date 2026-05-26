@@ -3389,6 +3389,13 @@ impl App {
                 Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
             }
             "0" | "HOME" => Some(motion::line_start(&self.buf, cur)),
+            // Ctrl-Home / Ctrl-End: vim's `gg` / `G` but on a single
+            // keystroke. Linewise like `gg`/`G` so e.g. `dC-END`
+            // deletes from the current line to the end of the file.
+            "C-HOME" => Some(0),
+            "C-END"  => Some(self.buf.line_byte_offset(
+                self.buf.line_count().saturating_sub(1)
+            )),
             "^"          => Some(motion::line_first_nonblank(&self.buf, cur)),
             // `-` — move to first non-blank of the previous line (vim
             // linewise motion). With a count, jumps N lines up.
@@ -5842,6 +5849,18 @@ impl App {
             "C-DOWN" => self.move_line_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
             "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
+            // Ctrl-Home / Ctrl-End — first / last line of file, vim's
+            // `gg` / `G` accessible without leaving the current mode.
+            "C-HOME" => {
+                self.cur_line = 0;
+                self.cur_col = 0;
+                self.want_col = 0;
+            }
+            "C-END"  => {
+                self.cur_line = self.buf.line_count().saturating_sub(1);
+                self.cur_col = self.current_line_len();
+                self.want_col = self.cur_col;
+            }
             "BACK" | "BACKSPACE" | "C-H" => {
                 let off = self.cursor_byte();
                 if off > 0 {
@@ -6014,6 +6033,18 @@ impl App {
             "DOWN"  => self.move_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
             "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
+            // Ctrl-Home / Ctrl-End — first / last line of file, vim's
+            // `gg` / `G` accessible without leaving the current mode.
+            "C-HOME" => {
+                self.cur_line = 0;
+                self.cur_col = 0;
+                self.want_col = 0;
+            }
+            "C-END"  => {
+                self.cur_line = self.buf.line_count().saturating_sub(1);
+                self.cur_col = self.current_line_len();
+                self.want_col = self.cur_col;
+            }
             "BACK" | "BACKSPACE" | "C-H" => {
                 // Step the cursor back without restoring; user can `u`
                 // to revert the whole replace turn.
