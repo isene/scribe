@@ -10,10 +10,13 @@
 
 mod buffer;
 mod calendar;
+mod digraphs;
+mod emoji_data;
 mod export;
 mod fold;
 mod mode;
 mod motion;
+mod picker;
 mod register;
 mod search;
 mod spell;
@@ -5893,6 +5896,16 @@ impl App {
             // (æ, ø, å, emoji) lines up the way the user sees it.
             "C-Y" => { self.copy_char_from(-1); }
             "C-E" => { self.copy_char_from( 1); }
+            // Vim's digraph-input key. Scribe overloads it to launch
+            // a browseable picker (digraphs + emoji) rather than
+            // strict Ctrl-K X Y two-char entry — the picker has a
+            // search box that subsumes that use case.
+            "C-K" => {
+                if let Some(glyph) = picker::pick(picker::InitialTab::All) {
+                    self.insert_text_at_cursor(&glyph);
+                }
+                self.render_all();
+            }
             "C-T" if self.autonumber => self.autonum_indent_in(),
             "C-D" if self.autonumber => self.autonum_indent_out(),
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" if self.autonumber => {
@@ -6950,6 +6963,24 @@ impl App {
 
     fn execute_command(&mut self, cmd: &str) -> bool {
         match cmd {
+            // Picker — vim's `:digraphs` shows the digraph table; `:emoji`
+            // jumps straight to the emoji tab. Both insert at the cursor
+            // if anything is picked and re-enter Normal mode (or the
+            // current mode, since the picker is modal on top).
+            "digraphs" | "dig" => {
+                if let Some(g) = picker::pick(picker::InitialTab::Digraphs) {
+                    self.insert_text_at_cursor(&g);
+                }
+                self.render_all();
+                return false;
+            }
+            "emoji" => {
+                if let Some(g) = picker::pick(picker::InitialTab::Emoji) {
+                    self.insert_text_at_cursor(&g);
+                }
+                self.render_all();
+                return false;
+            }
             "w" | "W" => {
                 match self.buf.save() {
                     Ok(_)  => self.set_status(" written", 46),
