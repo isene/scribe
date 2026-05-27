@@ -5901,9 +5901,9 @@ impl App {
             // strict Ctrl-K X Y two-char entry — the picker has a
             // search box that subsumes that use case.
             "C-K" => {
-                if let Some(glyph) = picker::pick(picker::InitialTab::All) {
-                    self.insert_text_at_cursor(&glyph);
-                }
+                let picks = picker::pick(picker::InitialTab::All);
+                for g in picks { self.insert_text_at_cursor(&g); }
+                Crust::clear_screen();
                 self.render_all();
             }
             "C-T" if self.autonumber => self.autonum_indent_in(),
@@ -6968,16 +6968,16 @@ impl App {
             // if anything is picked and re-enter Normal mode (or the
             // current mode, since the picker is modal on top).
             "digraphs" | "dig" => {
-                if let Some(g) = picker::pick(picker::InitialTab::Digraphs) {
-                    self.insert_text_at_cursor(&g);
-                }
+                let picks = picker::pick(picker::InitialTab::Digraphs);
+                for g in picks { self.insert_text_at_cursor(&g); }
+                Crust::clear_screen();
                 self.render_all();
                 return false;
             }
             "emoji" => {
-                if let Some(g) = picker::pick(picker::InitialTab::Emoji) {
-                    self.insert_text_at_cursor(&g);
-                }
+                let picks = picker::pick(picker::InitialTab::Emoji);
+                for g in picks { self.insert_text_at_cursor(&g); }
+                Crust::clear_screen();
                 self.render_all();
                 return false;
             }

@@ -2,9 +2,11 @@
 //! interactively; rcurses' emoji picker carried over to the Rust
 //! side. Single popup, category tabs, type-to-filter.
 //!
-//! Returns the picked glyph as a `String` (multi-codepoint emoji
-//! like 👍🏽 use ZWJ + skin-tone modifiers so they're not one char).
-//! `None` if the user cancelled with ESC.
+//! Multi-pick: stays open after Enter so the user can queue several
+//! glyphs in one session. ESC closes and returns everything queued
+//! (in pick order). The caller inserts them all at once after the
+//! popup clears — they appear at the cursor on the same line in the
+//! order picked.
 
 use crust::{Cursor, Input, Popup, style};
 
@@ -94,8 +96,11 @@ fn matches(entry: &Entry, query: &str) -> bool {
     true
 }
 
-/// Run the picker. Returns the chosen glyph or `None` on cancel.
-pub fn pick(initial_tab: InitialTab) -> Option<String> {
+/// Run the picker. Stays open across multiple Enter presses, each
+/// of which queues the highlighted glyph. Returns the queued glyphs
+/// in pick order when the user presses ESC. Empty vec = cancelled
+/// without picking anything.
+pub fn pick(initial_tab: InitialTab) -> Vec<String> {
     let popup_w: u16 = 72;
     let popup_h: u16 = 22;
     let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -108,12 +113,13 @@ pub fn pick(initial_tab: InitialTab) -> Option<String> {
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut scroll: usize = 0;
+    let mut picks: Vec<String> = Vec::new();
     let body_rows = (popup_h as usize).saturating_sub(6);  // chrome takes 6 rows
 
     // Hide the terminal cursor so it doesn't blink through the popup.
     Cursor::hide();
 
-    let result: Option<String> = loop {
+    loop {
         // Build filtered entry list for the current tab + query.
         let all = entries_for(tab);
         let filtered: Vec<&Entry> = all.iter().filter(|e| matches(e, &query)).collect();
@@ -186,21 +192,40 @@ pub fn pick(initial_tab: InitialTab) -> Option<String> {
         }
         // Pad to fill
         while lines.len() < popup_h as usize - 1 { lines.push(String::new()); }
-        // Footer hint
-        lines.push(style::fg(
-            "  Tab cycle cat · type to filter · Enter insert · ESC cancel",
-            240,
-        ));
+        // Footer: show queued picks (truncated to fit) + hint.
+        let footer = if picks.is_empty() {
+            style::fg(
+                "  Tab cycle · type to filter · Enter queue · ESC done",
+                240,
+            )
+        } else {
+            // Show the running queue so the user knows what'll get
+            // inserted on ESC. Truncate to fit the popup width.
+            let mut queue = String::new();
+            for g in &picks {
+                queue.push_str(g);
+                queue.push(' ');
+            }
+            let max_q = (popup_w as usize).saturating_sub(28);
+            let q_disp: String = queue.chars().take(max_q).collect();
+            format!("  {}  {}",
+                style::fg(&format!("queued ({}):", picks.len()), 81),
+                style::fg(&q_disp, 220))
+        };
+        lines.push(footer);
 
         popup.show(&lines.join("\n"));
 
         // ---- Input ----
         let Some(k) = Input::getchr(None) else { continue };
         match k.as_str() {
-            "ESC" | "C-C" => break None,
+            "ESC" | "C-C" => break,
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
                 if let Some(e) = filtered.get(cursor) {
-                    break Some(e.glyph.to_string());
+                    // Queue the pick; stay open so the user can
+                    // keep picking. The buffer behind only updates
+                    // when the popup is dismissed (ESC).
+                    picks.push(e.glyph.to_string());
                 }
             }
             "TAB"        => { tab = tab.next(); cursor = 0; scroll = 0; }
@@ -222,6 +247,11 @@ pub fn pick(initial_tab: InitialTab) -> Option<String> {
                     while start > 0 && !query.is_char_boundary(start) { start -= 1; }
                     query.truncate(start);
                     cursor = 0; scroll = 0;
+                } else if !picks.is_empty() {
+                    // No query to delete from → pop the last queued
+                    // pick instead. Lets the user undo a wrong
+                    // Enter without leaving the popup.
+                    picks.pop();
                 }
             }
             other => {
@@ -235,10 +265,13 @@ pub fn pick(initial_tab: InitialTab) -> Option<String> {
                 }
             }
         }
-    };
+    }
 
+    // Clear the popup region so the caller's render_all() doesn't
+    // need to paint over leftover popup pixels.
+    popup.pane.clear();
     Cursor::show();
-    result
+    picks
 }
 
 #[derive(Clone, Copy)]
