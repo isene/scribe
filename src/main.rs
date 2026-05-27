@@ -1302,7 +1302,8 @@ fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
     -> Vec<Vec<(char, usize, usize)>>
 {
     let char_w = |c: char, at_col: usize| -> usize {
-        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) } else { 1 }
+        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) }
+        else { crust::cell_width(c).max(1) }
     };
     let mut rows: Vec<Vec<(char, usize, usize)>> = Vec::new();
     let mut current: Vec<(char, usize, usize)> = Vec::new();
@@ -1417,8 +1418,15 @@ fn byte_at_or_past_col(line: &str, target_col: usize, tabstop: usize) -> (usize,
 
 fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop: usize) -> (usize, usize) {
     if width == 0 { return (0, gutter_w); }
+    // Per-cell width. Tabs expand to the next tabstop; otherwise use
+    // crust::cell_width which mirrors glass's emoji-routing rules
+    // (non-BMP codepoints render 2 cells, certain BMP emoji ranges
+    // ditto). Without this, every emoji collapses to 1 cell here and
+    // the cursor position math drifts left of where the glyph
+    // actually finishes on screen.
     let char_w = |c: char, at_col: usize| -> usize {
-        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) } else { 1 }
+        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) }
+        else { crust::cell_width(c).max(1) }
     };
     // Final position for each rendered byte. Boundary-dropped
     // spaces are absent from this map.
@@ -1654,6 +1662,41 @@ fn find_reference(line: &str, from: usize) -> Option<String> {
 
 /// `YYYY-MM-DD HH.MM` for HL checkbox timestamps. Local time. No
 /// dependency: divmod from Unix epoch + tz offset from libc.
+/// Colon-mode tab completer. Returns every command whose name starts
+/// with the typed prefix (case-sensitive). Empty prefix shows all
+/// available commands so Tab on a blank `:` cycles the menu. The
+/// list mirrors `App::execute_command` — keep them in sync when
+/// adding a new command.
+fn complete_colon_command(prefix: &str) -> Vec<String> {
+    const COMMANDS: &[&str] = &[
+        // Picker / glyph entry
+        "digraphs", "dig", "emoji",
+        // Save / quit
+        "w", "wq", "x", "q",
+        // Reload
+        "e", "edit", "e!", "edit!",
+        // Help / keys
+        "help", "keys", "keybindings", "cheat",
+        // AI
+        "claude", "chat",
+        // Email / draft handoff
+        "mail", "email", "eml",
+        // Display / mode
+        "config", "spell", "reading", "noreading",
+        "plain", "text", "display",
+        // Registers / abbrevs / maps
+        "registers", "reg", "abbrev", "abclear",
+        "maps", "mappings", "map",
+    ];
+    let p = prefix.trim_start_matches(':');  // be forgiving if user typed colon
+    let mut out: Vec<String> = COMMANDS.iter()
+        .filter(|c| c.starts_with(p))
+        .map(|c| c.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
 fn current_timestamp() -> String {
     use std::process::Command;
     // Fallback: shell out to `date` for correct local time including DST.
@@ -2371,7 +2414,16 @@ impl App {
         let bg_on = format!("\x1b[48;5;{}m", BG);
 
         let mode_label = style::bg(&style::fg(self.mode.label(), 0), self.mode.color());
-        let pos = format!(" {}:{} ", self.cur_line + 1, self.cur_col + 1);
+        // Col shown as 1-based character position, not byte offset.
+        // Byte-based jumps confusingly when the line contains
+        // multi-byte chars (one emoji ≠ 4 columns); the codepoint
+        // count matches the `Nc` buffer-char counter to its left.
+        let char_col: usize = {
+            let line = self.buf.line(self.cur_line);
+            let byte_cap = self.cur_col.min(line.len());
+            line[..byte_cap].chars().count()
+        };
+        let pos = format!(" {}:{} ", self.cur_line + 1, char_col + 1);
         let right = format!("scribe v{} ", VERSION);
 
         // Persistent stats segment: word count + spell status. Sits to the
@@ -5901,9 +5953,13 @@ impl App {
             // strict Ctrl-K X Y two-char entry — the picker has a
             // search box that subsumes that use case.
             "C-K" => {
-                let picks = picker::pick(picker::InitialTab::All);
-                for g in picks { self.insert_text_at_cursor(&g); }
-                Crust::clear_screen();
+                let glyph = picker::pick(
+                    picker::InitialTab::All,
+                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                );
+                if let Some(g) = glyph {
+                    self.insert_text_at_cursor(&g);
+                }
                 self.render_all();
             }
             "C-T" if self.autonumber => self.autonum_indent_in(),
@@ -6267,10 +6323,12 @@ impl App {
     /// No mid-ask render_all and no position_cursor calls — crust's
     /// editline owns the cursor for the duration of the prompt.
     fn run_command_prompt(&mut self) -> bool {
+        // Hook tab-completion in for the colon prompt only — clear
+        // after so other footer prompts (search, etc.) don't inherit
+        // it.
+        self.footer.completer = Some(complete_colon_command);
         let cmd = self.footer.ask_with_bg(":", "", 17);
-        // Ask painted the prompt line; restore the regular status bar.
-        // Editline already turned the cursor off on exit (see editline's
-        // tail `cursor::Hide`). render_all below will reposition + show.
+        self.footer.completer = None;
         self.render_footer();
         let quit = self.execute_command(cmd.trim());
         if !quit { self.render_all(); }
@@ -6962,22 +7020,32 @@ impl App {
     }
 
     fn execute_command(&mut self, cmd: &str) -> bool {
+        // Keep the list in COLON_COMMANDS (below) in sync when you add
+        // a new command here — that list drives tab completion.
         match cmd {
             // Picker — vim's `:digraphs` shows the digraph table; `:emoji`
             // jumps straight to the emoji tab. Both insert at the cursor
             // if anything is picked and re-enter Normal mode (or the
             // current mode, since the picker is modal on top).
             "digraphs" | "dig" => {
-                let picks = picker::pick(picker::InitialTab::Digraphs);
-                for g in picks { self.insert_text_at_cursor(&g); }
-                Crust::clear_screen();
+                let glyph = picker::pick(
+                    picker::InitialTab::Digraphs,
+                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                );
+                if let Some(g) = glyph {
+                    self.insert_text_at_cursor(&g);
+                }
                 self.render_all();
                 return false;
             }
             "emoji" => {
-                let picks = picker::pick(picker::InitialTab::Emoji);
-                for g in picks { self.insert_text_at_cursor(&g); }
-                Crust::clear_screen();
+                let glyph = picker::pick(
+                    picker::InitialTab::Emoji,
+                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                );
+                if let Some(g) = glyph {
+                    self.insert_text_at_cursor(&g);
+                }
                 self.render_all();
                 return false;
             }

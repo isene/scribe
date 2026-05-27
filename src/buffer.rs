@@ -217,7 +217,26 @@ impl Buffer {
     /// (`begin_compound` has been called), accumulate into pending_compound
     /// instead of creating a node per call.
     pub fn apply(&mut self, start: usize, end: usize, replacement: &str) {
-        let original: String = self.rope.byte_slice(start..end).to_string();
+        // Pure insertions (start == end) have no original content to
+        // capture — skip the byte_slice() so we don't trip ropey's
+        // "byte not on char boundary" panic for a degenerate empty
+        // range. The bounds still need to point AT a char boundary
+        // because byte_to_char would error otherwise; snap defensively.
+        let total = self.rope.len_bytes();
+        let snap = |b: usize| -> usize {
+            let b = b.min(total);
+            let s = self.rope.to_string();
+            let mut p = b;
+            while p > 0 && !s.is_char_boundary(p) { p -= 1; }
+            p
+        };
+        let start = snap(start);
+        let end = snap(end.max(start));
+        let original: String = if start == end {
+            String::new()
+        } else {
+            self.rope.byte_slice(start..end).to_string()
+        };
         let edit = Edit { start, end, replacement: replacement.into(), original };
         let start_char = self.rope.byte_to_char(start);
         let end_char = self.rope.byte_to_char(end);

@@ -2,13 +2,10 @@
 //! interactively; rcurses' emoji picker carried over to the Rust
 //! side. Single popup, category tabs, type-to-filter.
 //!
-//! Multi-pick: stays open after Enter so the user can queue several
-//! glyphs in one session. ESC closes and returns everything queued
-//! (in pick order). The caller inserts them all at once after the
-//! popup clears — they appear at the cursor on the same line in the
-//! order picked.
+//! Single-pick: Enter inserts the highlighted glyph and closes;
+//! ESC closes without inserting.
 
-use crust::{Cursor, Input, Popup, style};
+use crust::{Cursor, Input, Pane, Popup, style};
 
 use crate::digraphs::{DIGRAPHS, Digraph};
 use crate::emoji_data::EMOJI_CATEGORIES;
@@ -96,11 +93,14 @@ fn matches(entry: &Entry, query: &str) -> bool {
     true
 }
 
-/// Run the picker. Stays open across multiple Enter presses, each
-/// of which queues the highlighted glyph. Returns the queued glyphs
-/// in pick order when the user presses ESC. Empty vec = cancelled
-/// without picking anything.
-pub fn pick(initial_tab: InitialTab) -> Vec<String> {
+/// Run the picker. Returns the chosen glyph or `None` on cancel.
+///
+/// `refresh_panes` is the list of panes underneath the popup that need
+/// to be repainted after the popup goes away — without this, the
+/// caller's `render_all()` diff-renders against stale `prev_frame` and
+/// leaves the chrome blank. `popup.dismiss()` resets prev_frame on
+/// each pane (via `full_refresh`), so the next `say()` repaints.
+pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<String> {
     let popup_w: u16 = 72;
     let popup_h: u16 = 22;
     let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
@@ -113,13 +113,12 @@ pub fn pick(initial_tab: InitialTab) -> Vec<String> {
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut scroll: usize = 0;
-    let mut picks: Vec<String> = Vec::new();
     let body_rows = (popup_h as usize).saturating_sub(6);  // chrome takes 6 rows
 
     // Hide the terminal cursor so it doesn't blink through the popup.
     Cursor::hide();
 
-    loop {
+    let result: Option<String> = loop {
         // Build filtered entry list for the current tab + query.
         let all = entries_for(tab);
         let filtered: Vec<&Entry> = all.iter().filter(|e| matches(e, &query)).collect();
@@ -172,7 +171,17 @@ pub fn pick(initial_tab: InitialTab) -> Vec<String> {
                 let idx = scroll + vr;
                 if idx >= filtered.len() { break; }
                 let e = filtered[idx];
-                let glyph_cell = format!(" {:<2} ", e.glyph);
+                // Force a neutral white around the glyph. Glass's
+                // color-emoji path (CBDT via Noto Color Emoji) isn't
+                // wired up for non-BMP codepoints in this build, so
+                // emojis fall back to monochrome outline rendering
+                // in the current fg. Plain `style::native` (CSI 39)
+                // landed in glass's default fg which is a bluish
+                // grey — making every emoji look uniformly blue.
+                // White is the least bad alternative until glass's
+                // CBDT path is fixed; digraphs (and emoji color in
+                // the main buffer) are unaffected.
+                let glyph_cell = format!(" {} ", style::fg(&format!("{:<2}", e.glyph), 255));
                 let code_cell  = if e.code.is_empty() {
                     format!(" {:<4} ", "")
                 } else {
@@ -192,40 +201,20 @@ pub fn pick(initial_tab: InitialTab) -> Vec<String> {
         }
         // Pad to fill
         while lines.len() < popup_h as usize - 1 { lines.push(String::new()); }
-        // Footer: show queued picks (truncated to fit) + hint.
-        let footer = if picks.is_empty() {
-            style::fg(
-                "  Tab cycle · type to filter · Enter queue · ESC done",
-                240,
-            )
-        } else {
-            // Show the running queue so the user knows what'll get
-            // inserted on ESC. Truncate to fit the popup width.
-            let mut queue = String::new();
-            for g in &picks {
-                queue.push_str(g);
-                queue.push(' ');
-            }
-            let max_q = (popup_w as usize).saturating_sub(28);
-            let q_disp: String = queue.chars().take(max_q).collect();
-            format!("  {}  {}",
-                style::fg(&format!("queued ({}):", picks.len()), 81),
-                style::fg(&q_disp, 220))
-        };
-        lines.push(footer);
+        lines.push(style::fg(
+            "  Tab cycle cat · type to filter · Enter insert · ESC cancel",
+            240,
+        ));
 
         popup.show(&lines.join("\n"));
 
         // ---- Input ----
         let Some(k) = Input::getchr(None) else { continue };
         match k.as_str() {
-            "ESC" | "C-C" => break,
+            "ESC" | "C-C" => break None,
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" => {
                 if let Some(e) = filtered.get(cursor) {
-                    // Queue the pick; stay open so the user can
-                    // keep picking. The buffer behind only updates
-                    // when the popup is dismissed (ESC).
-                    picks.push(e.glyph.to_string());
+                    break Some(e.glyph.to_string());
                 }
             }
             "TAB"        => { tab = tab.next(); cursor = 0; scroll = 0; }
@@ -247,15 +236,9 @@ pub fn pick(initial_tab: InitialTab) -> Vec<String> {
                     while start > 0 && !query.is_char_boundary(start) { start -= 1; }
                     query.truncate(start);
                     cursor = 0; scroll = 0;
-                } else if !picks.is_empty() {
-                    // No query to delete from → pop the last queued
-                    // pick instead. Lets the user undo a wrong
-                    // Enter without leaving the popup.
-                    picks.pop();
                 }
             }
             other => {
-                // Single printable char → append to query.
                 if other.chars().count() == 1 {
                     let c = other.chars().next().unwrap();
                     if !c.is_control() {
@@ -265,13 +248,14 @@ pub fn pick(initial_tab: InitialTab) -> Vec<String> {
                 }
             }
         }
-    }
+    };
 
-    // Clear the popup region so the caller's render_all() doesn't
-    // need to paint over leftover popup pixels.
-    popup.pane.clear();
+    // Dismiss clears the popup area AND full_refreshes the underlying
+    // panes, resetting their prev_frame so the caller's render_all()
+    // sees a clean slate and paints the chrome back in.
+    popup.dismiss(refresh_panes);
     Cursor::show();
-    picks
+    result
 }
 
 #[derive(Clone, Copy)]
