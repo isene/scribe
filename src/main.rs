@@ -486,6 +486,36 @@ enum ChangeMotion {
 #[derive(Clone, Copy)]
 enum CaseOp { Lower, Upper, Toggle }
 
+/// Pending Visual Block change → Insert replication state. Captured
+/// when a block `c`/`s` enters Insert; consumed on the next ESC to
+/// copy the top-line insertion onto the rest of the block's lines.
+struct BlockInsert {
+    /// Display column where the insert started (block left edge).
+    vcol: usize,
+    /// Lines below the top line that should receive the replicated
+    /// text (the top line gets it via the live Insert keystrokes).
+    lines: Vec<usize>,
+}
+
+/// Resolve an input-layer key string to the single literal char it
+/// represents, for `r` (replace) and `f/F/t/T` (find) targets. crust
+/// delivers Tab/Enter/Shift-Tab as words, so a naïve
+/// `key.chars().next()` would grab the first letter ('T'/'E'). Named
+/// keys with no literal form (LEFT, UP, F1, …) return None → caller
+/// cancels the pending operation.
+fn key_to_literal_char(key: &str) -> Option<char> {
+    match key {
+        " " | "SPACE" => Some(' '),
+        "TAB" | "S-TAB" => Some('\t'),
+        "ENTER" | "\n" | "\r" | "C-M" | "C-J" => Some('\n'),
+        _ => {
+            let mut it = key.chars();
+            let c = it.next()?;
+            if it.next().is_none() && !c.is_control() { Some(c) } else { None }
+        }
+    }
+}
+
 impl Pending {
     fn count(&self) -> usize {
         let c1 = self.count1.unwrap_or(1);
@@ -526,6 +556,12 @@ struct App {
     /// stays put. Past-line-end cells render as styled blanks.
     vblock_anchor_vcol: usize,
     vblock_cur_vcol: usize,
+    /// Set when a Visual Block change (`c`/`s`/`C`) enters Insert mode.
+    /// On the next ESC the text typed on the top line is replicated to
+    /// the remaining block lines at the same column (vim block-insert).
+    block_insert: Option<BlockInsert>,
+    /// True while a Visual-mode `r` awaits its replacement char.
+    visual_replace_pending: bool,
     /// Last completed change, for `.` repeat.
     last_change: Option<LastChange>,
     /// While true we're capturing keystrokes typed in Insert mode after a
@@ -699,6 +735,8 @@ impl App {
             regs: Registers::load(),
             search: SearchState::new(),
             visual_anchor: 0,
+            block_insert: None,
+            visual_replace_pending: false,
             visual_anchor_line: 0,
             visual_anchor_col: 0,
             vblock_anchor_vcol: 0,
@@ -2837,6 +2875,37 @@ impl App {
             return false;
         }
 
+        // Awaiting a single character (for r, f, F, t, T)? Checked
+        // BEFORE every single-key command handler (space-fold, mark
+        // set/jump, z-prefix, …) so the target char is always taken
+        // as data, never re-interpreted as a command. Without this
+        // ordering `r<Space>` toggled a fold, `rm` set a mark, `rz`
+        // started the z-prefix, etc.
+        if let Some(op) = self.pending.awaiting_char {
+            self.pending.awaiting_char = None;
+            if key == "ESC" || key == "C-[" || key == "C-C" {
+                self.pending.clear();
+                return false;
+            }
+            // Resolve named keys to a literal char (TAB→tab,
+            // ENTER→newline, SPACE→space). Named keys with no literal
+            // form (LEFT, UP, F1, …) cancel.
+            let c = match key_to_literal_char(key) {
+                Some(ch) => ch,
+                None => { self.pending.clear(); return false; }
+            };
+            match op {
+                'r' => self.do_replace_char(c),
+                'f' => self.do_find_forward(c, false),
+                'F' => self.do_find_backward(c, false),
+                't' => self.do_find_forward(c, true),
+                'T' => self.do_find_backward(c, true),
+                _ => {}
+            }
+            self.pending.clear();
+            return false;
+        }
+
         // Mark dispatch.
         if self.mark_set_prefix {
             self.mark_set_prefix = false;
@@ -3117,26 +3186,6 @@ impl App {
                     register: self.pending.register,
                     insert_text: String::new(),
                 });
-            }
-            self.pending.clear();
-            return false;
-        }
-
-        // Awaiting a single character (for r, f, F, t, T)?
-        if let Some(op) = self.pending.awaiting_char {
-            self.pending.awaiting_char = None;
-            if key == "ESC" { self.pending.clear(); return false; }
-            let c = match key.chars().next() {
-                Some(ch) if !ch.is_control() => ch,
-                _ => { self.pending.clear(); return false; }
-            };
-            match op {
-                'r' => self.do_replace_char(c),
-                'f' => self.do_find_forward(c, false),
-                'F' => self.do_find_backward(c, false),
-                't' => self.do_find_forward(c, true),
-                'T' => self.do_find_backward(c, true),
-                _ => {}
             }
             self.pending.clear();
             return false;
@@ -5144,6 +5193,24 @@ impl App {
 
     fn handle_visual(&mut self, key: &str) -> bool {
         if let Some(q) = self.try_keymap("visual", key) { return q; }
+        // `r` <char>: replace every char in the selection. Checked
+        // first so the replacement char isn't re-interpreted as a
+        // visual command.
+        if self.visual_replace_pending {
+            self.visual_replace_pending = false;
+            if key == "ESC" || key == "C-[" || key == "C-C" {
+                self.mode = Mode::Normal;
+                self.pending.clear();
+                return false;
+            }
+            if let Some(ch) = key_to_literal_char(key) {
+                self.apply_visual_replace(ch);
+            } else {
+                self.mode = Mode::Normal;
+                self.pending.clear();
+            }
+            return false;
+        }
         // Leader (`\`) prefix dispatch — works in Visual just like in
         // Normal so `\s` (sort), `\R` (renumber), `\z`/`\x`
         // (encrypt/decrypt visual range), etc. fire instead of `s`
@@ -5187,6 +5254,12 @@ impl App {
             }
             "c" | "C" | "s" => {
                 self.apply_visual_op('c');
+                return false;
+            }
+            "r" => {
+                // Arm: next key is the replacement char (handled at the
+                // top of handle_visual on the following call).
+                self.visual_replace_pending = true;
                 return false;
             }
             "y" | "Y" => {
@@ -5357,15 +5430,22 @@ impl App {
             _ => return,
         };
         let text: String = self.buf.rope.byte_slice(s..e).to_string();
-        let transformed: String = text.chars().map(|c| match op {
-            CaseOp::Lower => c.to_ascii_lowercase(),
-            CaseOp::Upper => c.to_ascii_uppercase(),
-            CaseOp::Toggle => {
-                if c.is_ascii_uppercase() { c.to_ascii_lowercase() }
-                else if c.is_ascii_lowercase() { c.to_ascii_uppercase() }
-                else { c }
+        // Unicode-aware case mapping (not to_ascii_*): æøåÆØÅ and other
+        // non-ASCII letters must fold too. char::to_lowercase /
+        // to_uppercase yield iterators (a few chars expand, e.g. ß),
+        // so build the string with `extend`.
+        let mut transformed = String::with_capacity(text.len());
+        for c in text.chars() {
+            match op {
+                CaseOp::Lower => transformed.extend(c.to_lowercase()),
+                CaseOp::Upper => transformed.extend(c.to_uppercase()),
+                CaseOp::Toggle => {
+                    if c.is_uppercase() { transformed.extend(c.to_lowercase()); }
+                    else if c.is_lowercase() { transformed.extend(c.to_uppercase()); }
+                    else { transformed.push(c); }
+                }
             }
-        }).collect();
+        }
         self.buf.apply(s, e, &transformed);
         self.cursor_to_byte(s);
         self.mode = Mode::Normal;
@@ -5427,7 +5507,86 @@ impl App {
         let (b, _) = byte_at_or_past_col(&top_line, v1, ts);
         self.cur_col = b.min(top_line.len());
         self.want_col = self.cur_col;
-        if op == 'c' { self.enter_insert(); }
+        if op == 'c' {
+            self.enter_insert();
+            // Arm block-insert replication: text typed on the top line
+            // (l1) gets copied to l1+1..=l2 at column v1 on ESC. Empty
+            // range (single-line block) → nothing to replicate.
+            let lines: Vec<usize> = ((l1 + 1)..=l2).collect();
+            if !lines.is_empty() {
+                self.block_insert = Some(BlockInsert { vcol: v1, lines });
+            }
+        }
+    }
+
+    /// Copy `text` into each line of a block-insert at display column
+    /// `vcol`. Called on ESC after a Visual Block `c`/`s`. Lines too
+    /// short to reach `vcol` are left untouched (vim behaviour).
+    fn replicate_block_insert(&mut self, vcol: usize, lines: &[usize], text: &str) {
+        if text.is_empty() { return; }
+        let ts = self.tabstop();
+        self.buf.begin_compound();
+        // Bottom-up so earlier line byte offsets stay valid as we edit.
+        let mut sorted: Vec<usize> = lines.to_vec();
+        sorted.sort_unstable();
+        for &line in sorted.iter().rev() {
+            if line >= self.buf.line_count() { continue; }
+            let line_text = self.buf.line(line);
+            let (byte, start_vcol) = byte_at_or_past_col(&line_text, vcol, ts);
+            if start_vcol < vcol { continue; } // line ends before the block column
+            let off = self.buf.line_byte_offset(line) + byte;
+            self.buf.apply(off, off, text);
+        }
+        self.buf.end_compound();
+    }
+
+    /// Replace every character in the active visual selection with
+    /// `ch` (vim's `r` in Visual / VisualLine / VisualBlock). Newlines
+    /// in a charwise/linewise selection are preserved.
+    fn apply_visual_replace(&mut self, ch: char) {
+        let repl_str = ch.to_string();
+        match self.mode {
+            Mode::VisualBlock => {
+                let l1 = self.visual_anchor_line.min(self.cur_line);
+                let l2 = self.visual_anchor_line.max(self.cur_line);
+                let v1 = self.vblock_anchor_vcol.min(self.vblock_cur_vcol);
+                let v2 = self.vblock_anchor_vcol.max(self.vblock_cur_vcol);
+                let ts = self.tabstop();
+                self.buf.begin_compound();
+                for line in (l1..=l2).rev() {
+                    let line_text = self.buf.line(line);
+                    let (sb, _) = byte_at_or_past_col(&line_text, v1, ts);
+                    let (eb, _) = byte_at_or_past_col(&line_text, v2 + 1, ts);
+                    if eb <= sb { continue; } // line doesn't reach the block
+                    // Preserve cell count: one `ch` per existing char.
+                    let n = line_text[sb..eb].chars().count();
+                    let repl: String = std::iter::repeat(ch).take(n).collect();
+                    let off = self.buf.line_byte_offset(line);
+                    self.buf.apply(off + sb, off + eb, &repl);
+                }
+                self.buf.end_compound();
+                self.cur_line = l1;
+                let top = self.buf.line(self.cur_line);
+                let (b, _) = byte_at_or_past_col(&top, v1, ts);
+                self.cur_col = b.min(top.len());
+                self.want_col = self.cur_col;
+            }
+            Mode::Visual | Mode::VisualLine => {
+                let (s, e) = if matches!(self.mode, Mode::VisualLine) {
+                    self.visual_line_range()
+                } else {
+                    self.visual_range()
+                };
+                let text = self.buf.rope.byte_slice(s..e).to_string();
+                let repl: String = text.chars()
+                    .map(|c| if c == '\n' { '\n' } else { ch }).collect();
+                self.buf.apply(s, e, &repl);
+                self.cursor_to_byte(s);
+            }
+            _ => { let _ = repl_str; }
+        }
+        self.mode = Mode::Normal;
+        self.pending.clear();
     }
 
     // ── Operators ──────────────────────────────────────────────────────
@@ -5870,9 +6029,12 @@ impl App {
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
                 self.clamp_col_to_line();
+                let block = self.block_insert.take();
+                let mut block_text = String::new();
                 if self.capturing_insert {
                     let captured = std::mem::take(&mut self.captured_insert);
                     self.capturing_insert = false;
+                    if block.is_some() { block_text = captured.clone(); }
                     // If a `c`-op preceded this insert, splice the text into
                     // its captured LastChange so dot replays the full change.
                     if let Some(LastChange::Op { ref mut insert_text, .. }) = self.last_change {
@@ -5885,6 +6047,15 @@ impl App {
                         });
                     }
                 }
+                // Block-insert replication: copy the top-line text onto
+                // the rest of the block. vim breaks the block insert if
+                // a newline was typed, so only single-line inserts
+                // replicate.
+                if let Some(bi) = block {
+                    if !block_text.is_empty() && !block_text.contains('\n') {
+                        self.replicate_block_insert(bi.vcol, &bi.lines, &block_text);
+                    }
+                }
                 // Recheck spelling on Insert→Normal: cheap for typical mail
                 // bodies, gives instant feedback the moment the user pauses.
                 if self.spell_enabled { self.recheck_spell(); }
@@ -5895,6 +6066,18 @@ impl App {
             "RIGHT" => self.move_right_wrap(),
             "UP"    => self.move_up(),
             "DOWN"  => self.move_down(),
+            // Page motion in Insert mode (vim parity — PageUp/PageDown
+            // work mid-insert). Half-page steps via repeated move_up /
+            // move_down so the insert-mode column clamp (one past EOL)
+            // and want_col tracking match the single-arrow behaviour.
+            "PgUP" => {
+                let step = (self.main_p.h as usize) / 2;
+                for _ in 0..step { self.move_up(); }
+            }
+            "PgDOWN" => {
+                let step = (self.main_p.h as usize) / 2;
+                for _ in 0..step { self.move_down(); }
+            }
             // Ctrl-Up / Ctrl-Down move the current line (parity with
             // Normal mode). Capturing-insert recording sees this as
             // an opaque action; replay via dot still works because
