@@ -1,0 +1,187 @@
+HyperList
+	[1+] HyperList Item
+		[?] Starter; OR: 
+			Identifier (Numbers: Format = "1.1.1.1", Mixed: Format = "1A1A")
+				[? Multi-line Item] The Identifier acts like the plus sign ("+")
+			Multi-line Indicator = "+"
+				+ If one Item on a certain indent is multi-line, all Items on the same indent
+				 (including single-line Items) must start with a plus sign ("+") or <Identifier>
+				 and all lines on the same indent after the first line must start with a space
+		[?] Type
+			OR: 
+				State = "S:" or "|"
+				Transition = "T:" or "/"
+			Children inherit Type from parent unless marked with different Type
+			Can be skipped when the Item is obviously a state or transition
+		Content; AND/OR: 
+			Element; AND/OR:	
+				Operator
+					Anything operating on an Item or a set of Items
+						[? Set of Items] Items are indented below the Operator
+					Can be any of the usual logical operators
+					Is written in capitals ending in a colon and a space
+						EXAMPLES: "AND: ", "OR: ", "AND/OR: ", "NOT: ", "IMPLIES: "
+					Can contain a Comment to specify the Operator
+						EXAMPLE: "OR(PRIORITY): "
+							Sub-Items are to be chosen in the order of priority as listed
+					To make the Item run continuously, use "CONTINUOUS: " 
+						Item is done concurrent with remaining Items
+						The Operator can be combined with a timestamp Tag
+							EXAMPLE: "CONTINUOUS: YYYY-MM-07:" = Do the Item weekly
+					To show that an Item is encrypted or is to be encrypted, use "ENCRYPTION: "
+						OR: 
+							 The encrypted block can be correctly indented
+							 The encrypted block contains indentation and is left justified
+									This would seem to break the list, but is allowed
+					A block can be included of "literal text" negating any HyperList markup
+						Use a HyperList Item containing only the Operator "\" to mark start/end
+							EXAMPLE: 
+								\
+								This is a block of literal text...
+								Where nothing counts as HyperList markup
+								Thus - neither this: [?] nor THIS: <Test> - are seen as markup
+								...until we end this block with...
+								\
+				Qualifier
+					Any statement in square brackets that qualifies an Item
+					Specifies under what conditions an Item is to be executed, exists or is valid
+					Several Qualifiers can be strung together, separated by commas
+						All Qualifiers need to be fulfilled for the Item to be valid
+						EXAMPLE: "[+YYYY-MM-DD 02.30, Button color = Red, 4, ?] Push button"
+					Successive Qualifiers can be strung together, separated by periods; EXAMPLE: 
+						"[Apples. Oranges. Grapes]"
+							Do Item in the context of "apples", then "oranges", then "grapes"
+					EXAMPLES: 
+						Do Item 3 times = "[3]"
+						Do Item if "the mail has arrived" = "[The mail has arrived]"
+						Do Item 2 times while "foo=true" = "[2, foo=true]"
+						Do Item from 3 to 5 times while "bar=false" = "[3..5, bar=false]"
+						Do Item 1 or more times = "[1+]"
+						Do Item 1 or more times while "Bob is polite" = "[1+, Bob is polite]"
+						Do Item up to 4 times only while "zoo=0" = "[<4, zoo=0]"
+					Optional Item = "[?]"
+					Timestamp Qualifier = "[YYYY-MM-DD hh.mm.ss]"
+						Shorten the format to the appropriate granularity
+					Time relations
+						Length of time to wait before doing the Item = "[+YYYY-MM-DD]"
+						Less than a certain length of time after previous Item = "[<+YYYY-MM-DD]"
+						More than a certain length of time after previous Item = "[>+YYYY-MM-DD]"
+						Length of time to wait before doing next Item = "[-YYYY-MM-DD]"
+						Less than a certain length of time before next Item = "[<-YYYY-MM-DD]"
+						More than a certain length of time before next Item = "[>-YYYY-MM-DD]"
+						Length of time to wait after doing referenced Item = "[+YYYY-MM-DD<Item]>"
+						Other obvious time indicators may be used; EXAMPLES: 
+							"[+1 week]"
+							"[-2 Martian years]"
+						EXAMPLES: 
+							Wait one month before doing the Item = "[+YYYY-01-DD]"
+							Do Item less than 4 days before next Item = "[<-YYYY-MM-04]"
+							Wait one year and two days after Item X = "[+0001-00-02<X>]"
+						Time repetition
+							Obvious/intuitive repetition
+								EXAMPLES: 
+									"[YYYY-MM-03]" = The third of every month
+									"[YYYY-12-DD]" = Every day in every December
+									"[2011-MM-05]" = The fifth of every month of 2011
+									"[Tue,Fri 12.00]" = Noon every Tuesday and Friday
+							Strict convention
+								Format = YYYY-MM-DD+X Day hh.mm+Y - YYYY-MM-DD hh.mm; EXAMPLES: 
+									"[2011-05-01+7 13.00]" = 2011-05-01 1pm, repeated every 7 days
+									"[2011-05-01+2,3,2]" = Every 2, then 3, then 2 days, in repetition
+									"[2011-05-01+2 - 2012-05-01]" = Every second day for one year
+									"[2011-05-01 13.00+1]" = 2011-05-01 1pm, repeated every hour
+									"[2011-05-01 Fri,Sat - 2011-10-01]" = Every Fri & Sat in time interval
+						Checking off Items
+							Unchecked Item = "[_]"
+							Item in progress = "[O]"
+							Checked Item = "[x]" 
+								[?] Timestamp Tag after ("[x] YYYY-MM-DD hh.mm:ss:")
+				Substitution
+					Any statement in curly brackets is a substitution; EXAMPLES: 
+						"[fruit = apples, oranges, bananas] Eat {fruit}"
+							Eat apples, then oranges, then bananas
+						"Ask which painting she likes the best; Buy {painting}"
+				Property
+					Any attribute to the <Content>, ending in a colon and a space
+						Gives additional information or description to the Item
+					EXAMPLES: 
+						"Location = Someplace:", "Color = Green:", "Strength = Medium:" and "In Norway:"
+				Description
+					The main body of the HyperList Item, the "meat" of the line
+			Additive; AND/OR: 
+				Reference
+					+ An Item name or Identifier, list name or anything else
+					 enclosed in angle brackets ("<>"); EXAMPLES: 
+						Reference to a website = "<http://www.isene.org/>"
+						Reference to a file = "<file:/path/to/filename>"
+					+ There are two types of References; OR: 
+						Redirection (hard Reference)
+							An Item consisting only of a Reference is a redirection
+								For a transition Item = Jump to referenced Item and execute
+									+ If the redirect is to jump back after executing 
+									 the referenced Item (and its children), then add another 
+									 set of angle brackets (<<Referenced Item>>)
+										+ EXAMPLE: Use this when creating subroutines at 
+										 the end of the list
+								For a state Item = Include the referenced Item
+							An Item consisting only of the key word "SKIP"
+								Ends the current HyperList level
+							An Item consisting only of the key word "END" 
+								Ends the whole HyperList
+						Soft Reference
+							Reference is part of an Item
+								Look at referenced Item for info only
+							Even softer Reference = have the Reference in parentheses
+								An Item that is only something apropos
+					+ A Reference to any Item upward in the HyperList is simply a
+					 Reference to the Item's <Content>
+					+ A Reference containing several levels down a HyperList needs a "/" 
+					 to separate each level, like a "path" (as with a URL) to the Item
+					+ To make a Reference to a different branch in a HyperList, 
+					 start the Reference from the highest common level on the list
+					 and include all Items down to the referenced Item
+						EXAMPLE: Reference from here to <Hyperlist Item/Starter/Identifier>
+					+ For long Items in a Reference, concatenation can be used
+						The concatenation must be unique
+							EXAMPLE: Reference from here to <Additive/Comment/Anything...>
+				Tag
+					A hash sign followed by any letters or numbers, used as a marker (#Tagged)
+					Is not executed as a HyperList command
+				Comment
+					Anything within parentheses is a Comment
+					Is not executed as a HyperList command
+				Quote
+					Anything in quotation marks is a Quote
+					Is not executed as a HyperList command
+				Change Markup; OR: 
+					Deletion
+						Remove the Item by adding "##<" at the end of the Item
+					Motion; OPTIONS: 
+						Move the Item by adding "##><Reference>"
+							This moves the Item just below the referenced Item
+						Move the Item one level in by adding "##<-" at the end of the Item
+						Move the Item one level out by adding "##->" at the end of the Item
+							EXAMPLE: Move an Item as a child to referenced Item = "##><Reference>##->"
+					Changed Item
+						Prefix an Item with "##Text##" to signify that a change has been made
+							Add information inside the angle brackets as appropriate
+								EXAMPLE: To show who changed it and when = "##John 2012-03-21##"
+		Separator 
+			OR: 
+				Semicolon
+					A semicolon is used to separate two HyperList Items on the same line
+				Newline
+					Used to add another Item on the same level
+					Indent
+						A Tab or an asterisk ("*")
+							Used to add a child
+								A child adds information to its parent
+								A child is another regular <HyperList Item>
+			Definition
+				A Separator and the same or less indent normally reads "then:"
+				[? Parent contains <Description>] 
+					The Separator and right indent reads "with:" or "consists of:"
+				[? NOT: parent contains <Description>] 
+					The Separator and right indent reads "applies to:"
+					A Separator between the children reads "and:"
+
