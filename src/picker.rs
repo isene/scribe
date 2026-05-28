@@ -118,7 +118,19 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
     let mut query = String::new();
     let mut cursor: usize = 0;
     let mut scroll: usize = 0;
-    let body_rows = (popup_h as usize).saturating_sub(6);  // chrome takes 6 rows
+
+    // Selected tab gets an orange bg. `style::bg_rgb` closes with
+    // `\x1b[49m` (reset bg to the TERMINAL default), not the popup bg,
+    // so after the orange run we explicitly restore the panel bg
+    // (POPUP_BG) or the rest of the row renders dark.
+    let tab_label = |label: &str, selected: bool| -> String {
+        if selected {
+            format!("{}\x1b[48;5;{}m",
+                style::bg_rgb(&style::fg(label, 16), "f74c00"), POPUP_BG)
+        } else {
+            style::fg(label, 244)
+        }
+    };
 
     // Hide the terminal cursor so it doesn't blink through the popup.
     Cursor::hide();
@@ -129,6 +141,40 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
         let filtered: Vec<&Entry> = all.iter().filter(|e| matches(e, &query)).collect();
         if cursor >= filtered.len() && !filtered.is_empty() { cursor = filtered.len() - 1; }
         if filtered.is_empty() { cursor = 0; }
+
+        // Pack the tab strip into rows ourselves with a fixed 2-space
+        // indent per row. Letting the pane auto-wrap the single strip
+        // broke a wrap inside a tab's " label " padding: it dropped the
+        // selected tab's leading space, so its orange bg started flush
+        // against the glyph (the "Objects" tab at the start of the
+        // wrapped second row). Packing by hand never splits a label, so
+        // every selected bg keeps its left pad.
+        let content_w = (popup_w as usize).saturating_sub(4);
+        let mut tab_defs: Vec<(String, bool)> = vec![
+            (format!(" {} ", Tab::All.title()), tab == Tab::All),
+            (format!(" {} ", Tab::Digraphs.title()), tab == Tab::Digraphs),
+        ];
+        for (i, cat) in EMOJI_CATEGORIES.iter().enumerate() {
+            tab_defs.push((format!(" {} ", cat.name), tab == Tab::Emoji(i)));
+        }
+        let mut tab_rows: Vec<String> = Vec::new();
+        let mut row = String::from("  ");
+        let mut row_w = 2usize;
+        for (label, selected) in &tab_defs {
+            let w = label.chars().count() + 1; // label + trailing separator
+            if row_w + w > content_w && row_w > 2 {
+                tab_rows.push(std::mem::replace(&mut row, String::from("  ")));
+                row_w = 2;
+            }
+            row.push_str(&tab_label(label, *selected));
+            row.push(' ');
+            row_w += w;
+        }
+        if row_w > 2 { tab_rows.push(row); }
+
+        // Chrome = top pad + tab rows + divider + search + divider + hint.
+        let body_rows = (popup_h as usize).saturating_sub(5 + tab_rows.len());
+
         // Scroll window keeps cursor visible.
         if cursor < scroll { scroll = cursor; }
         if cursor >= scroll + body_rows { scroll = cursor + 1 - body_rows; }
@@ -136,35 +182,7 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
         // ---- Render ----
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
-        // Tab strip. The selected tab gets an orange bg; the trick is
-        // that `style::bg_rgb` closes with `\x1b[49m` (reset bg to the
-        // TERMINAL default), not to the popup's bg. On a line that
-        // continues past the highlighted tab (the wrapped second row),
-        // the following tabs then render on the terminal default —
-        // visible as a dark box. So after the orange tab we explicitly
-        // restore the panel bg (236, matching Popup::centered below).
-        let tab_label = |label: &str, selected: bool| -> String {
-            if selected {
-                format!("{}\x1b[48;5;{}m",
-                    style::bg_rgb(&style::fg(label, 16), "f74c00"), POPUP_BG)
-            } else {
-                style::fg(label, 244)
-            }
-        };
-        let mut tab_strip = String::from("  ");
-        for &(t, _shortcut) in &[
-            (Tab::All, "A"), (Tab::Digraphs, "D"),
-        ] {
-            let label = format!(" {} ", t.title());
-            tab_strip.push_str(&tab_label(&label, t == tab));
-            tab_strip.push(' ');
-        }
-        for (i, cat) in EMOJI_CATEGORIES.iter().enumerate() {
-            let label = format!(" {} ", cat.name);
-            tab_strip.push_str(&tab_label(&label, tab == Tab::Emoji(i)));
-            tab_strip.push(' ');
-        }
-        lines.push(tab_strip);
+        for r in &tab_rows { lines.push(r.clone()); }
         lines.push(style::fg(&format!("  {}", "─".repeat(popup_w as usize - 4)), 238));
         // Search line
         let search_label = style::fg(" search:  ", 81);
