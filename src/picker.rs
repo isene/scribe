@@ -10,6 +10,11 @@ use crust::{Cursor, Input, Pane, Popup, style};
 use crate::digraphs::{DIGRAPHS, Digraph};
 use crate::emoji_data::EMOJI_CATEGORIES;
 
+/// Popup panel background (256-color index). Used both to build the
+/// popup and to restore the bg after a truecolor-bg selected tab, so
+/// the rest of the tab strip keeps the panel colour.
+const POPUP_BG: u16 = 236;
+
 /// A single item in the picker (one per row).
 struct Entry<'a> {
     glyph: &'a str,
@@ -103,7 +108,7 @@ fn matches(entry: &Entry, query: &str) -> bool {
 pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<String> {
     let popup_w: u16 = 72;
     let popup_h: u16 = 22;
-    let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+    let mut popup = Popup::centered(popup_w, popup_h, 252, POPUP_BG);
 
     let mut tab: Tab = match initial_tab {
         InitialTab::All       => Tab::All,
@@ -131,28 +136,32 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
         // ---- Render ----
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
-        // Tab strip
+        // Tab strip. The selected tab gets an orange bg; the trick is
+        // that `style::bg_rgb` closes with `\x1b[49m` (reset bg to the
+        // TERMINAL default), not to the popup's bg. On a line that
+        // continues past the highlighted tab (the wrapped second row),
+        // the following tabs then render on the terminal default —
+        // visible as a dark box. So after the orange tab we explicitly
+        // restore the panel bg (236, matching Popup::centered below).
+        let tab_label = |label: &str, selected: bool| -> String {
+            if selected {
+                format!("{}\x1b[48;5;{}m",
+                    style::bg_rgb(&style::fg(label, 16), "f74c00"), POPUP_BG)
+            } else {
+                style::fg(label, 244)
+            }
+        };
         let mut tab_strip = String::from("  ");
         for &(t, _shortcut) in &[
             (Tab::All, "A"), (Tab::Digraphs, "D"),
         ] {
             let label = format!(" {} ", t.title());
-            let styled = if t == tab {
-                style::bg_rgb(&style::fg(&label, 16), "f74c00")
-            } else {
-                style::fg(&label, 244)
-            };
-            tab_strip.push_str(&styled);
+            tab_strip.push_str(&tab_label(&label, t == tab));
             tab_strip.push(' ');
         }
         for (i, cat) in EMOJI_CATEGORIES.iter().enumerate() {
             let label = format!(" {} ", cat.name);
-            let styled = if tab == Tab::Emoji(i) {
-                style::bg_rgb(&style::fg(&label, 16), "f74c00")
-            } else {
-                style::fg(&label, 244)
-            };
-            tab_strip.push_str(&styled);
+            tab_strip.push_str(&tab_label(&label, tab == Tab::Emoji(i)));
             tab_strip.push(' ');
         }
         lines.push(tab_strip);

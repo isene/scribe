@@ -503,6 +503,17 @@ struct BlockInsert {
 /// `key.chars().next()` would grab the first letter ('T'/'E'). Named
 /// keys with no literal form (LEFT, UP, F1, …) return None → caller
 /// cancels the pending operation.
+/// Jump-class motions that should record the pre-move position in
+/// the `'` mark (so `''` / `` `` `` returns there). Matches vim's
+/// jumplist-setting motions. Line/word/char motions are deliberately
+/// excluded.
+fn is_jump_motion(key: &str) -> bool {
+    matches!(key,
+        "G" | "gg" | "n" | "N"
+        | "{" | "}" | "(" | ")" | "%"
+        | "H" | "M" | "L" | "[[" | "]]")
+}
+
 fn key_to_literal_char(key: &str) -> Option<char> {
     match key {
         " " | "SPACE" => Some(' '),
@@ -2922,8 +2933,13 @@ impl App {
             let exact = self.mark_jump_exact;
             self.mark_jump_exact = false;
             if let Some(c) = key.chars().next() {
-                if c.is_ascii_alphabetic() {
-                    if let Some(&byte) = self.marks.get(&c) {
+                // `''` / `` `` `` (and `'`` / `` `' ``) jump to the
+                // auto "previous location" mark, stored under '\''.
+                // Any of `'` / `` ` `` as the target resolves to it.
+                let is_prev = c == '\'' || c == '`';
+                let lookup = if is_prev { '\'' } else { c };
+                if c.is_ascii_alphabetic() || is_prev {
+                    if let Some(&byte) = self.marks.get(&lookup) {
                         // Operator-pending: `d'a` / `y'a` / `c'a` (and
                         // ``-variants) act as a range from the cursor's
                         // current position to the mark. `'` selects a
@@ -2951,6 +2967,10 @@ impl App {
                             self.pending.clear();
                             return false;
                         }
+                        // For `''` / `` `` ``, swap: stash the current
+                        // position back into the `'` mark so repeating
+                        // `''` toggles between the two locations (vim).
+                        let prev = self.cursor_byte();
                         self.cursor_to_byte(byte);
                         if !exact {
                             // `'a` lands on first non-blank of the
@@ -2958,6 +2978,9 @@ impl App {
                             let off = motion::line_first_nonblank(
                                 &self.buf, self.cursor_byte());
                             self.cursor_to_byte(off);
+                        }
+                        if is_prev {
+                            self.marks.insert('\'', prev);
                         }
                     } else {
                         self.set_status(&format!(" mark '{} not set", c), 196);
@@ -3396,6 +3419,13 @@ impl App {
                     });
                 }
             } else {
+                // Record the pre-jump position in the `'` mark so
+                // `''` / `` `` `` returns here (minimal single-slot
+                // jumplist). Only for jump-class motions — line/char
+                // motions (h/j/k/l/w/b/…) don't set it, matching vim.
+                if is_jump_motion(key) {
+                    self.marks.insert('\'', self.cursor_byte());
+                }
                 self.cursor_to_byte(target_byte);
             }
             self.pending.clear();
