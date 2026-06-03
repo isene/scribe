@@ -391,7 +391,7 @@ Scribe accepts `+N` for line-jump (vim convention), so kastrup's compose flow dr
 
 ## HyperList
 
-Scribe ships with full `hyperlist.vim` parity for `.hl` and `.woim` files: indent folding, autonumbering, encryption (incl. dotfile auto-encrypt, byte-for-byte compatible with the Ruby `hyperlist` app's `ENC:` format), references, presentation mode, calendar export, HTML / LaTeX / Markdown export, and more.
+Scribe ships with full `hyperlist.vim` parity for `.hl` and `.woim` files: indent folding, autonumbering, encryption (dotfile auto-encrypt, reading both the Ruby `hyperlist` app's `ENC:` envelope and the vim plugin's `openssl aes-256-cbc -pbkdf2 -salt` form, and preserving whichever a file uses on save), references, presentation mode, calendar export, HTML / LaTeX / Markdown export, and more.
 
 All HyperList commands live behind the `\` leader. Highlights:
 

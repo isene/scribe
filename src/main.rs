@@ -129,7 +129,8 @@ fn main() {
                 }
                 match buffer::decrypt(&cipher, &pw) {
                     Ok(plain) => {
-                        app.buf = buffer::Buffer::from_decrypted(p.clone(), plain, pw);
+                        let openssl_fmt = buffer::is_openssl_blob(&cipher);
+                        app.buf = buffer::Buffer::from_decrypted(p.clone(), plain, pw, openssl_fmt);
                         // Defensive: force HL kind when the path's
                         // extension says HL. `detect_kind` already
                         // does this, but if the path got mangled

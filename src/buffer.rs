@@ -93,6 +93,11 @@ pub struct Buffer {
     /// In-memory password for the encrypted file. Never persisted.
     /// Cleared when the buffer is replaced (`:e <other>`).
     pub password: Option<String>,
+    /// True when the encrypted file uses the openssl `Salted__` envelope
+    /// (`openssl aes-256-cbc -e -pbkdf2 -a -salt`, as written by the vim
+    /// HyperList plugin) rather than scribe's `ENC:` one. Saves preserve the
+    /// format so the file stays readable by whichever tool owns it.
+    pub openssl_format: bool,
 }
 
 impl Buffer {
@@ -105,6 +110,7 @@ impl Buffer {
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: false,
             password: None,
+            openssl_format: false,
         }
     }
 
@@ -120,11 +126,14 @@ impl Buffer {
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: false,
             password: None,
+            openssl_format: false,
         })
     }
 
-    /// Used by the dotfile auto-decrypt path in main().
-    pub fn from_decrypted(path: PathBuf, plaintext: String, password: String) -> Self {
+    /// Used by the dotfile auto-decrypt path in main(). `openssl_format` is
+    /// true when the on-disk file is the openssl `Salted__` envelope, so saves
+    /// re-encrypt in that form rather than scribe's `ENC:`.
+    pub fn from_decrypted(path: PathBuf, plaintext: String, password: String, openssl_format: bool) -> Self {
         let kind = detect_kind(&path, &plaintext);
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Self {
@@ -135,6 +144,7 @@ impl Buffer {
             compound_depth: 0, pending_compound: Vec::new(),
             encrypted: true,
             password: Some(password),
+            openssl_format,
         }
     }
 
@@ -201,7 +211,14 @@ impl Buffer {
             let pw = self.password.clone()
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other,
                     "encrypted but no cached password — re-open the file"))?;
-            let cipher = encrypt(&s, &pw)?;
+            // Preserve the on-disk envelope: openssl `Salted__` (vim plugin)
+            // or scribe's `ENC:`. Converting silently would lock out the other
+            // tool that owns the file.
+            let cipher = if self.openssl_format {
+                encrypt_openssl(&s, &pw)?
+            } else {
+                encrypt(&s, &pw)?
+            };
             std::fs::write(&path, cipher)?;
         } else {
             std::fs::write(&path, s)?;
@@ -338,9 +355,19 @@ pub fn is_encrypted_dotfile(path: &PathBuf) -> bool {
     looks_like_enc_file(path)
 }
 
+/// base64 of the openssl 8-byte "Salted__" magic always starts with this.
+const OPENSSL_B64_PREFIX: &str = "U2FsdGVkX1";
+
 fn looks_like_enc_file(path: &PathBuf) -> bool {
     let Ok(s) = std::fs::read_to_string(path) else { return false };
-    s.trim_start().starts_with("ENC:")
+    let t = s.trim_start();
+    t.starts_with("ENC:") || t.starts_with(OPENSSL_B64_PREFIX)
+}
+
+/// True when `content` is the openssl `Salted__` envelope (base64). Used by
+/// the open path to remember the format so saves preserve it.
+pub fn is_openssl_blob(content: &str) -> bool {
+    content.trim_start().starts_with(OPENSSL_B64_PREFIX)
 }
 
 /// HL encryption scheme — byte-for-byte compatible with the Ruby
@@ -379,9 +406,20 @@ pub fn encrypt(plaintext: &str, password: &str) -> std::io::Result<String> {
     Ok(format!("ENC:{}", base64::engine::general_purpose::STANDARD.encode(combined)))
 }
 
-/// Decrypt the HL `ENC:` envelope written by [`encrypt`] (or by the
-/// Ruby `hyperlist` app). Returns the plaintext.
+/// Decrypt either HL envelope: scribe's `ENC:` (written by [`encrypt`] / the
+/// Ruby app) or the openssl `Salted__` form (`openssl aes-256-cbc -pbkdf2
+/// -salt`, the vim HyperList plugin). Auto-detected. Returns the plaintext.
 pub fn decrypt(ciphertext: &str, password: &str) -> std::io::Result<String> {
+    let t = ciphertext.trim_start();
+    if t.starts_with(OPENSSL_B64_PREFIX) {
+        decrypt_openssl(t, password)
+    } else {
+        decrypt_enc(ciphertext, password)
+    }
+}
+
+/// scribe `ENC:` envelope: base64(salt[16] ‖ iv[16] ‖ aes-256-cbc(ct)).
+fn decrypt_enc(ciphertext: &str, password: &str) -> std::io::Result<String> {
     use aes::Aes256;
     use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
     use base64::Engine as _;
@@ -411,6 +449,70 @@ pub fn decrypt(ciphertext: &str, password: &str) -> std::io::Result<String> {
             format!("utf-8: {}", e)))
 }
 
+/// openssl `Salted__` envelope: base64("Salted__" ‖ salt[8] ‖ ct), possibly
+/// wrapped across lines (`openssl -a`). key‖iv = PBKDF2-HMAC-SHA256(pw, salt,
+/// 10000, 48) — openssl `enc -pbkdf2` defaults (SHA-256 PRF, 10000 iters).
+fn decrypt_openssl(ciphertext: &str, password: &str) -> std::io::Result<String> {
+    use aes::Aes256;
+    use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use base64::Engine as _;
+    type Dec = cbc::Decryptor<Aes256>;
+
+    let b64: String = ciphertext.chars().filter(|c| !c.is_whitespace()).collect();
+    let blob = base64::engine::general_purpose::STANDARD.decode(b64)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("base64: {}", e)))?;
+    if blob.len() < 16 || &blob[0..8] != b"Salted__" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "not an openssl Salted__ blob"));
+    }
+    let salt = &blob[8..16];
+    let ct   = &blob[16..];
+    let (key, iv) = derive_key_iv(password, salt);
+
+    let cipher = Dec::new(key.as_slice().into(), iv.as_slice().into());
+    let pt = cipher.decrypt_padded_vec_mut::<Pkcs7>(ct)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other,
+            "decrypt failed (wrong password or corrupt data)"))?;
+    String::from_utf8(pt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("utf-8: {}", e)))
+}
+
+/// Encrypt into the openssl `Salted__` envelope, byte-compatible with
+/// `openssl aes-256-cbc -e -pbkdf2 -a -salt`. base64 wrapped at 64 columns
+/// with a trailing newline, matching openssl's own output.
+pub fn encrypt_openssl(plaintext: &str, password: &str) -> std::io::Result<String> {
+    use aes::Aes256;
+    use cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    use base64::Engine as _;
+    type Enc = cbc::Encryptor<Aes256>;
+
+    let mut salt = [0u8; 8];
+    getrandom::getrandom(&mut salt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("rng: {}", e)))?;
+    let (key, iv) = derive_key_iv(password, &salt);
+
+    let cipher = Enc::new(key.as_slice().into(), &iv.into());
+    let ct = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext.as_bytes());
+
+    let mut blob = Vec::with_capacity(16 + ct.len());
+    blob.extend_from_slice(b"Salted__");
+    blob.extend_from_slice(&salt);
+    blob.extend_from_slice(&ct);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+
+    let mut out = String::with_capacity(b64.len() + b64.len() / 64 + 1);
+    let mut i = 0;
+    while i < b64.len() {
+        let end = (i + 64).min(b64.len());
+        out.push_str(&b64[i..end]);
+        out.push('\n');
+        i = end;
+    }
+    Ok(out)
+}
+
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     use hmac::Hmac;
     use sha2::Sha256;
@@ -419,3 +521,59 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
         .expect("pbkdf2 cannot fail for 32-byte output");
     key
 }
+
+/// openssl key derivation: 48 bytes = aes-256 key (32) ‖ iv (16).
+fn derive_key_iv(password: &str, salt: &[u8]) -> ([u8; 32], [u8; 16]) {
+    use hmac::Hmac;
+    use sha2::Sha256;
+    let mut buf = [0u8; 48];
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 10000, &mut buf)
+        .expect("pbkdf2 cannot fail for 48-byte output");
+    let mut key = [0u8; 32];
+    let mut iv = [0u8; 16];
+    key.copy_from_slice(&buf[0..32]);
+    iv.copy_from_slice(&buf[32..48]);
+    (key, iv)
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::*;
+
+    #[test]
+    fn enc_roundtrip() {
+        let blob = encrypt("master: hunter2\nbank: s3cr3t", "pw").unwrap();
+        assert!(blob.starts_with("ENC:"));
+        assert!(!is_openssl_blob(&blob));
+        assert_eq!(decrypt(&blob, "pw").unwrap(), "master: hunter2\nbank: s3cr3t");
+    }
+
+    #[test]
+    fn openssl_roundtrip() {
+        let plain = "master: hunter2\nbank: s3cr3t\n";
+        let blob = encrypt_openssl(plain, "pw").unwrap();
+        assert!(is_openssl_blob(&blob));
+        // decrypt() must auto-detect and read it back.
+        assert_eq!(decrypt(&blob, "pw").unwrap(), plain);
+    }
+
+    #[test]
+    fn decrypt_openssl_cli_blob() {
+        // Produced by the EXACT vim-plugin command (and what the user's real
+        // ~/.tasks/.p.hl uses):
+        //   printf 'hello world\nsecond line\n' \
+        //     | openssl aes-256-cbc -e -pbkdf2 -a -salt -pass pass:testpassword
+        let blob = "U2FsdGVkX19EMO2mqlsCSLDsvL/TEE2KnUvyHyyoz1mQOvjS1a4Ea7clJGvoLT2G";
+        assert!(is_openssl_blob(blob));
+        assert_eq!(decrypt(blob, "testpassword").unwrap(), "hello world\nsecond line\n");
+    }
+
+    #[test]
+    fn wrong_password_fails_both() {
+        let enc = encrypt("secret", "right").unwrap();
+        assert!(decrypt(&enc, "wrong").is_err());
+        let ossl = encrypt_openssl("secret", "right").unwrap();
+        assert!(decrypt(&ossl, "wrong").is_err());
+    }
+}
+
