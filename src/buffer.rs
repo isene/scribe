@@ -115,7 +115,11 @@ impl Buffer {
     }
 
     pub fn from_path(path: PathBuf) -> std::io::Result<Self> {
-        let s = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut s = std::fs::read_to_string(&path).unwrap_or_default();
+        // Normalise CRLF / lone-CR to LF. A stray carriage return returns the
+        // terminal cursor to column 0 mid-line and shreds the render — common
+        // when opening a Windows-authored .txt downloaded from the web.
+        if s.contains('\r') { s = s.replace("\r\n", "\n").replace('\r', "\n"); }
         let kind = detect_kind(&path, &s);
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(Self {
@@ -134,6 +138,9 @@ impl Buffer {
     /// true when the on-disk file is the openssl `Salted__` envelope, so saves
     /// re-encrypt in that form rather than scribe's `ENC:`.
     pub fn from_decrypted(path: PathBuf, plaintext: String, password: String, openssl_format: bool) -> Self {
+        let plaintext = if plaintext.contains('\r') {
+            plaintext.replace("\r\n", "\n").replace('\r', "\n")
+        } else { plaintext };
         let kind = detect_kind(&path, &plaintext);
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Self {
@@ -156,7 +163,8 @@ impl Buffer {
         let Some(path) = self.path.clone() else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "no file"));
         };
-        let s = std::fs::read_to_string(&path)?;
+        let mut s = std::fs::read_to_string(&path)?;
+        if s.contains('\r') { s = s.replace("\r\n", "\n").replace('\r', "\n"); }
         self.rope = Rope::from_str(&s);
         self.dirty = false;
         self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
