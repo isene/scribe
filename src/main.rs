@@ -48,6 +48,7 @@ fn main() {
     let mut path: Option<PathBuf> = None;
     let mut cli_theme: Option<String> = None;
     let mut no_spell = false;
+    let mut export_fmt: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
@@ -69,6 +70,15 @@ fn main() {
         } else if arg == "--insert" {
             start_insert = true;
             i += 1;
+        } else if arg == "--export" && i + 1 < args.len() {
+            export_fmt = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(rest) = arg.strip_prefix("--export=") {
+            export_fmt = Some(rest.to_string());
+            i += 1;
+        } else if arg == "--pdf" {
+            export_fmt = Some("pdf".to_string());
+            i += 1;
         } else if arg == "--no-spell" {
             // Skip the auto-enable-on-Email branch in App::new. Used
             // when an embedder (kastrup compose) wants the editor up
@@ -81,6 +91,34 @@ fn main() {
             i += 1;
         } else {
             i += 1;
+        }
+    }
+    // Headless export: `scribe --export FMT FILE` / `scribe --pdf FILE`
+    // renders and exits without the TUI. Used for scripting and tests.
+    if let Some(fmt) = export_fmt {
+        let Some(p) = path.clone() else {
+            eprintln!("--export/--pdf needs a file argument");
+            std::process::exit(2);
+        };
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        let title = p.file_stem().and_then(|s| s.to_str()).unwrap_or("HyperList").to_string();
+        let (rendered, ext): (String, &str) = match fmt.as_str() {
+            "html" | "h" => (export::to_html(&text, &title), "html"),
+            "latex" | "tex" | "l" => (export::to_latex(&text, &title), "tex"),
+            "markdown" | "md" | "m" => (export::to_markdown(&text, &title), "md"),
+            "pdf" | "p" => {
+                let target = p.with_extension("pdf");
+                match export::latex_to_pdf(&export::to_latex(&text, &title), &target) {
+                    Ok(_)  => { println!("exported → {}", target.display()); std::process::exit(0); }
+                    Err(e) => { eprintln!("pdf export failed: {}", e); std::process::exit(1); }
+                }
+            }
+            other => { eprintln!("unknown export format: {}", other); std::process::exit(2); }
+        };
+        let target = p.with_extension(ext);
+        match std::fs::write(&target, rendered) {
+            Ok(_)  => { println!("exported → {}", target.display()); std::process::exit(0); }
+            Err(e) => { eprintln!("export failed: {}", e); std::process::exit(1); }
         }
     }
     install_panic_hook();
@@ -3075,7 +3113,7 @@ impl App {
                 self.leader_sub = Some(key.chars().next().unwrap());
                 self.set_status(
                     if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
-                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown" },
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF" },
                     244);
                 return false;
             }
@@ -4381,6 +4419,7 @@ impl App {
             ('x', "h") => self.export_to("html"),
             ('x', "l") => self.export_to("latex"),
             ('x', "m") => self.export_to("markdown"),
+            ('x', "p") => self.export_to("pdf"),
             ('e', "ESC") | ('x', "ESC") => self.set_status(" cancelled", 244),
             _ => self.set_status(&format!(" leader \\{}{}: unknown", group, key), 244),
         }
@@ -4451,7 +4490,7 @@ impl App {
         lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
         lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
         lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
-        lines.push(format!("  {}        export HTML / LaTeX / Markdown",    key("\\xh \\xl \\xm")));
+        lines.push(format!("  {}    export HTML / LaTeX / Markdown / PDF",    key("\\xh \\xl \\xm \\xp")));
         lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
         lines.push(format!("  {}  Close", key("ESC")));
         // Hide the terminal cursor — otherwise it stays parked on the
@@ -5049,6 +5088,19 @@ impl App {
             .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
             .unwrap_or("HyperList")
             .to_string();
+        // PDF goes through LaTeX → pdflatex (auto-landscape for wide items).
+        if matches!(fmt, "pdf" | "p") {
+            let target = match self.buf.path.as_ref() {
+                Some(p) => p.with_extension("pdf"),
+                None    => std::path::PathBuf::from("scribe-export.pdf"),
+            };
+            let latex = export::to_latex(&text, &title);
+            match export::latex_to_pdf(&latex, &target) {
+                Ok(_)  => self.set_status(&format!(" exported → {}", target.display()), 46),
+                Err(e) => self.set_status(&format!(" pdf export failed: {}", e), 196),
+            }
+            return;
+        }
         let (rendered, ext) = match fmt {
             "html" | "h" => (export::to_html(&text, &title), "html"),
             "latex" | "tex" | "l" => (export::to_latex(&text, &title), "tex"),
@@ -5255,7 +5307,7 @@ impl App {
                 self.leader_sub = Some(key.chars().next().unwrap());
                 self.set_status(
                     if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
-                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown" },
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF" },
                     244);
                 return false;
             }

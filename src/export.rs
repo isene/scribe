@@ -263,6 +263,23 @@ fn esc_latex(s: &str) -> String {
             '~'  => out.push_str("\\~{}"),
             '<'  => out.push_str("\\textless{}"),
             '>'  => out.push_str("\\textgreater{}"),
+            // Common Unicode punctuation/symbols that pdflatex+inputenc
+            // does NOT map by default — normalise so the build can't die
+            // on "Unicode character not set up for use with LaTeX".
+            '\u{2014}' => out.push_str("---"),              // — em dash
+            '\u{2013}' => out.push_str("--"),               // – en dash
+            '\u{2018}' | '\u{2019}' => out.push('\''),      // ‘ ’ single quotes
+            '\u{201C}' => out.push_str("``"),               // “ left double
+            '\u{201D}' => out.push_str("''"),               // ” right double
+            '\u{2026}' => out.push_str("\\ldots{}"),        // … ellipsis
+            '\u{2022}' | '\u{00B7}' => out.push_str("\\textbullet{}"), // • ·
+            '\u{2192}' => out.push_str("$\\rightarrow$"),   // →
+            '\u{2190}' => out.push_str("$\\leftarrow$"),    // ←
+            '\u{2713}' | '\u{2714}' => out.push_str("\\checkmark{}"), // ✓ ✔
+            '\u{2717}' | '\u{2718}' | '\u{2715}' => out.push_str("$\\times$"), // ✗ ✘ ✕
+            '\u{00A0}' => out.push('~'),                    // non-breaking space
+            '\u{00D7}' => out.push_str("$\\times$"),        // ×
+            '\u{00B0}' => out.push_str("$^{\\circ}$"),      // °
             _    => out.push(c),
         }
     }
@@ -306,13 +323,31 @@ fn line_to_latex(line: &str) -> String {
 }
 
 pub fn to_latex(text: &str, title: &str) -> String {
+    let lines = parse_lines(text);
+
+    // Auto-orient. Estimate each line's rendered width in `\small\ttfamily`
+    // characters — body length plus ~2.5 chars per indent depth — and flip
+    // to landscape when the widest line would overflow A4 portrait's text
+    // column (~100 chars at these settings). Keeps the common short-list
+    // case in portrait; widens only when an item genuinely won't fit.
+    const PORTRAIT_MAX_CHARS: usize = 100;
+    let widest = lines.iter()
+        .map(|(d, body)| (*d as f64 * 2.5) as usize + body.chars().count())
+        .max().unwrap_or(0);
+    let landscape = widest > PORTRAIT_MAX_CHARS;
+
     let mut s = String::new();
     s.push_str("\\documentclass[10pt,a4paper]{article}\n");
-    s.push_str("\\usepackage[margin=1.5cm]{geometry}\n");
+    if landscape {
+        s.push_str("\\usepackage[margin=1.5cm,landscape]{geometry}\n");
+    } else {
+        s.push_str("\\usepackage[margin=1.5cm]{geometry}\n");
+    }
     s.push_str("\\usepackage[T1]{fontenc}\n");
     s.push_str("\\usepackage[utf8]{inputenc}\n");
+    s.push_str("\\usepackage{textcomp}\n");
+    s.push_str("\\usepackage{amssymb}\n");
     s.push_str("\\usepackage{xcolor}\n");
-    s.push_str("\\usepackage{enumitem}\n");
     s.push_str("\\definecolor{hlprop}{HTML}{CC0000}\n");
     s.push_str("\\definecolor{hlqual}{HTML}{00AA00}\n");
     s.push_str("\\definecolor{hlop}{HTML}{0000CC}\n");
@@ -321,19 +356,63 @@ pub fn to_latex(text: &str, title: &str) -> String {
     s.push_str("\\definecolor{hlsubst}{HTML}{AA8800}\n");
     s.push_str("\\definecolor{hltag}{HTML}{CC5500}\n");
     s.push_str("\\setlength{\\parindent}{0pt}\n");
+    s.push_str("\\setlength{\\parskip}{0pt}\n");
+    s.push_str("\\pagestyle{empty}\n");
     s.push_str("\\begin{document}\n");
-    s.push_str(&format!("\\section*{{{}}}\n", esc_latex(title)));
-    s.push_str("\\begin{description}[leftmargin=0pt,labelwidth=0pt,labelindent=0pt,style=multiline]\n");
+    s.push_str(&format!("{{\\large\\bfseries {}}}\\par\n", esc_latex(title)));
+    s.push_str("\\vspace{6pt}\n");
     s.push_str("\\ttfamily\\small\n");
-    for (depth, body) in parse_lines(text) {
-        if body.is_empty() { s.push_str("\\\\[3pt]\n"); continue; }
-        let indent: String = "\\hspace*{1.5em}".repeat(depth);
-        let line = line_to_latex(&body);
-        s.push_str(&format!("{}{}\\\\\n", indent, line));
+    // Each HyperList line is its own paragraph: `\hspace*` sets the depth
+    // indent and `\hangindent` keeps any wrapped continuation aligned
+    // under the item. No `description`/`\item` env — that was the source
+    // of the "Something's wrong--perhaps a missing \item" pdflatex error.
+    for (depth, body) in &lines {
+        if body.is_empty() { s.push_str("\\vspace{4pt}\n"); continue; }
+        let indent = format!("{:.1}em", *depth as f64 * 1.5);
+        let line = line_to_latex(body);
+        s.push_str(&format!(
+            "\\noindent\\hangindent={ind}\\hangafter=1\\hspace*{{{ind}}}{txt}\\par\n",
+            ind = indent, txt = line));
     }
-    s.push_str("\\end{description}\n");
     s.push_str("\\end{document}\n");
     s
+}
+
+/// Compile `latex` into a PDF at `target` using `pdflatex`. The `.tex`
+/// and aux files are written into a private temp dir so the source
+/// folder only receives the finished PDF. On failure returns the first
+/// LaTeX error line from the engine log.
+pub fn latex_to_pdf(latex: &str, target: &std::path::Path) -> Result<(), String> {
+    use std::process::Command;
+    let tmp = std::env::temp_dir().join(format!("scribe-pdf-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {}", e))?;
+    let tex = tmp.join("doc.tex");
+    std::fs::write(&tex, latex).map_err(|e| format!("write .tex: {}", e))?;
+    let run = Command::new("pdflatex")
+        .arg("-interaction=nonstopmode")
+        .arg("-halt-on-error")
+        .arg("-output-directory").arg(&tmp)
+        .arg(&tex)
+        .current_dir(&tmp)
+        .output();
+    let result = match run {
+        Err(e) => Err(format!("pdflatex not available ({})", e)),
+        Ok(_) => {
+            let pdf = tmp.join("doc.pdf");
+            if pdf.exists() {
+                std::fs::copy(&pdf, target).map(|_| ())
+                    .map_err(|e| format!("copy pdf: {}", e))
+            } else {
+                let log = std::fs::read_to_string(tmp.join("doc.log")).unwrap_or_default();
+                let err = log.lines().find(|l| l.starts_with('!'))
+                    .map(|l| l.trim_start_matches("! ").to_string())
+                    .unwrap_or_else(|| "see LaTeX log".to_string());
+                Err(err)
+            }
+        }
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
 }
 
 // ── Markdown emitter ──────────────────────────────────────────────────
