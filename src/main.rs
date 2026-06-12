@@ -1325,6 +1325,20 @@ fn read_password_tty(prompt: &str) -> std::io::Result<String> {
 ///   "5 foo"     → ("", 5, false)
 ///   "5. foo"    → ("", 5, true)
 ///   "foo"       → None
+/// The character occupying display column `target` in `line` (TAB-aware):
+/// the char that starts at `target`, a space if `target` lands inside a
+/// TAB's span, or None past end-of-line.
+fn char_at_display_col(line: &str, target: usize, ts: usize) -> Option<char> {
+    let mut d = 0usize;
+    for ch in line.chars() {
+        if d == target { return Some(ch); }
+        let w = if ch == '\t' { ts - (d % ts) } else { 1 };
+        if d < target && target < d + w { return Some(' '); }
+        d += w;
+    }
+    None
+}
+
 fn parse_number_prefix(s: &str) -> Option<(String, u64, bool)> {
     // Pattern: <digits>(.<digits>)*\.?<space>
     let bytes = s.as_bytes();
@@ -4274,15 +4288,23 @@ impl App {
     /// cursor. No-op when there's no source line (top/bottom of buf)
     /// or when the source line is too short to have a char at that
     /// column. Used by Insert-mode Ctrl-Y / Ctrl-E.
+    ///
+    /// Alignment is by DISPLAY column, not char index: a TAB is one
+    /// character but `tabstop` columns wide, so char-index alignment put
+    /// the wrong character under the cursor whenever the two lines were
+    /// indented differently with tabs. Every other char still counts as
+    /// one unit, so multi-byte text (æ ø å, emoji) lines up as the user
+    /// sees it.
     fn copy_char_from(&mut self, dir: i32) {
         let src_idx: isize = self.cur_line as isize + dir as isize;
         if src_idx < 0 { return; }
         let src_idx = src_idx as usize;
         if src_idx >= self.buf.line_count() { return; }
+        let ts = self.tabstop();
         let cur_line = self.buf.line(self.cur_line);
-        let chars_before = cur_line[..self.cur_col.min(cur_line.len())].chars().count();
+        let target = display_col(&cur_line, self.cur_col.min(cur_line.len()), ts);
         let src = self.buf.line(src_idx);
-        let Some(ch) = src.chars().nth(chars_before) else { return };
+        let Some(ch) = char_at_display_col(&src, target, ts) else { return };
         let s = ch.to_string();
         let off = self.cursor_byte();
         self.buf.apply(off, off, &s);
@@ -5008,6 +5030,32 @@ impl App {
             self.want_col = self.cur_col;
         }
         self.buf.end_compound();
+    }
+
+    /// Insert-mode `Ctrl-T` outside autonumber: vim-style indent — insert
+    /// one TAB at the start of the current line; the cursor rides along.
+    fn insert_indent(&mut self) {
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        self.buf.apply(line_off, line_off, "\t");
+        self.cur_col += 1;
+        self.want_col = self.cur_col;
+    }
+
+    /// Insert-mode `Ctrl-D` outside autonumber: vim-style outdent — drop one
+    /// leading TAB, or up to `tabstop` leading spaces, from the current line.
+    fn insert_outdent(&mut self) {
+        let line = self.buf.line(self.cur_line);
+        let remove = if line.starts_with('\t') {
+            1
+        } else {
+            let ts = self.tabstop();
+            line.chars().take(ts).take_while(|c| *c == ' ').count()
+        };
+        if remove == 0 { return; }
+        let line_off = self.buf.line_byte_offset(self.cur_line);
+        self.buf.apply(line_off, line_off + remove, "");
+        self.cur_col = self.cur_col.saturating_sub(remove);
+        self.want_col = self.cur_col;
     }
 
     fn showhide_pattern(&mut self, pattern: &str, show: bool) {
@@ -6230,6 +6278,10 @@ impl App {
             }
             "C-T" if self.autonumber => self.autonum_indent_in(),
             "C-D" if self.autonumber => self.autonum_indent_out(),
+            // Vim insert-mode indent / outdent (plain buffers): one tab in,
+            // one tab (or tabstop spaces) out, at the start of the line.
+            "C-T" => self.insert_indent(),
+            "C-D" => self.insert_outdent(),
             "ENTER" | "\n" | "\r" | "C-M" | "C-J" if self.autonumber => {
                 self.autonum_newline();
             }
