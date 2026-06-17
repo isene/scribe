@@ -3086,8 +3086,7 @@ impl App {
                         244);
                 }
                 "z" => {
-                    let _ = self.buf.save();
-                    return true;
+                    return self.save_guarded();
                 }
                 "n" => self.jump_next_misspelling(),
                 "p" => self.jump_prev_misspelling(),
@@ -3127,7 +3126,7 @@ impl App {
                 self.leader_sub = Some(key.chars().next().unwrap());
                 self.set_status(
                     if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
-                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF" },
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF  d=docx  o=odt" },
                     244);
                 return false;
             }
@@ -4403,6 +4402,10 @@ impl App {
             "g" => self.calendar_add(),
             // Complexity.
             "c" => self.complexity_report(),
+            // Colour the Visual selection (prism picks fg/bg). Stored as an
+            // inline HTML span, so it survives a .md/.html save and exports
+            // to docx/odt/pdf via soffice with the colour intact.
+            "C" => self.color_visual(),
             // Presentation mode toggle (Up/Down → presentation_step).
             "p" => {
                 self.presentation = !self.presentation;
@@ -4442,6 +4445,8 @@ impl App {
             ('x', "l") => self.export_to("latex"),
             ('x', "m") => self.export_to("markdown"),
             ('x', "p") => self.export_to("pdf"),
+            ('x', "d") => self.export_to("docx"),
+            ('x', "o") => self.export_to("odt"),
             ('e', "ESC") | ('x', "ESC") => self.set_status(" cancelled", 244),
             _ => self.set_status(&format!(" leader \\{}{}: unknown", group, key), 244),
         }
@@ -4509,10 +4514,11 @@ impl App {
         lines.push(format!("  {}           reference jump (ref/file/URL)",  key("\\r")));
         lines.push(format!("  {}           presentation mode toggle",       key("\\p")));
         lines.push(format!("  {}           complexity report",              key("\\c")));
+        lines.push(format!("  {}           colour selection (visual, prism)", key("\\C")));
         lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
         lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
         lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
-        lines.push(format!("  {}    export HTML / LaTeX / Markdown / PDF",    key("\\xh \\xl \\xm \\xp")));
+        lines.push(format!("  {} export HTML/LaTeX/MD/PDF/docx/odt", key("\\xh \\xl \\xm \\xp \\xd \\xo")));
         lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
         lines.push(format!("  {}  Close", key("ESC")));
         // Hide the terminal cursor — otherwise it stays parked on the
@@ -5149,6 +5155,17 @@ impl App {
             }
             return;
         }
+        // docx / odt go through LibreOffice headless (soffice) — the only
+        // converter that keeps inline colour / highlight / font-size. md
+        // buffers are first rendered to HTML by pandoc (the spans pass
+        // through); html buffers feed soffice directly.
+        if matches!(fmt, "docx" | "odt") {
+            match self.export_office(fmt) {
+                Ok(p)  => self.set_status(&format!(" exported → {}", p.display()), 46),
+                Err(e) => self.set_status(&format!(" {} export failed: {}", fmt, e), 196),
+            }
+            return;
+        }
         let (rendered, ext) = match fmt {
             "html" | "h" => (export::to_html(&text, &title), "html"),
             "latex" | "tex" | "l" => (export::to_latex(&text, &title), "tex"),
@@ -5162,6 +5179,212 @@ impl App {
         match std::fs::write(&target, rendered) {
             Ok(_)  => self.set_status(&format!(" exported → {}", target.display()), 46),
             Err(e) => self.set_status(&format!(" export failed: {}", e), 196),
+        }
+    }
+
+    /// `\C` in Visual mode — wrap the selection in an inline colour span
+    /// (`<span style="color:#..;background-color:#..">…</span>`). prism
+    /// supplies fg/bg. A white background is treated as "no highlight" and
+    /// omitted. Colours live in the text as HTML, so they survive a
+    /// Markdown/HTML save and export to docx/odt/pdf via soffice.
+    fn color_visual(&mut self) {
+        if !self.mode.is_visual() {
+            self.set_status(" \\C — select text in Visual mode first", 244);
+            return;
+        }
+        let (lo, hi) = if matches!(self.mode, Mode::VisualLine) {
+            self.visual_line_range()
+        } else {
+            self.visual_range()
+        };
+        self.mode = Mode::Normal;
+        self.pending.clear();
+        let Some((fg_hex, bg_hex)) = self.pick_color_prism() else {
+            self.set_status(" prism not available", 196);
+            self.render_all();
+            return;
+        };
+        let s = self.buf.rope.to_string();
+        if lo >= hi || hi > s.len() { self.render_all(); return; }
+        let sel = &s[lo..hi];
+        let mut decls = format!("color:{}", fg_hex);
+        if bg_hex.to_ascii_lowercase() != "#ffffff" {
+            decls.push_str(&format!(";background-color:{}", bg_hex));
+        }
+        let wrapped = format!("<span style=\"{}\">{}</span>", decls, sel);
+        self.buf.begin_compound();
+        self.buf.apply(lo, hi, &wrapped);
+        self.buf.end_compound();
+        let (line, col) = self.buf.byte_to_line_col(lo);
+        self.cur_line = line;
+        self.cur_col = col;
+        self.want_col = col;
+        self.set_status(" coloured (\\C)", 46);
+        self.render_all();
+    }
+
+    /// Launch prism as an fg/bg picker; returns (fg_hex, bg_hex) like
+    /// "#rrggbb", or None if prism couldn't run. Mirrors grid's picker:
+    /// prism writes `fg=`/`bg=` to a temp file (`--out`) so its TUI and
+    /// scribe's don't fight over the screen.
+    fn pick_color_prism(&mut self) -> Option<(String, String)> {
+        let outfile = format!("/tmp/scribe_pick_{}.txt", std::process::id());
+        let _ = std::fs::remove_file(&outfile);
+        Crust::cleanup();
+        let status = std::process::Command::new("prism")
+            .arg("--pair")
+            .arg(format!("--out={}", outfile))
+            .arg("#000000")
+            .arg("#ffffff")
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.header.invalidate();
+        self.main_p.invalidate();
+        self.footer.invalidate();
+        if status.is_err() { let _ = std::fs::remove_file(&outfile); return None; }
+        let mut fg = "#000000".to_string();
+        let mut bg = "#ffffff".to_string();
+        if let Ok(text) = std::fs::read_to_string(&outfile) {
+            for line in text.lines() {
+                if let Some(h) = line.strip_prefix("fg=") { fg = h.trim().to_string(); }
+                else if let Some(h) = line.strip_prefix("bg=") { bg = h.trim().to_string(); }
+            }
+        }
+        let _ = std::fs::remove_file(&outfile);
+        Some((fg, bg))
+    }
+
+    /// Build an HTML form of the buffer and convert it to docx/odt with
+    /// LibreOffice headless. Returns the output path. md → html via pandoc
+    /// (keeps the colour spans); html buffers are used as-is. A private
+    /// soffice profile avoids clashing with a running LibreOffice instance.
+    fn export_office(&self, fmt: &str) -> Result<std::path::PathBuf, String> {
+        use std::process::{Command, Stdio};
+        let src = self.buf.path.clone().ok_or_else(|| "save the file first".to_string())?;
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let mut text = String::new();
+        for chunk in self.buf.rope.chunks() { text.push_str(chunk); }
+
+        let tmpdir = std::env::temp_dir();
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("scribe-export");
+        let tag = format!("{}-{}", stem, std::process::id());
+        let html_path = tmpdir.join(format!("{}.html", tag));
+
+        if matches!(ext.as_str(), "html" | "htm") {
+            std::fs::write(&html_path, &text).map_err(|e| format!("write html: {}", e))?;
+        } else {
+            // pandoc markdown -> standalone html5; raw <span> passes through.
+            let child = Command::new("pandoc")
+                .args(["-f", "markdown", "-t", "html5", "--standalone"])
+                .arg("-o").arg(&html_path)
+                .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+                .spawn();
+            let res = match child {
+                Ok(mut c) => {
+                    if let Some(si) = c.stdin.as_mut() {
+                        use std::io::Write;
+                        let _ = si.write_all(text.as_bytes());
+                    }
+                    c.wait()
+                }
+                Err(e) => return Err(format!("pandoc not available ({})", e)),
+            };
+            match res {
+                Ok(s) if s.success() => {}
+                _ => return Err("pandoc conversion failed".into()),
+            }
+        }
+
+        let profile = format!("file://{}/scribe-soffice-{}",
+            tmpdir.display(), std::process::id());
+        let filter = if fmt == "docx" { "docx:MS Word 2007 XML" } else { "odt" };
+        let run = Command::new("soffice")
+            .arg("--headless")
+            .arg(format!("-env:UserInstallation={}", profile))
+            .arg("--convert-to").arg(filter)
+            .arg("--outdir").arg(&tmpdir)
+            .arg(&html_path)
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status();
+        let _ = std::fs::remove_file(&html_path);
+        match run {
+            Ok(s) if s.success() => {}
+            Ok(_)  => return Err("soffice conversion failed".into()),
+            Err(e) => return Err(format!("soffice (LibreOffice) not available ({})", e)),
+        }
+        let produced = tmpdir.join(format!("{}.{}", tag, fmt));
+        let target = src.with_extension(fmt);
+        std::fs::rename(&produced, &target)
+            .or_else(|_| std::fs::copy(&produced, &target).map(|_| ()))
+            .map_err(|e| format!("move output: {}", e))?;
+        let _ = std::fs::remove_file(&produced);
+        Ok(target)
+    }
+
+    /// True if the buffer carries an inline colour span scribe wrote.
+    fn buffer_has_color(&self) -> bool {
+        let s = self.buf.rope.to_string();
+        s.contains("<span style=\"color:") || s.contains("<span style=\"background-color:")
+    }
+
+    /// True if the open file is already a colour-preserving markup format.
+    fn path_is_markup(&self) -> bool {
+        self.buf.path.as_ref()
+            .and_then(|p| p.extension()).and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "html" | "htm"))
+            .unwrap_or(false)
+    }
+
+    /// Plain save with status. Returns true on success.
+    fn save_plain(&mut self) -> bool {
+        match self.buf.save() {
+            Ok(_)  => { self.set_status(" written", 46); true }
+            Err(e) => { self.set_status(&format!(" save failed: {}", e), 196); false }
+        }
+    }
+
+    /// Save, guarding colours: if the buffer has colour spans but the file
+    /// isn't .md/.html, ask whether to save as Markdown/HTML (keeping the
+    /// colours) or strip them and save plain. Returns true when saved.
+    fn save_guarded(&mut self) -> bool {
+        if !self.buffer_has_color() || self.path_is_markup() {
+            return self.save_plain();
+        }
+        let ans = self.footer_prompt(
+            "Colours need .md/.html — save as [m]d / [h]tml, or [d]iscard? ");
+        match ans.trim().chars().next() {
+            Some('m') | Some('M') => self.save_as_ext("md"),
+            Some('h') | Some('H') => self.save_as_ext("html"),
+            Some('d') | Some('D') => { self.strip_color_spans(); self.save_plain() }
+            _ => { self.set_status(" save cancelled", 244); false }
+        }
+    }
+
+    /// Repoint the buffer at <stem>.<ext> and save there (keeps colours).
+    fn save_as_ext(&mut self, ext: &str) -> bool {
+        let new_path = match self.buf.path.as_ref() {
+            Some(p) => p.with_extension(ext),
+            None    => std::path::PathBuf::from(format!("scribe-export.{}", ext)),
+        };
+        self.buf.path = Some(new_path.clone());
+        match self.buf.save() {
+            Ok(_)  => { self.set_status(&format!(" written → {}", new_path.display()), 46); true }
+            Err(e) => { self.set_status(&format!(" save failed: {}", e), 196); false }
+        }
+    }
+
+    /// Remove scribe's colour spans, keeping their inner text. One undo step.
+    fn strip_color_spans(&mut self) {
+        let s = self.buf.rope.to_string();
+        let re = regex::Regex::new(
+            r#"(?s)<span style="(?:color|background-color):[^"]*">(.*?)</span>"#).unwrap();
+        let stripped = re.replace_all(&s, "$1").into_owned();
+        if stripped != s {
+            self.buf.begin_compound();
+            self.buf.apply(0, s.len(), &stripped);
+            self.buf.end_compound();
         }
     }
 
@@ -5355,7 +5578,7 @@ impl App {
                 self.leader_sub = Some(key.chars().next().unwrap());
                 self.set_status(
                     if key == "e" { " \\e — e=encrypt  d=decrypt  k=rekey" }
-                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF" },
+                    else          { " \\x — h=HTML  l=LaTeX  m=Markdown  p=PDF  d=docx  o=odt" },
                     244);
                 return false;
             }
@@ -7368,10 +7591,7 @@ impl App {
                 return false;
             }
             "w" | "W" => {
-                match self.buf.save() {
-                    Ok(_)  => self.set_status(" written", 46),
-                    Err(e) => self.set_status(&format!(" save failed: {}", e), 196),
-                }
+                self.save_guarded();
                 false
             }
             // Vim's `:w <path>` — write the current buffer to that
@@ -7417,8 +7637,7 @@ impl App {
             // sticky shift key (or muscle memory) doesn't bounce the user
             // out with "unknown: Wq".
             "wq" | "Wq" | "wQ" | "WQ" | "x" | "X" => {
-                let _ = self.buf.save();
-                true
+                self.save_guarded()
             }
             "" => false,
             // Bare `:e` (vim's `:edit`) reloads the current file from disk.

@@ -20,6 +20,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 - **Reading mode** — `:read` (or `zr`) for Goyo-style centered text, optional Limelight-style paragraph dim. Prose without chrome.
 - **Email-mode rendering** — `.eml` files and kastrup compose tempfiles get header / quote-level / signature colors that match kastrup's right pane 1-for-1. Inline email addresses + URLs highlighted everywhere.
 - **Syntax highlighting** for ~18 source languages plus dedicated HyperList / Markdown / LaTeX renderers via the shared `highlight` crate. Multi-line block comments and string literals keep their color across line breaks.
+- **Inline text colour + office export** — `\C` colours a Visual selection (prism picks fg/bg) as an HTML span shown live in Markdown; `\xd` / `\xo` export the buffer to **docx** / **odt** via LibreOffice with colour, highlight and font sizes preserved. Colour lives in the text, so a Markdown/HTML save keeps it.
 - **Spellcheck** via hunspell — auto-on for email mode, opt-in elsewhere via `:set spell`. Configurable language and underline color. `]s` / `[s` navigation, `z=` suggestions, `zg` to add to personal dict.
 - **Persistent registers** — yanks and macros live in `~/.config/scribe/registers.json` and update on every yank, so they survive restarts AND share live across concurrent scribe sessions.
 - **No LSP / debugger / quickfix / `:make`** — writers don't compile.
@@ -402,8 +403,9 @@ All HyperList commands live behind the `\` leader. Highlights:
 | Nav     | `\r` reference jump (in-buffer / file / URL) · `\p` presentation toggle |
 | Filter  | `\S` / `\H` / `\N` show / hide / reset (also `zs` / `zh` / `z0`) |
 | Look    | `\h` limelight · `\u` state/transition underline |
-| Export  | `\xh` HTML · `\xl` LaTeX · `\xm` Markdown |
+| Export  | `\xh` HTML · `\xl` LaTeX · `\xm` Markdown · `\xp` PDF · `\xd` docx · `\xo` odt |
 | Crypto  | `\ee` encrypt · `\ed` decrypt · `\ek` rekey |
+| Colour  | `\C` colour the Visual selection (prism picks fg/bg) |
 | Other   | `\s` sort · `\c` complexity · `\g` calendar add |
 | Help    | `\?` cheatsheet popup (ESC dismisses) |
 
