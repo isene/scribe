@@ -2237,9 +2237,10 @@ impl App {
                     "hl" | "woim"       => highlight::highlight_hyperlist(&all, line_count + 1),
                     "md" | "markdown"   => highlight::highlight_markdown_source(&all, line_count + 1),
                     "tex"               => highlight::highlight_tex(&all, line_count + 1),
-                    // No-extension / plain-text prose still gets inline colour/
-                    // font spans rendered (but no Markdown styling imposed).
-                    "" | "txt" | "text" => highlight::highlight_plain_spans(&all, line_count + 1),
+                    // Plain prose and HTML (a colour/font save target) get their
+                    // inline spans rendered — no Markdown styling imposed.
+                    "" | "txt" | "text" | "html" | "htm"
+                                        => highlight::highlight_plain_spans(&all, line_count + 1),
                     _                   => highlight::highlight(&all, ext, line_count + 1),
                 };
                 let mut lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
@@ -2275,6 +2276,22 @@ impl App {
                     }
                 }
                 lines
+            }
+            // A no-name / `:set ft=plain` buffer still renders inline colour/
+            // font spans (the markup the `\C` / `\F` pickers insert), so the
+            // tags dim and `\M` can conceal them before the buffer is saved.
+            FileKind::Plain => {
+                let line_count = self.buf.line_count();
+                let mut all = String::new();
+                for i in 0..line_count {
+                    all.push_str(&self.buf.line(i));
+                    all.push('\n');
+                }
+                highlight::set_span_conceal(self.markup_concealed, self.cur_line);
+                highlight::highlight_plain_spans(&all, line_count + 1)
+                    .split('\n')
+                    .map(str::to_string)
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -2929,8 +2946,10 @@ impl App {
             return false;
         }
         // `M` toggles macro recording. While recording, a second `M` stops;
-        // otherwise it primes for the register name.
-        if key == "M" && self.pending.operator.is_none()
+        // otherwise it primes for the register name. Skip when the leader is
+        // pending so `\M` (markup toggle) reaches the leader dispatch below —
+        // this handler sits before it and would otherwise swallow the `M`.
+        if key == "M" && !self.leader_prefix && self.pending.operator.is_none()
             && self.pending.count1.is_none() && self.pending.text_object.is_none()
         {
             if let Some(reg) = self.recording.take() {
