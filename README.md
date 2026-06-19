@@ -20,7 +20,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 - **Reading mode** — `:read` (or `zr`) for Goyo-style centered text, optional Limelight-style paragraph dim. Prose without chrome.
 - **Email-mode rendering** — `.eml` files and kastrup compose tempfiles get header / quote-level / signature colors that match kastrup's right pane 1-for-1. Inline email addresses + URLs highlighted everywhere.
 - **Syntax highlighting** for ~18 source languages plus dedicated HyperList / Markdown / LaTeX renderers via the shared `highlight` crate. Multi-line block comments and string literals keep their color across line breaks.
-- **Inline text colour + office export** — `\C` colours a Visual selection (prism picks fg/bg) as an HTML span shown live in Markdown; `\xd` / `\xo` export the buffer to **docx** / **odt** via LibreOffice with colour, highlight and font sizes preserved. Colour lives in the text, so a Markdown/HTML save keeps it.
+- **Inline colour, font + office export** — `\C` colours a Visual selection (prism picks fg/bg) and `\F` sets its font + size (the `fonts` picker), both stored as live HTML spans; `\M` conceals the span markup (revealing it only on the cursor's line) so styled prose reads clean. `\xd` / `\xo` export the buffer to **docx** / **odt** via LibreOffice with colour, highlight, font and size preserved. The styling lives in the text, so a Markdown / HTML / plain save keeps it.
 - **Spellcheck** via hunspell — auto-on for email mode, opt-in elsewhere via `:set spell`. Configurable language and underline color. `]s` / `[s` navigation, `z=` suggestions, `zg` to add to personal dict.
 - **Persistent registers** — yanks and macros live in `~/.config/scribe/registers.json` and update on every yank, so they survive restarts AND share live across concurrent scribe sessions.
 - **No LSP / debugger / quickfix / `:make`** — writers don't compile.
@@ -28,7 +28,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Status
 
-**v0.1.28** — daily-driveable for prose AND HyperList. Full feature reference below.
+**v0.1.61** — daily-driveable for prose AND HyperList. Inline colour / font / markup-conceal and office export are in. Full feature reference below.
 
 ## Screenshots
 
@@ -197,6 +197,19 @@ paragraphdim = true
 | `:set syntax=NAME` | force the buffer's filetype: `plain` / `email` / `rust` / `md` / `py` / `sh` / `js` / `ts` / `c` / `cpp` / `go` / `rb` / `lua` / `tex` / `hl` (HyperList) / … |
 
 Source highlight handles **multi-line state**: block comments and string literals keep their color across line breaks. Email mode mirrors kastrup's right-pane palette 1-for-1.
+
+### Inline colour, font + markup
+
+Per-span styling is stored as inline HTML, so it lives in the text (a Markdown / HTML / plain save keeps it) and exports to office formats with the styling intact.
+
+| Key | Action |
+|---|---|
+| `\C` | colour the Visual selection — [prism](https://github.com/isene/prism) picks fg/bg → `<span style="color:…">` |
+| `\F` | set its font + size — the [fonts](https://github.com/isene/fonts) picker → `<span style="font-family:'…';font-size:…pt">` |
+| `\M` | hide the span markup — tags conceal on every line except the cursor's, so styled prose reads clean but stays editable where the cursor sits |
+| `\xd` / `\xo` | export to **docx** / **odt** via LibreOffice headless, with colour, background, font and size preserved |
+
+The styled inner text renders live (colour applied, `<span>` tags dimmed) in Markdown, HTML, and plain-text buffers alike. `\C` / `\F` each launch their picker full-screen, then return to scribe with the choice wrapped around the selection.
 
 ### Line numbers + gutter
 
