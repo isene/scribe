@@ -738,6 +738,10 @@ struct App {
     /// `g:calendar` equivalent — destination for `\G`.
     calendar: Option<String>,
     alldates: bool,
+    /// `\M` markup toggle — when true, inline colour/font `<span>` tags are
+    /// concealed on every line except the cursor's, so styled prose reads clean
+    /// while the markup stays editable where the cursor sits.
+    markup_concealed: bool,
 }
 
 impl App {
@@ -831,6 +835,7 @@ impl App {
             st_underline: 0,
             calendar: rc.calendar.clone(),
             alldates: rc.alldates,
+            markup_concealed: false,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -2225,11 +2230,17 @@ impl App {
                     all.push_str(&self.buf.line(i));
                     all.push('\n');
                 }
+                // `\M` markup toggle: conceal span tags on every line but the
+                // cursor's. Set per-render since the cursor line moves.
+                highlight::set_span_conceal(self.markup_concealed, self.cur_line);
                 let rendered = match ext.as_str() {
-                    "hl" | "woim"      => highlight::highlight_hyperlist(&all, line_count + 1),
-                    "md" | "markdown"  => highlight::highlight_markdown_source(&all, line_count + 1),
-                    "tex"              => highlight::highlight_tex(&all, line_count + 1),
-                    _                  => highlight::highlight(&all, ext, line_count + 1),
+                    "hl" | "woim"       => highlight::highlight_hyperlist(&all, line_count + 1),
+                    "md" | "markdown"   => highlight::highlight_markdown_source(&all, line_count + 1),
+                    "tex"               => highlight::highlight_tex(&all, line_count + 1),
+                    // No-extension / plain-text prose still gets inline colour/
+                    // font spans rendered (but no Markdown styling imposed).
+                    "" | "txt" | "text" => highlight::highlight_plain_spans(&all, line_count + 1),
+                    _                   => highlight::highlight(&all, ext, line_count + 1),
                 };
                 let mut lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
                 // `\u` State / Transition underline cycle for HL only.
@@ -4410,6 +4421,9 @@ impl App {
             // family + size). Stored as an inline HTML span like colour;
             // exports to docx/odt/pdf via soffice with the font intact.
             "F" => self.font_visual(),
+            // Toggle concealment of colour/font span markup (reveals on the
+            // cursor's line so it stays editable).
+            "M" => self.toggle_markup(),
             // Presentation mode toggle (Up/Down → presentation_step).
             "p" => {
                 self.presentation = !self.presentation;
@@ -4520,6 +4534,7 @@ impl App {
         lines.push(format!("  {}           complexity report",              key("\\c")));
         lines.push(format!("  {}           colour selection (visual, prism)", key("\\C")));
         lines.push(format!("  {}           font on selection (visual, fonts)", key("\\F")));
+        lines.push(format!("  {}           toggle colour/font markup", key("\\M")));
         lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
         lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
         lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
@@ -5295,6 +5310,20 @@ impl App {
         self.cur_col = col;
         self.want_col = col;
         self.set_status(&format!(" font: {} {}pt (\\F)", family, size), 46);
+        self.render_all();
+    }
+
+    /// `\M` — toggle concealment of inline colour/font `<span>` markup. When
+    /// on, the tags hide on every line except the cursor's (so the prose reads
+    /// clean but the markup stays editable where the cursor is).
+    fn toggle_markup(&mut self) {
+        self.markup_concealed = !self.markup_concealed;
+        if self.markup_concealed {
+            self.set_status(" markup hidden (\\M) — reveals on the cursor line", 46);
+        } else {
+            self.set_status(" markup shown (\\M)", 244);
+        }
+        self.main_p.invalidate();
         self.render_all();
     }
 
