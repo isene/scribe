@@ -4406,6 +4406,10 @@ impl App {
             // inline HTML span, so it survives a .md/.html save and exports
             // to docx/odt/pdf via soffice with the colour intact.
             "C" => self.color_visual(),
+            // Set the font on the Visual selection (the `fonts` picker chooses
+            // family + size). Stored as an inline HTML span like colour;
+            // exports to docx/odt/pdf via soffice with the font intact.
+            "F" => self.font_visual(),
             // Presentation mode toggle (Up/Down → presentation_step).
             "p" => {
                 self.presentation = !self.presentation;
@@ -4515,6 +4519,7 @@ impl App {
         lines.push(format!("  {}           presentation mode toggle",       key("\\p")));
         lines.push(format!("  {}           complexity report",              key("\\c")));
         lines.push(format!("  {}           colour selection (visual, prism)", key("\\C")));
+        lines.push(format!("  {}           font on selection (visual, fonts)", key("\\F")));
         lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
         lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
         lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
@@ -5253,6 +5258,74 @@ impl App {
         }
         let _ = std::fs::remove_file(&outfile);
         Some((fg, bg))
+    }
+
+    /// `\F` in Visual mode — wrap the selection in an inline font span
+    /// (`<span style="font-family:'X'; font-size:Npt">…</span>`). The `fonts`
+    /// picker supplies family + size. Like colour, it lives in the text as
+    /// HTML and survives a Markdown/HTML save and export to docx/odt/pdf.
+    fn font_visual(&mut self) {
+        if !self.mode.is_visual() {
+            self.set_status(" \\F — select text in Visual mode first", 244);
+            return;
+        }
+        let (lo, hi) = if matches!(self.mode, Mode::VisualLine) {
+            self.visual_line_range()
+        } else {
+            self.visual_range()
+        };
+        self.mode = Mode::Normal;
+        self.pending.clear();
+        let Some((family, size)) = self.pick_font() else {
+            self.set_status(" font pick cancelled", 244);
+            self.render_all();
+            return;
+        };
+        let s = self.buf.rope.to_string();
+        if lo >= hi || hi > s.len() { self.render_all(); return; }
+        let sel = &s[lo..hi];
+        let mut decls = format!("font-family:'{}'", family);
+        if size > 0 { decls.push_str(&format!(";font-size:{}pt", size)); }
+        let wrapped = format!("<span style=\"{}\">{}</span>", decls, sel);
+        self.buf.begin_compound();
+        self.buf.apply(lo, hi, &wrapped);
+        self.buf.end_compound();
+        let (line, col) = self.buf.byte_to_line_col(lo);
+        self.cur_line = line;
+        self.cur_col = col;
+        self.want_col = col;
+        self.set_status(&format!(" font: {} {}pt (\\F)", family, size), 46);
+        self.render_all();
+    }
+
+    /// Launch the `fonts` picker; returns (family, size_pt), or None if the
+    /// user cancelled or `fonts` isn't on PATH. Mirrors pick_color_prism: the
+    /// picker writes `family=`/`size=` to a temp file (`--out`) so its TUI and
+    /// scribe's don't fight over the screen.
+    fn pick_font(&mut self) -> Option<(String, u32)> {
+        let outfile = format!("/tmp/scribe_font_{}.txt", std::process::id());
+        let _ = std::fs::remove_file(&outfile);
+        Crust::cleanup();
+        let status = std::process::Command::new("fonts")
+            .arg(format!("--out={}", outfile))
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.header.invalidate();
+        self.main_p.invalidate();
+        self.footer.invalidate();
+        if status.is_err() { let _ = std::fs::remove_file(&outfile); return None; }
+        // A cancelled picker exits non-zero and writes nothing.
+        let text = std::fs::read_to_string(&outfile).ok();
+        let _ = std::fs::remove_file(&outfile);
+        let text = text?;
+        let mut family = String::new();
+        let mut size = 0u32;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("family=") { family = v.trim().to_string(); }
+            else if let Some(v) = line.strip_prefix("size=") { size = v.trim().parse().unwrap_or(0); }
+        }
+        if family.is_empty() { None } else { Some((family, size)) }
     }
 
     /// Build an HTML form of the buffer and convert it to docx/odt with
