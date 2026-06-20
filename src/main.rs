@@ -3204,32 +3204,6 @@ impl App {
             return false;
         }
 
-        // HyperList: <RIGHT> on a closed foldable line opens it,
-        // <LEFT> on an open foldable line closes it. Falls through to
-        // the regular wrap-motion otherwise — so navigating across a
-        // non-foldable line still works, and a count prefix still
-        // routes through motion (`5l`-style use is unchanged).
-        if (key == "LEFT" || key == "RIGHT")
-            && self.is_hyperlist()
-            && self.pending.operator.is_none()
-            && self.pending.count1.is_none()
-            && self.pending.text_object.is_none()
-        {
-            let total = self.buf.line_count();
-            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
-            if fold::is_foldable(self.cur_line, &all) {
-                let closed = self.folds.is_closed(self.cur_line);
-                if key == "RIGHT" && closed {
-                    self.folds.open(self.cur_line);
-                    return false;
-                }
-                if key == "LEFT" && !closed {
-                    self.folds.close(self.cur_line);
-                    return false;
-                }
-            }
-        }
-
         // `]` / `[` prefix: dispatch on the follow-up key.
         if let Some(open) = self.bracket_prefix.take() {
             match (open, key) {
@@ -5310,16 +5284,24 @@ impl App {
         };
         self.mode = Mode::Normal;
         self.pending.clear();
-        let Some((family, size)) = self.pick_font() else {
+        let Some((family, _)) = self.pick_font() else {
             self.set_status(" font pick cancelled", 244);
             self.render_all();
             return;
         };
+        // Ask for a point size; Enter (empty) leaves it unset, so the span
+        // carries only the family and inherits the document's size.
+        self.render_all();
+        let size_in = self.footer.ask_with_bg(
+            &format!(" size for {} in pt (Enter = none): ", family), "", 17);
+        self.render_footer();
+        let pt: Option<u32> = size_in.trim().parse().ok().filter(|&n| n > 0);
+
         let s = self.buf.rope.to_string();
         if lo >= hi || hi > s.len() { self.render_all(); return; }
         let sel = &s[lo..hi];
         let mut decls = format!("font-family:'{}'", family);
-        if size > 0 { decls.push_str(&format!(";font-size:{}pt", size)); }
+        if let Some(pt) = pt { decls.push_str(&format!(";font-size:{}pt", pt)); }
         let wrapped = format!("<span style=\"{}\">{}</span>", decls, sel);
         self.buf.begin_compound();
         self.buf.apply(lo, hi, &wrapped);
@@ -5328,7 +5310,10 @@ impl App {
         self.cur_line = line;
         self.cur_col = col;
         self.want_col = col;
-        self.set_status(&format!(" font: {} {}pt (\\F)", family, size), 46);
+        match pt {
+            Some(n) => self.set_status(&format!(" font: {} {}pt (\\F)", family, n), 46),
+            None => self.set_status(&format!(" font: {} (\\F)", family), 46),
+        }
         self.render_all();
     }
 
@@ -8059,12 +8044,18 @@ impl App {
                 self.relative_numbers = false;
                 false
             }
-            other if other.starts_with("set syntax") => {
-                // `:set syntax=NAME` — override the buffer's detected file
-                // kind so the renderer treats the content as `NAME`.
-                // Useful after `:claude` has rewritten code into prose, or
-                // when scribe guessed Plain for an unrecognised extension.
+            other if other.starts_with("set syntax")
+                  || other.starts_with("set filetype")
+                  || other.starts_with("set ft") => {
+                // `:set syntax=NAME` (vim aliases `:set ft=NAME` /
+                // `:set filetype=NAME`) — override the buffer's detected file
+                // kind so the renderer treats the content as `NAME`. Useful
+                // after `:claude` has rewritten code into prose, when scribe
+                // guessed Plain for an unrecognised extension, or to force
+                // `md` / `html` so inline colour/font spans render live.
                 let name = other.trim_start_matches("set syntax")
+                    .trim_start_matches("set filetype")
+                    .trim_start_matches("set ft")
                     .trim_start_matches('=')
                     .trim();
                 if name.is_empty() {
@@ -8083,6 +8074,13 @@ impl App {
                         "email" | "mail" | "eml" => {
                             self.buf.kind = FileKind::Email;
                             self.set_status(" syntax: email", 244);
+                        }
+                        // HTML isn't in the syntax-lang table, but the renderer
+                        // handles it (inline colour/font spans, no markdown), so
+                        // accept it explicitly — it's a colour/font save target.
+                        "html" | "htm" => {
+                            self.buf.kind = FileKind::Source("html".to_string());
+                            self.set_status(" syntax: html", 244);
                         }
                         n => {
                             if highlight::lang_known(n).is_some() {

@@ -28,7 +28,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Status
 
-**v0.1.61** — daily-driveable for prose AND HyperList. Inline colour / font / markup-conceal and office export are in. Full feature reference below.
+**v0.1.62** — daily-driveable for prose AND HyperList. Inline colour / font / markup-conceal and office export are in. Full feature reference below.
 
 ## Screenshots
 
@@ -194,7 +194,7 @@ paragraphdim = true
 |---|---|
 | `:set theme=NAME` | `monokai` / `solarized` / `nord` / `dracula` / `gruvbox` / `plain` |
 | `--theme=NAME` (CLI) | one-session override |
-| `:set syntax=NAME` | force the buffer's filetype: `plain` / `email` / `rust` / `md` / `py` / `sh` / `js` / `ts` / `c` / `cpp` / `go` / `rb` / `lua` / `tex` / `hl` (HyperList) / … |
+| `:set syntax=NAME` (vim aliases `:set ft=` / `:set filetype=`) | force the buffer's filetype: `plain` / `email` / `rust` / `md` / `html` / `py` / `sh` / `js` / `ts` / `c` / `cpp` / `go` / `rb` / `lua` / `tex` / `hl` (HyperList) / … |
 
 Source highlight handles **multi-line state**: block comments and string literals keep their color across line breaks. Email mode mirrors kastrup's right-pane palette 1-for-1.
 
@@ -205,7 +205,7 @@ Per-span styling is stored as inline HTML, so it lives in the text (a Markdown /
 | Key | Action |
 |---|---|
 | `\C` | colour the Visual selection — [prism](https://github.com/isene/prism) picks fg/bg → `<span style="color:…">` |
-| `\F` | set its font + size — the [fonts](https://github.com/isene/fonts) picker → `<span style="font-family:'…';font-size:…pt">` |
+| `\F` | set its font — the [fonts](https://github.com/isene/fonts) picker chooses the family, then scribe asks for a point size (Enter = none) → `<span style="font-family:'…'[;font-size:…pt]">` |
 | `\M` | hide the span markup — tags conceal on every line except the cursor's, so styled prose reads clean but stays editable where the cursor sits |
 | `\xd` / `\xo` | export to **docx** / **odt** via LibreOffice headless, with colour, background, font and size preserved |
 
