@@ -14,6 +14,7 @@ mod digraphs;
 mod emoji_data;
 mod export;
 mod fold;
+mod help;
 mod mode;
 mod motion;
 mod picker;
@@ -3329,6 +3330,11 @@ impl App {
                     }
                     self.pending.clear();
                 }
+                "?" => {
+                    // `g?` — searchable help index.
+                    self.pending.clear();
+                    self.help_index("");
+                }
                 "q" => {
                     // Enter `gq` operator-pending. Don't clear pending — count
                     // and register survive into the next motion / `q` shortcut.
@@ -4431,7 +4437,7 @@ impl App {
                 self.set_status(" show/hide cleared", 244);
             }
             // Cheatsheet popup.
-            "?" => self.show_hl_cheatsheet(),
+            "?" => self.help_index(""),
             // Word lookup: send the word under the cursor plus a few
             // lines of surrounding context to `claude -p` and show the
             // response in a popup. Vim's `K` is also wired up, but
@@ -4504,44 +4510,77 @@ impl App {
         }
     }
 
-    /// `\?` cheatsheet popup. Modal; ESC dismisses.
-    fn show_hl_cheatsheet(&mut self) {
-        let popup_w = 64u16;
-        let popup_h = 22u16;
-        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+    /// `\?` / `g?` / `:help <query>` — searchable help index. A live-filtered
+    /// list of every binding, command, and feature (`category · trigger ·
+    /// description`). Type to filter, arrows / PgUp-Dn scroll, Esc closes.
+    /// Browse-only; reads the curated `help::HELP` table.
+    fn help_index(&mut self, init: &str) {
+        let (cols, rows) = Crust::terminal_size();
+        let popup_w = 84u16.min(cols.saturating_sub(4)).max(48);
+        let popup_h = 34u16.min(rows.saturating_sub(2)).max(14);
+        let inner_w = popup_w as usize - 4;            // text width after "  "
+        let list_h = (popup_h as usize).saturating_sub(6); // title+filter+2 sep+footer+lead
+        let dw = inner_w.saturating_sub(33).max(8);    // description column width
         let key = |k: &str| style::fg(k, 220);
-        let mut lines: Vec<String> = Vec::new();
-        lines.push(String::new());
-        lines.push(format!("  {}", style::bold("HyperList — leader bindings (\\)")));
-        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
-        lines.push(format!("  {}        fold to level 0..9",                key("\\0..\\9")));
-        lines.push(format!("  {}           fold all open",                  key("\\a")));
-        lines.push(format!("  {}      checkbox / + timestamp / in-progress", key("\\v \\V \\o")));
-        lines.push(format!("  {}           autonumber toggle",              key("\\n")));
-        lines.push(format!("  {}           renumber selection (visual)",    key("\\R")));
-        lines.push(format!("  {}           sort by indent (visual)",        key("\\s")));
-        lines.push(format!("  {}           state/transition underline",     key("\\u")));
-        lines.push(format!("  {}           limelight highlight",            key("\\h")));
-        lines.push(format!("  {}           reference jump (ref/file/URL)",  key("\\r")));
-        lines.push(format!("  {}           presentation mode toggle",       key("\\p")));
-        lines.push(format!("  {}           complexity report",              key("\\c")));
-        lines.push(format!("  {}           colour selection (visual, prism)", key("\\C")));
-        lines.push(format!("  {}           font on selection (visual, fonts)", key("\\F")));
-        lines.push(format!("  {}           toggle colour/font markup", key("\\M")));
-        lines.push(format!("  {}           calendar add (gcalcli)",         key("\\g")));
-        lines.push(format!("  {}     show / hide / clear word",             key("\\S \\H \\N")));
-        lines.push(format!("  {}        encrypt / decrypt / rekey",         key("\\ee \\ed \\ek")));
-        lines.push(format!("  {} export HTML/LaTeX/MD/PDF/docx/odt", key("\\xh \\xl \\xm \\xp \\xd \\xo")));
-        lines.push(format!("  {}", style::fg(&"-".repeat(popup_w as usize - 4), 238)));
-        lines.push(format!("  {}  Close", key("ESC")));
-        // Hide the terminal cursor — otherwise it stays parked on the
-        // buffer beneath the popup and renders as a stray block (visible
-        // through the popup's interior).
+        let fit = |s: &str, w: usize| -> String {
+            let c: Vec<char> = s.chars().collect();
+            if c.len() >= w { c[..w].iter().collect() }
+            else { let mut o: String = c.iter().collect(); o.push_str(&" ".repeat(w - c.len())); o }
+        };
+        let cut = |s: &str, w: usize| -> String {
+            let c: Vec<char> = s.chars().collect();
+            if c.len() <= w { s.to_string() }
+            else { c[..w.saturating_sub(1)].iter().collect::<String>() + "…" }
+        };
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        let mut filter = init.to_string();
+        let mut top = 0usize;
         Cursor::hide();
-        popup.show(&lines.join("\n"));
         loop {
+            let matches = help::search(&filter);
+            let n = matches.len();
+            let max_top = n.saturating_sub(list_h);
+            if top > max_top { top = max_top; }
+
+            let mut lines: Vec<String> = Vec::with_capacity(popup_h as usize);
+            lines.push(String::new());
+            lines.push(format!("  {}    {}", style::bold("Help"),
+                style::fg(&format!("{} match{}", n, if n == 1 { "" } else { "es" }), 244)));
+            lines.push(format!("  {} {}", key("search:"),
+                if filter.is_empty() { style::fg("(type to filter)", 240) } else { filter.clone() }));
+            lines.push(format!("  {}", style::fg(&"-".repeat(inner_w), 238)));
+            for i in 0..list_h {
+                match matches.get(top + i) {
+                    Some(row) => {
+                        let (cat, trig, desc) = **row;
+                        lines.push(format!("  {} {} {}",
+                            style::fg(&fit(cat, 9), 240),
+                            style::fg(&fit(trig, 22), 220),
+                            cut(desc, dw)));
+                    }
+                    None => lines.push(String::new()),
+                }
+            }
+            lines.push(format!("  {}", style::fg(&"-".repeat(inner_w), 238)));
+            lines.push(format!("  {}",
+                style::fg(&cut("type to filter · ↑↓ / PgUp-Dn scroll · Esc close", inner_w), 244)));
+            popup.show(&lines.join("\n"));
+
             let Some(k) = Input::getchr(None) else { break };
-            if k == "ESC" || k == "q" { break; }
+            match k.as_str() {
+                "ESC" | "C-C" | "ENTER" => break,
+                "DOWN"   => { if top + list_h < n { top += 1; } }
+                "UP"     => { top = top.saturating_sub(1); }
+                "PgDOWN" => { top = (top + list_h).min(max_top); }
+                "PgUP"   => { top = top.saturating_sub(list_h); }
+                "BACK"   => { filter.pop(); top = 0; }
+                "C-U"    => { filter.clear(); top = 0; }
+                s if s.chars().count() == 1 => {
+                    let ch = s.chars().next().unwrap();
+                    if !ch.is_control() { filter.push(ch); top = 0; }
+                }
+                _ => {}
+            }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
         Cursor::show();
@@ -7928,7 +7967,12 @@ impl App {
             }
             other if other.starts_with("help ") || other.starts_with("h ") => {
                 let topic = other.splitn(2, ' ').nth(1).unwrap_or("").trim();
-                self.open_help(topic);
+                match topic.to_lowercase().as_str() {
+                    // Full README / HyperList docs stay on these topics; any
+                    // other word opens the searchable help index, filtered.
+                    "hl" | "hyperlist" | "readme" => self.open_help(topic),
+                    _ => self.help_index(topic),
+                }
                 false
             }
             "config" | "Config" => {

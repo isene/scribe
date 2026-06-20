@@ -28,7 +28,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ## Status
 
-**v0.1.62** — daily-driveable for prose AND HyperList. Inline colour / font / markup-conceal and office export are in. Full feature reference below.
+**v0.1.63** — daily-driveable for prose AND HyperList. Inline colour / font / markup-conceal and office export are in. Full feature reference below.
 
 ## Screenshots
 
@@ -234,7 +234,9 @@ The styled inner text renders live (colour applied, `<span>` tags dimmed) in Mar
 
 ### Help
 
-`:help` (or `:h`) opens the bundled README in the current buffer as a Markdown source — search with `/`, navigate with normal motions. Refuses if the current buffer is dirty (save or `Q` first). `:e <file>` returns to your work.
+- `\?` / `g?` — **searchable help index**: a live-filtered list of every binding, command, and feature. Type to filter (matches across key, description, and category), `↑↓` / `PgUp`-`PgDn` scroll, `Esc` closes.
+- `:help <query>` — open the index pre-filtered, e.g. `:help font`, `:help export`, `:help :set`, `:help fold`.
+- `:help` / `:help hl` — open the full bundled README / HyperList reference in a popup; scroll with `j` / `k`, `Esc` closes.
 
 ### Sessions
 
