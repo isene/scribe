@@ -2236,13 +2236,13 @@ impl App {
                 highlight::set_span_conceal(self.markup_concealed, self.cur_line);
                 let rendered = match ext.as_str() {
                     "hl" | "woim"       => highlight::highlight_hyperlist(&all, line_count + 1),
-                    "md" | "markdown"   => highlight::highlight_markdown_source(&all, line_count + 1),
-                    "tex"               => highlight::highlight_tex(&all, line_count + 1),
+                    "md" | "markdown"   => self.embed_hl(highlight::highlight_markdown_source(&all, line_count + 1), &all, line_count),
+                    "tex"               => self.embed_hl(highlight::highlight_tex(&all, line_count + 1), &all, line_count),
                     // Plain prose and HTML (a colour/font save target) get their
                     // inline spans rendered — no Markdown styling imposed.
                     "" | "txt" | "text" | "html" | "htm"
-                                        => highlight::highlight_plain_spans(&all, line_count + 1),
-                    _                   => highlight::highlight(&all, ext, line_count + 1),
+                                        => self.embed_hl(highlight::highlight_plain_spans(&all, line_count + 1), &all, line_count),
+                    _                   => self.embed_hl(highlight::highlight(&all, ext, line_count + 1), &all, line_count),
                 };
                 let mut lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
                 // `\u` State / Transition underline cycle for HL only.
@@ -2289,7 +2289,7 @@ impl App {
                     all.push('\n');
                 }
                 highlight::set_span_conceal(self.markup_concealed, self.cur_line);
-                highlight::highlight_plain_spans(&all, line_count + 1)
+                self.embed_hl(highlight::highlight_plain_spans(&all, line_count + 1), &all, line_count)
                     .split('\n')
                     .map(str::to_string)
                     .collect()
@@ -4326,17 +4326,76 @@ impl App {
     /// 3 (matches hyperlist.vim's `setlocal tabstop=3`); everything
     /// else uses 8.
     fn tabstop(&self) -> usize {
+        // Inside an embedded HLstart…HLend block, honour the HyperList tab stop
+        // even in a markdown / plain file, so the region's tree indents at 3.
+        if self.in_hl_region(self.cur_line) { return 3; }
         match &self.buf.kind {
             buffer::FileKind::Source(s) if s == "hl" || s == "woim" => 3,
             _ => 8,
         }
     }
 
-    /// True iff the current buffer is a HyperList (.hl / .woim) file.
-    /// Used to gate HyperList-specific keybindings like LEFT/RIGHT
-    /// fold-toggle without polluting the generic motion handler.
+    /// True iff the current buffer is a HyperList (.hl / .woim) file, OR the
+    /// cursor sits inside an embedded `HLstart`…`HLend` region. Gates
+    /// HyperList-specific behaviour.
     fn is_hyperlist(&self) -> bool {
-        matches!(&self.buf.kind, buffer::FileKind::Source(s) if s == "hl" || s == "woim")
+        self.in_hl_region(self.cur_line)
+            || matches!(&self.buf.kind, buffer::FileKind::Source(s) if s == "hl" || s == "woim")
+    }
+
+    /// True iff `line_idx` sits strictly inside an `HLstart` … `HLend` block —
+    /// an embedded HyperList region in an otherwise non-HL file (mirrors
+    /// hyperlist.vim's syntax region). The marker lines themselves are not
+    /// "inside".
+    fn in_hl_region(&self, line_idx: usize) -> bool {
+        if line_idx >= self.buf.line_count() { return false; }
+        match self.buf.line(line_idx).trim() {
+            "HLstart" | "HLend" => return false,
+            _ => {}
+        }
+        let mut inside = false;
+        for i in 0..line_idx {
+            match self.buf.line(i).trim() {
+                "HLstart" => inside = true,
+                "HLend" => inside = false,
+                _ => {}
+            }
+        }
+        inside
+    }
+
+    /// Cheap gate: does the buffer contain any `HLstart` marker at all? Keeps
+    /// the embedded-HL render path fully cold for ordinary files.
+    fn has_hl_region(&self) -> bool {
+        (0..self.buf.line_count()).any(|i| self.buf.line(i).trim() == "HLstart")
+    }
+
+    /// Overlay embedded HyperList regions onto an already-highlighted buffer:
+    /// `HLstart`/`HLend` markers render dark grey, and the lines between them
+    /// are re-highlighted as HyperList independent of the surrounding file.
+    /// `base` is the file's normal per-line styled output (`\n`-joined); `all`
+    /// is the raw buffer text.
+    fn embed_hl(&self, base: String, all: &str, line_count: usize) -> String {
+        if !self.has_hl_region() { return base; }
+        let base_lines: Vec<&str> = base.split('\n').collect();
+        let hl = highlight::highlight_hyperlist(all, line_count + 1);
+        let hl_lines: Vec<&str> = hl.split('\n').collect();
+        let mut out: Vec<String> = Vec::with_capacity(line_count + 1);
+        let mut inside = false;
+        for i in 0..line_count {
+            let raw = self.buf.line(i);
+            match raw.trim() {
+                "HLstart" => { inside = true;  out.push(format!("\x1b[38;5;240m{}\x1b[0m", raw)); }
+                "HLend"   => { inside = false; out.push(format!("\x1b[38;5;240m{}\x1b[0m", raw)); }
+                // Pre-expand the region's tabs at the HyperList stop (3) here,
+                // so these lines hold spaces — the final buffer-wide
+                // expand_tabs_styled (cursor-based width) then can't widen them.
+                // That keeps the region at 3 no matter where the cursor is.
+                _ if inside => out.push(expand_tabs_styled(hl_lines.get(i).copied().unwrap_or(""), 3)),
+                _ => out.push(base_lines.get(i).copied().unwrap_or("").to_string()),
+            }
+        }
+        out.join("\n")
     }
 
     /// Leading-whitespace prefix of the current line (TAB/space/`*`),
