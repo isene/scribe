@@ -511,7 +511,7 @@ enum LastChange {
     Replace { c: char, count: usize },
     Insert { text: String },
     Paste { after: bool, count: usize, register: Option<char> },
-    SimpleAction { key: String, count: usize, register: Option<char> },
+    SimpleAction { key: String, count: usize },
 }
 
 /// Motion descriptor stable enough to replay verbatim regardless of cursor
@@ -4223,7 +4223,6 @@ impl App {
             self.last_change = Some(LastChange::SimpleAction {
                 key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
                 count: delta.unsigned_abs() as usize,
-                register: None,
             });
             return;
         }
@@ -4272,7 +4271,6 @@ impl App {
         self.last_change = Some(LastChange::SimpleAction {
             key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
             count: delta.unsigned_abs() as usize,
-            register: None,
         });
     }
 
@@ -7030,7 +7028,18 @@ impl App {
                 self.do_paste(after, count);
                 self.pending.register = saved;
             }
-            LastChange::SimpleAction { .. } => {}
+            LastChange::SimpleAction { key, count } => {
+                // Currently only C-A / C-X record a SimpleAction. Replay
+                // by re-dispatching the same signed delta change_number
+                // used by the original keypress (count = magnitude,
+                // sign from the key).
+                let delta = count as i64;
+                match key.as_str() {
+                    "C-A" => self.change_number(delta),
+                    "C-X" => self.change_number(-delta),
+                    _ => {}
+                }
+            }
         }
     }
 
