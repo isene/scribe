@@ -22,6 +22,10 @@
 //! Storage: a `HashSet<usize>` of START line indexes that are currently
 //! closed. Cheap lookup, simple state.
 
+// Folds exposes a complete open/close/count API; the binary currently
+// uses a subset, so allow the unused public methods.
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 
 #[derive(Default, Clone, Debug)]

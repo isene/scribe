@@ -1,6 +1,10 @@
 // AUTO-GENERATED from `vim -E -c digraphs` dump. Do not edit by hand.
 // Source: RFC 1345 / Vim's default digraph table. 1324 entries.
 
+// `category` is part of the generated RFC 1345 schema but unused by the
+// binary; keep the field, silence the dead-code warning.
+#![allow(dead_code)]
+
 pub struct Digraph {
     pub code: &'static str,
     pub glyph: &'static str,

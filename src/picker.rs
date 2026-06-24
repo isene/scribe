@@ -7,7 +7,7 @@
 
 use crust::{Cursor, Input, Pane, Popup, style};
 
-use crate::digraphs::{DIGRAPHS, Digraph};
+use crate::digraphs::DIGRAPHS;
 use crate::emoji_data::EMOJI_CATEGORIES;
 
 /// Popup panel background (256-color index). Used both to build the

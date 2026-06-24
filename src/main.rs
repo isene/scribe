@@ -509,7 +509,7 @@ enum LastChange {
         insert_text: String,
     },
     Replace { c: char, count: usize },
-    Insert { text: String, append: bool },
+    Insert { text: String },
     Paste { after: bool, count: usize, register: Option<char> },
     SimpleAction { key: String, count: usize, register: Option<char> },
 }
@@ -1305,22 +1305,6 @@ struct RcConfig {
     calendar: Option<String>,
     /// `alldates = true` — include past events too.
     alldates: bool,
-}
-
-/// Prompt on the controlling tty for a password with echo disabled.
-/// Defers to `stty -echo` since pulling in `termios` for one call is
-/// excessive. Re-enables echo on return regardless of outcome.
-fn read_password_tty(prompt: &str) -> std::io::Result<String> {
-    use std::io::{BufRead, Write};
-    let _ = std::process::Command::new("stty").arg("-echo").status();
-    print!("{}", prompt);
-    let _ = std::io::stdout().flush();
-    let mut pw = String::new();
-    let stdin = std::io::stdin();
-    stdin.lock().read_line(&mut pw)?;
-    let _ = std::process::Command::new("stty").arg("echo").status();
-    println!();
-    Ok(pw.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
 }
 
 /// Parse the leading number prefix of an HL item (after indentation).
@@ -4335,14 +4319,6 @@ impl App {
         }
     }
 
-    /// True iff the current buffer is a HyperList (.hl / .woim) file, OR the
-    /// cursor sits inside an embedded `HLstart`…`HLend` region. Gates
-    /// HyperList-specific behaviour.
-    fn is_hyperlist(&self) -> bool {
-        self.in_hl_region(self.cur_line)
-            || matches!(&self.buf.kind, buffer::FileKind::Source(s) if s == "hl" || s == "woim")
-    }
-
     /// True iff `line_idx` sits strictly inside an `HLstart` … `HLend` block —
     /// an embedded HyperList region in an otherwise non-HL file (mirrors
     /// hyperlist.vim's syntax region). The marker lines themselves are not
@@ -5037,7 +5013,7 @@ impl App {
         // Walk lines, collapse maximal runs of "should-hide" lines
         // into a fold whose head is the first line of the run.
         let mut run_start: Option<usize> = None;
-        let mut close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
+        let close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
             if end > start { folds.close_range(start, end); }
         };
         for i in 0..total {
@@ -5184,7 +5160,7 @@ impl App {
         let total = self.buf.line_count();
         self.folds.clear();
         let mut run_start: Option<usize> = None;
-        let mut close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
+        let close_run = |start: usize, end: usize, folds: &mut fold::Folds| {
             if end > start { folds.close_range(start, end); }
         };
         for i in 0..total {
@@ -6601,7 +6577,6 @@ impl App {
                         // Pure insert (i / a / o / O / I / A) — record on its own.
                         self.last_change = Some(LastChange::Insert {
                             text: captured,
-                            append: false,
                         });
                     }
                 }
@@ -6835,7 +6810,6 @@ impl App {
                     if !captured.is_empty() {
                         self.last_change = Some(LastChange::Insert {
                             text: captured,
-                            append: false,
                         });
                     }
                 }
