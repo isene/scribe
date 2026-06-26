@@ -155,6 +155,16 @@ impl Buffer {
         }
     }
 
+    /// Recompute `kind` from the current path + content. Call after the
+    /// buffer adopts a new path (`:w <newname>` on an unnamed buffer) so
+    /// syntax highlighting matches the saved filetype without a reload.
+    pub fn refresh_kind(&mut self) {
+        if let Some(path) = self.path.clone() {
+            let s = self.rope.to_string();
+            self.kind = detect_kind(&path, &s);
+        }
+    }
+
     /// Re-read the file from disk, replacing the rope content + resetting
     /// dirty / mtime. Undo history is preserved (caller may still want to
     /// undo back into the pre-reload state). Returns Err if the file is

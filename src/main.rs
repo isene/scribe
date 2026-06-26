@@ -7811,8 +7811,22 @@ impl App {
                 let mut s = String::new();
                 for chunk in self.buf.rope.chunks() { s.push_str(chunk); }
                 match std::fs::write(&expanded, s) {
-                    Ok(_) => self.set_status(
-                        &format!(" written to {}", expanded.display()), 46),
+                    Ok(_) => {
+                        // If the buffer had no name yet, adopt this path as
+                        // the current file so a later bare `:w` lands here
+                        // instead of erroring with "no file". An already-named
+                        // buffer keeps vim's "write a copy elsewhere" semantics.
+                        if self.buf.path.is_none() {
+                            self.buf.path = Some(expanded.clone());
+                            self.buf.dirty = false;
+                            self.buf.last_mtime = std::fs::metadata(&expanded)
+                                .ok().and_then(|m| m.modified().ok());
+                            // Apply highlighting for the saved filetype.
+                            self.buf.refresh_kind();
+                        }
+                        self.set_status(
+                            &format!(" written to {}", expanded.display()), 46);
+                    }
                     Err(e) => self.set_status(
                         &format!(" save failed: {}", e), 196),
                 }
