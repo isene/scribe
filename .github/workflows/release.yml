@@ -29,18 +29,18 @@ jobs:
             artifact: scribe-macos-aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: scribe
 
       - name: Checkout crust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/crust
           path: crust
 
       - name: Checkout highlight
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/highlight
           path: highlight
@@ -78,7 +78,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
