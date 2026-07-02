@@ -752,6 +752,11 @@ impl App {
         header.wrap = false; header.scroll = false;
         let mut main_p = Pane::new(1, 2, cols, rows.saturating_sub(2), 231, 0);
         main_p.wrap = true;
+        // scribe owns its own viewport: it computes self.scroll and fills
+        // the pane with ~ fillers, so crust's automatic scroll markers are
+        // meaningless here and drew a spurious ▽ (crust re-wraps and counts
+        // one line past the visible height). Disable them.
+        main_p.scroll = false;
         // word_wrap stays true (the default) — prose-friendly
         // line-breaks at spaces. `position_cursor` replays the
         // word-wrap algorithm via `wrap_pos()` so the cursor lands
@@ -5650,6 +5655,7 @@ impl App {
         self.header.wrap = false; self.header.scroll = false;
         self.main_p = Pane::new(main_x, 2, main_w, rows.saturating_sub(2), 231, 0);
         self.main_p.wrap = true;
+        self.main_p.scroll = false; // scribe owns its viewport — no crust scroll markers
         // Preserve record + history across layout recompute — recreating
         // the footer would otherwise blow them away on every `:read`
         // toggle, killing command-line Up/Down recall.
