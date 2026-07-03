@@ -52,8 +52,8 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | Keys | Action |
 |---|---|
 | `h j k l` (also arrows) | left / down / up / right; arrows wrap across line boundaries in Insert |
-| `0` `^` `$` (`HOME` `END`) | line start / first non-blank / line end |
-| `gg` `G` (with count: `12G`) | first / last line / line N |
+| `0` `^` `$` | line start / first non-blank / line end |
+| `gg` `G` (also `HOME` `END`; count: `12G`) | first / last line / line N |
 | `w b e W B` | next/prev word, end of word; capital = WORD (whitespace-delimited) |
 | `f{c}` `F{c}` `t{c}` `T{c}` | jump on/before next/prev `c` on the current line |
 | `Ctrl-D` `Ctrl-U` (`PgUp/PgDn`) | half-page / full-page scroll |

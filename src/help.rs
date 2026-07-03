@@ -8,8 +8,8 @@ pub type Entry = (&'static str, &'static str, &'static str);
 pub const HELP: &[Entry] = &[
     // Motion
     ("Motion", "h j k l", "left / down / up / right (arrows too)"),
-    ("Motion", "0 ^ $", "line start / first non-blank / end (Home/End)"),
-    ("Motion", "gg G", "first / last line; 12G jumps to line 12"),
+    ("Motion", "0 ^ $", "line start / first non-blank / line end"),
+    ("Motion", "gg G", "first / last line (Home/End too); 12G to line 12"),
     ("Motion", "w b e  W B E", "next/prev word, end of word; CAPS = WORD"),
     ("Motion", "f F t T {c}", "jump on/before next/prev char on the line"),
     ("Motion", "Ctrl-D Ctrl-U", "half-page scroll down/up (PgDn/PgUp full)"),

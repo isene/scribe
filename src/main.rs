@@ -549,7 +549,7 @@ struct BlockInsert {
 /// excluded.
 fn is_jump_motion(key: &str) -> bool {
     matches!(key,
-        "G" | "gg" | "n" | "N"
+        "G" | "gg" | "n" | "N" | "HOME" | "END"
         | "{" | "}" | "(" | ")" | "%"
         | "H" | "M" | "L" | "[[" | "]]")
 }
@@ -3573,12 +3573,13 @@ impl App {
                 let len = self.buf.line(target_line).len();
                 Some(off + self.want_col.min(len.saturating_sub(1).max(0)))
             }
-            "0" | "HOME" => Some(motion::line_start(&self.buf, cur)),
-            // Ctrl-Home / Ctrl-End: vim's `gg` / `G` but on a single
-            // keystroke. Linewise like `gg`/`G` so e.g. `dC-END`
-            // deletes from the current line to the end of the file.
-            "C-HOME" => Some(0),
-            "C-END"  => Some(self.buf.line_byte_offset(
+            "0" => Some(motion::line_start(&self.buf, cur)),
+            // Home / Ctrl-Home go to the top of the file (vim `gg`); End /
+            // Ctrl-End to the last line (vim `G`). `0` still goes to column 0
+            // and `$` to line end. Charwise from the cursor for operators, so
+            // e.g. `dEND` deletes from the current line to the end of file.
+            "HOME" | "C-HOME" => Some(0),
+            "END" | "C-END"  => Some(self.buf.line_byte_offset(
                 self.buf.line_count().saturating_sub(1)
             )),
             "^"          => Some(motion::line_first_nonblank(&self.buf, cur)),
@@ -3596,7 +3597,7 @@ impl App {
                     .unwrap_or(0);
                 Some(off + first_nonblank)
             }
-            "$" | "END"  => {
+            "$"  => {
                 let mut end = motion::line_end(&self.buf, cur);
                 // For motion (no operator), step back one char so we don't
                 // sit past last visible char — vim semantics.
