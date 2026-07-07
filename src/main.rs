@@ -3872,6 +3872,11 @@ impl App {
                 None       => self.set_status(" already at newest change", 244),
             },
 
+            // `=` — RPN calculator. Launches rpnx; on a normal quit its X
+            // register is inserted at the cursor. The RPN sibling of the
+            // insert-mode <C-R>= algebraic eval.
+            "=" => self.launch_rpnx(),
+
             // Enter Command — pointer-style: footer.ask handles the prompt
             // line entirely (line editor, cursor placement, no flicker).
             // execute_command runs once the user hits Enter.
@@ -5437,6 +5442,41 @@ impl App {
             else if let Some(v) = line.strip_prefix("size=") { size = v.trim().parse().unwrap_or(0); }
         }
         if family.is_empty() { None } else { Some((family, size)) }
+    }
+
+    /// `=` — hand the screen to the RPNx calculator, then insert its X register
+    /// at the cursor. rpnx writes X to `--emit-file` on a normal quit (its TUI
+    /// owns the terminal meanwhile, so we can't pipe its stdout); a cancel-quit
+    /// writes nothing. Same screen handoff as pick_font.
+    fn launch_rpnx(&mut self) {
+        let outfile = format!("/tmp/scribe_rpnx_{}.txt", std::process::id());
+        let _ = std::fs::remove_file(&outfile);
+        Crust::cleanup();
+        let status = std::process::Command::new("rpnx")
+            .arg("--emit-file")
+            .arg(&outfile)
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.header.invalidate();
+        self.main_p.invalidate();
+        self.footer.invalidate();
+        if status.is_err() {
+            let _ = std::fs::remove_file(&outfile);
+            self.set_status(" rpnx not found on PATH", 196);
+            self.render_all();
+            return;
+        }
+        let val = std::fs::read_to_string(&outfile).ok();
+        let _ = std::fs::remove_file(&outfile);
+        match val.as_deref().map(str::trim) {
+            Some(v) if !v.is_empty() => {
+                self.insert_text_at_cursor(v);
+                self.set_status(&format!(" = {}", v), 244);
+            }
+            _ => self.set_status(" (no value)", 244),
+        }
+        self.render_all();
     }
 
     /// Build an HTML form of the buffer and convert it to docx/odt with

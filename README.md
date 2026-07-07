@@ -128,6 +128,13 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 `u` undo, `Ctrl-R` redo. The buffer keeps an undo **tree** in memory (not a linear stack), and the cursor follows the edit site so you can see what changed.
 
+### Calculator
+
+Two ways to drop a number into the text:
+
+- **Insert mode `Ctrl-R =`** — type a quick arithmetic expression, the result is inserted. Good for `1920/2 + 8`.
+- **Normal mode `=`** — hands the screen to [rpnx](https://github.com/isene/rpnx), the full RPN / XRPN scientific calculator. Do the calculation, quit with `Q`, and the X register lands at the cursor. `Ctrl-C` in rpnx inserts nothing.
+
 ### Macros
 
 `M{reg}` starts recording into register `reg`; `M` again stops. `@{reg}` replays. `@@` replays the last-played macro. Macros and yanks **share the same registers**, so:
