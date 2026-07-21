@@ -2020,6 +2020,13 @@ impl App {
 
     // ── Rendering ──────────────────────────────────────────────────────
     fn render_all(&mut self) {
+        // Sync fold state with any structural edits since the last
+        // frame — closed folds are stored by line index and must move
+        // with the text (insert above a collapsed item, undo, paste…).
+        let edits = std::mem::take(&mut self.buf.line_edits);
+        for (at, delta) in edits {
+            self.folds.shift_lines(at, delta);
+        }
         self.render_header();
         self.render_main();
         self.render_footer();

@@ -87,6 +87,12 @@ pub struct Buffer {
     /// reaches 0) commits the accumulated edits as a single node.
     compound_depth: usize,
     pending_compound: Vec<Edit>,
+    /// Journal of line-count changes: `(first_affected_line, delta)`
+    /// pushed by apply()/undo()/redo() whenever an edit adds or removes
+    /// lines. The app drains this each cycle and shifts fold state (and
+    /// any other line-indexed bookkeeping) to match — folds are stored
+    /// by line index and desync on every structural edit otherwise.
+    pub line_edits: Vec<(usize, isize)>,
     /// True for files that decrypt on open and re-encrypt on save (HL
     /// dotfile convention: `.foo.hl` is auto-encrypted on disk).
     pub encrypted: bool,
@@ -108,6 +114,7 @@ impl Buffer {
             last_mtime: None,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            line_edits: Vec::new(),
             encrypted: false,
             password: None,
             openssl_format: false,
@@ -128,6 +135,7 @@ impl Buffer {
             last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            line_edits: Vec::new(),
             encrypted: false,
             password: None,
             openssl_format: false,
@@ -149,6 +157,7 @@ impl Buffer {
             last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
+            line_edits: Vec::new(),
             encrypted: true,
             password: Some(password),
             openssl_format,
@@ -177,6 +186,9 @@ impl Buffer {
         if s.contains('\r') { s = s.replace("\r\n", "\n").replace('\r', "\n"); }
         self.rope = Rope::from_str(&s);
         self.dirty = false;
+        // Content replaced wholesale — pending line-shift entries would
+        // apply garbage offsets to fold state.
+        self.line_edits.clear();
         self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(())
     }
@@ -273,6 +285,11 @@ impl Buffer {
             self.rope.byte_slice(start..end).to_string()
         };
         let edit = Edit { start, end, replacement: replacement.into(), original };
+        let delta = replacement.matches('\n').count() as isize
+            - edit.original.matches('\n').count() as isize;
+        if delta != 0 {
+            self.line_edits.push((self.rope.byte_to_line(start), delta));
+        }
         let start_char = self.rope.byte_to_char(start);
         let end_char = self.rope.byte_to_char(end);
         self.rope.remove(start_char..end_char);
@@ -297,6 +314,11 @@ impl Buffer {
         let head = self.head?;
         let node = self.nodes[head].clone();
         for e in node.edits.iter().rev() {
+            let delta = e.original.matches('\n').count() as isize
+                - e.replacement.matches('\n').count() as isize;
+            if delta != 0 {
+                self.line_edits.push((self.rope.byte_to_line(e.start), delta));
+            }
             let new_end = e.start + e.replacement.len();
             let start_char = self.rope.byte_to_char(e.start);
             let end_char = self.rope.byte_to_char(new_end);
@@ -319,6 +341,11 @@ impl Buffer {
         let target = target?;
         let node = self.nodes[target].clone();
         for e in &node.edits {
+            let delta = e.replacement.matches('\n').count() as isize
+                - e.original.matches('\n').count() as isize;
+            if delta != 0 {
+                self.line_edits.push((self.rope.byte_to_line(e.start), delta));
+            }
             let start_char = self.rope.byte_to_char(e.start);
             let end_char = self.rope.byte_to_char(e.end);
             self.rope.remove(start_char..end_char);

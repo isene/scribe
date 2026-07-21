@@ -231,6 +231,35 @@ impl Folds {
 
     /// Open every fold (alias for `set_level(usize::MAX)` semantics).
     pub fn open_all(&mut self) { self.closed.clear(); }
+
+    /// Shift fold state after a structural edit: `delta` lines were
+    /// added (positive) or removed (negative) starting just after
+    /// `at_line`. Closed-fold starts and explicit ranges move with the
+    /// text they were attached to; fold heads that sat inside a deleted
+    /// span are dropped. Without this, every insert/delete above a
+    /// closed fold left the stored line index pointing one line off —
+    /// most visibly, a freshly inserted item "inherited" the next
+    /// sibling's closed fold and collapsed the moment it gained a child.
+    pub fn shift_lines(&mut self, at_line: usize, delta: isize) {
+        if delta == 0 { return; }
+        let moved = |s: usize| -> Option<usize> {
+            if s <= at_line { return Some(s); }
+            if delta < 0 {
+                let cut = (-delta) as usize;
+                if s <= at_line + cut { return None; }      // inside deleted span
+                Some(s - cut)
+            } else {
+                Some(s + delta as usize)
+            }
+        };
+        self.closed = self.closed.iter().filter_map(|&s| moved(s)).collect();
+        self.explicit = self.explicit.iter()
+            .filter_map(|&(s, e)| match (moved(s), moved(e)) {
+                (Some(s2), Some(e2)) if e2 > s2 => Some((s2, e2)),
+                _ => None,
+            })
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +298,28 @@ mod tests {
         assert!(f.is_visible(3, &l));
         f.toggle_at(0, &l);
         assert!(f.is_visible(1, &l));
+    }
+
+    #[test]
+    fn shift_lines_keeps_folds_attached() {
+        // Collapsed-to-level-2 tree; insert a new level-2 line between
+        // two collapsed items, then give it a child. The child must
+        // stay visible — the bug was that the next sibling's closed
+        // index landed on the new item after the insert.
+        let before = lines("a\n\tb1\n\t\tc1\n\tb2\n\t\tc2");
+        let mut f = Folds::new();
+        f.set_level(1, &before);          // b1 and b2 collapsed
+        assert!(!f.is_visible(2, &before));
+        // Insert a new "\tnew" after b1's fold (index 3), then a child.
+        let after = lines("a\n\tb1\n\t\tc1\n\tnew\n\t\tchild\n\tb2\n\t\tc2");
+        f.shift_lines(2, 2);              // two lines added after line 2
+        assert!(f.is_visible(3, &after), "new item visible");
+        assert!(f.is_visible(4, &after), "typed child stays visible");
+        assert!(!f.is_visible(6, &after), "b2 stays collapsed");
+        // And deletion shifts back: remove the two inserted lines.
+        f.shift_lines(2, -2);
+        assert!(!f.is_visible(2, &before));
+        assert!(!f.is_visible(4, &before));
     }
 
     #[test]
