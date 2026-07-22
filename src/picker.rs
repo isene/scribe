@@ -208,7 +208,10 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
                 // White is the least bad alternative until glass's
                 // CBDT path is fixed; digraphs (and emoji color in
                 // the main buffer) are unaffected.
-                let glyph_cell = format!(" {} ", style::fg(&format!("{:<2}", e.glyph), 255));
+                // pad_display, NOT format!("{:<2}"): format pads by CHAR
+                // count, so a VS16-carrying emoji (2 chars, 2 cells)
+                // got no padding and shifted the whole row left a cell.
+                let glyph_cell = format!(" {} ", style::fg(&crust::pad_display(e.glyph, 2), 255));
                 let code_cell  = if e.code.is_empty() {
                     format!(" {:<4} ", "")
                 } else {

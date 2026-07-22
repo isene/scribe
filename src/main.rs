@@ -1398,10 +1398,6 @@ fn visual_width_of(s: &str, tabstop: usize) -> usize {
 fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
     -> Vec<Vec<(char, usize, usize)>>
 {
-    let char_w = |c: char, at_col: usize| -> usize {
-        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) }
-        else { crust::cell_width(c).max(1) }
-    };
     let mut rows: Vec<Vec<(char, usize, usize)>> = Vec::new();
     let mut current: Vec<(char, usize, usize)> = Vec::new();
     let mut col = gutter_w;
@@ -1410,17 +1406,22 @@ fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
         rows.push(current);
         return rows;
     }
+    let mut wk = crust::WidthWalker::new();
     for c in line.chars() {
-        let cw = char_w(c, col);
-        if col + cw > width {
+        let cont = wk.is_continuation(c);
+        let cw = walk_char(&mut wk, c, col, tabstop);
+        if col + cw > width && !cont {
             let space_idx = current.iter().rposition(|&(ch, _, _)| ch == ' ');
             if let Some(sp) = space_idx {
                 let tail: Vec<(char, usize, usize)> = current.drain(sp + 1..).collect();
                 current.pop(); // drop boundary space
                 rows.push(std::mem::take(&mut current));
                 col = 0;
+                // Fresh walker is safe: the tail starts right after a
+                // space, i.e. on a cluster boundary.
+                let mut twk = crust::WidthWalker::new();
                 for (tc, tb, _) in tail {
-                    let tw = char_w(tc, col);
+                    let tw = walk_char(&mut twk, tc, col, tabstop);
                     current.push((tc, tb, col));
                     col += tw;
                 }
@@ -1428,7 +1429,9 @@ fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
                 rows.push(std::mem::take(&mut current));
                 col = 0;
             }
-            let cw2 = char_w(c, col);
+            // Only a tab's width depends on the column; anything else
+            // keeps its pre-wrap width.
+            let cw2 = if c == '\t' { tabstop.saturating_sub(col % tabstop).max(1) } else { cw };
             current.push((c, byte_pos, col));
             col += cw2;
         } else {
@@ -1439,6 +1442,21 @@ fn wrap_simulate(line: &str, width: usize, gutter_w: usize, tabstop: usize)
     }
     rows.push(current);
     rows
+}
+
+/// Advance `wk` over `c` and return the cells it adds at `at_col`.
+/// Tabs expand to the next tabstop and reset the walker (a tab closes
+/// any emoji cluster); everything else goes through crust's
+/// WidthWalker so VS16/ZWJ clusters count what glass actually paints
+/// (a lone `cell_width` can't see the selector and drifted the cursor
+/// one cell for every VS16-carrying emoji on the line).
+fn walk_char(wk: &mut crust::WidthWalker, c: char, at_col: usize, tabstop: usize) -> usize {
+    if c == '\t' {
+        *wk = crust::WidthWalker::new();
+        tabstop.saturating_sub(at_col % tabstop).max(1)
+    } else {
+        wk.push(c)
+    }
 }
 
 /// Inverse of `wrap_pos`: given a target visual `(row_in_line,
@@ -1515,16 +1533,6 @@ fn byte_at_or_past_col(line: &str, target_col: usize, tabstop: usize) -> (usize,
 
 fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop: usize) -> (usize, usize) {
     if width == 0 { return (0, gutter_w); }
-    // Per-cell width. Tabs expand to the next tabstop; otherwise use
-    // crust::cell_width which mirrors glass's emoji-routing rules
-    // (non-BMP codepoints render 2 cells, certain BMP emoji ranges
-    // ditto). Without this, every emoji collapses to 1 cell here and
-    // the cursor position math drifts left of where the glyph
-    // actually finishes on screen.
-    let char_w = |c: char, at_col: usize| -> usize {
-        if c == '\t' { tabstop.saturating_sub(at_col % tabstop).max(1) }
-        else { crust::cell_width(c).max(1) }
-    };
     // Final position for each rendered byte. Boundary-dropped
     // spaces are absent from this map.
     let mut pos: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
@@ -1534,9 +1542,11 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
     let mut col: usize = gutter_w;
     let mut byte_pos: usize = 0;
 
+    let mut wk = crust::WidthWalker::new();
     for c in line.chars() {
-        let cw = char_w(c, col);
-        if col + cw > width {
+        let cont = wk.is_continuation(c);
+        let cw = walk_char(&mut wk, c, col, tabstop);
+        if col + cw > width && !cont {
             // Overflow → break. Prefer last space; else hard break.
             let space_idx = current.iter().rposition(|&(ch, _, _)| ch == ' ');
             if let Some(sp) = space_idx {
@@ -1551,8 +1561,10 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
                 current.clear();
                 row += 1;
                 col = 0;
+                // Fresh walker: the tail starts on a cluster boundary.
+                let mut twk = crust::WidthWalker::new();
                 for (tc, tb, _) in tail {
-                    let tw = char_w(tc, col);
+                    let tw = walk_char(&mut twk, tc, col, tabstop);
                     current.push((tc, tb, col));
                     col += tw;
                 }
@@ -1563,7 +1575,7 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
                 row += 1;
                 col = 0;
             }
-            let cw2 = char_w(c, col);
+            let cw2 = if c == '\t' { tabstop.saturating_sub(col % tabstop).max(1) } else { cw };
             current.push((c, byte_pos, col));
             col += cw2;
         } else {
@@ -1587,9 +1599,11 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
     // terminals that draw the bar cursor at the LEFT edge of a cell —
     // glass and many others. Wrapping makes "I'm past-end" obvious.
     if byte_col >= line.len() {
-        let last_col = current.last()
-            .map(|&(c, _, cc)| cc + char_w(c, cc))
-            .unwrap_or(col);
+        // `col` already sits at the right edge of the last glyph — it
+        // advanced by each char's effective width, including
+        // cluster-collapsed emoji. Recomputing a lone trailing char's
+        // width here would miscount a VS16 tail.
+        let last_col = col;
         if last_col + 1 >= width { return (row + 1, 0); }
         return (row, last_col);
     }
@@ -1605,9 +1619,7 @@ fn wrap_pos(line: &str, byte_col: usize, width: usize, gutter_w: usize, tabstop:
     // Nothing further — return end of last row. Same one-cell slack
     // as the past-end branch above for the same bar-cursor-rendering
     // reason.
-    let last_col = current.last()
-        .map(|&(c, _, cc)| cc + char_w(c, cc))
-        .unwrap_or(col);
+    let last_col = col;
     if last_col + 1 >= width { (row + 1, 0) } else { (row, last_col) }
 }
 
