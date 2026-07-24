@@ -3213,6 +3213,18 @@ impl App {
             return false;
         }
 
+        // <Right> on a collapsed item opens it (hyperlist-style);
+        // on an open line it stays the ordinary right motion (falls
+        // through). Gated on no pending operator so d<Right> etc.
+        // keep their motion semantics.
+        if key == "RIGHT" && self.pending.operator.is_none()
+            && self.pending.count1.is_none() && self.pending.text_object.is_none()
+            && self.folds.is_closed(self.cur_line)
+        {
+            self.folds.open(self.cur_line);
+            return false;
+        }
+
         // `]` / `[` prefix: dispatch on the follow-up key.
         if let Some(open) = self.bracket_prefix.take() {
             match (open, key) {
