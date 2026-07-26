@@ -135,7 +135,7 @@ fn main() {
     Crust::init();
     Crust::set_app_identity("Scribe");
     use std::io::Write;
-    print!("\x1b[?2004h");
+    Crust::enable_bracketed_paste();
     let _ = std::io::stdout().flush();
 
     let mut app = App::new(app_path, cli_theme, no_spell);
@@ -299,7 +299,7 @@ fn main() {
         app.render_all();
     }
 
-    print!("\x1b[?2004l");
+    Crust::disable_bracketed_paste();
     let _ = std::io::stdout().flush();
     // Persist `:` command history across runs. The footer pane was the
     // editline target; its history is the live list.
@@ -1891,7 +1891,7 @@ fn install_panic_hook() {
         // Restore terminal first so the panic text isn't eaten by
         // alt-screen / raw mode.
         use std::io::Write as _;
-        let _ = std::io::stdout().write_all(b"\x1b[?2004l");
+        Crust::disable_bracketed_paste();
         let _ = std::io::stdout().flush();
         Crust::cleanup();
 
@@ -2025,7 +2025,7 @@ fn gutter_cell(line_idx: usize, cur_line: usize, line_count: usize, relative: bo
         line_idx + 1
     };
     // Dim the gutter (240 = gray) so it doesn't compete with content.
-    format!("\x1b[38;5;240m{:>width$} │ \x1b[39m", n, width = digits)
+    format!("{} ", style::fg(&format!("{:>width$} │", n, width = digits), 240))
 }
 
 impl App {
@@ -2280,7 +2280,7 @@ impl App {
                                     || bytes[indent_end] == b' ')
                             { indent_end += 1; }
                             let (head, tail) = styled.split_at(indent_end);
-                            *styled = format!("{}\x1b[4m{}\x1b[24m", head, tail);
+                            *styled = format!("{}{}", head, style::underline(tail));
                         }
                     }
                 }
@@ -2537,10 +2537,10 @@ impl App {
         if self.reading_mode {
             // Reading mode: only show transient status (the user
             // pressed a key that produced one), otherwise dim line.
-            let bg = format!("\x1b[48;5;{}m", 234u8);
+            let bg = style::set_bg(234);
             let line = match &self.status {
-                Some((msg, c)) => format!("{} {}{}\x1b[0m", bg, style::fg(msg, *c), bg),
-                None => format!("{}{}\x1b[0m", bg, " ".repeat(self.cols as usize)),
+                Some((msg, c)) => format!("{} {}{}{}", bg, style::fg(msg, *c), bg, style::RESET),
+                None => format!("{}{}{}", bg, " ".repeat(self.cols as usize), style::RESET),
             };
             self.footer.say(&line);
             return;
@@ -2550,7 +2550,7 @@ impl App {
         // segment we re-assert the pane's bg so the gap spaces don't render
         // as black streaks. The whole line ends with one final \x1b[0m.
         const BG: u8 = 236;
-        let bg_on = format!("\x1b[48;5;{}m", BG);
+        let bg_on = style::set_bg(BG);
 
         let mode_label = style::bg(&style::fg(self.mode.label(), 0), self.mode.color());
         // Col shown as 1-based character position, not byte offset.
@@ -2640,22 +2640,22 @@ impl App {
             // final reset. bg_on after every helper that ends in [0m so
             // the trailing reset doesn't drop the bar to terminal-default
             // bg mid-line.
-            format!("{}{}{}{}{}{}{}\x1b[0m",
+            format!("{}{}{}{}{}{}{}{}",
                 mode_label, bg_on, middle_styled, " ".repeat(gap),
-                stats_styled, pos, right)
+                stats_styled, pos, right, style::RESET)
         } else if mode_w + middle_w + stats_w + pos_w + right_w
                   .saturating_sub(stats_w) <= cols
         {
             // Too tight for the stats segment — drop it.
             let visible_w = mode_w + middle_w + pos_w + right_w;
             let pad = cols.saturating_sub(visible_w);
-            format!("{}{}{}{}{}{}\x1b[0m",
-                mode_label, bg_on, middle_styled, " ".repeat(pad), pos, right)
+            format!("{}{}{}{}{}{}{}",
+                mode_label, bg_on, middle_styled, " ".repeat(pad), pos, right, style::RESET)
         } else {
             let visible = format!("{}{}{}", mode_label, bg_on, middle_styled);
             let visible_w = mode_w + middle_w;
             let pad = cols.saturating_sub(visible_w);
-            format!("{}{}\x1b[0m", visible, " ".repeat(pad))
+            format!("{}{}{}", visible, " ".repeat(pad), style::RESET)
         };
         self.footer.say(&line);
     }
@@ -4401,8 +4401,8 @@ impl App {
         for i in 0..line_count {
             let raw = self.buf.line(i);
             match raw.trim() {
-                "HLstart" => { inside = true;  out.push(format!("\x1b[38;5;240m{}\x1b[0m", raw)); }
-                "HLend"   => { inside = false; out.push(format!("\x1b[38;5;240m{}\x1b[0m", raw)); }
+                "HLstart" => { inside = true;  out.push(style::styled(&raw, Some(240), None, "")); }
+                "HLend"   => { inside = false; out.push(style::styled(&raw, Some(240), None, "")); }
                 // Pre-expand the region's tabs at the HyperList stop (3) here,
                 // so these lines hold spaces — the final buffer-wide
                 // expand_tabs_styled (cursor-based width) then can't widen them.
@@ -8726,7 +8726,7 @@ impl App {
         // Bracketed-paste mode would interfere with claude's own input
         // handling, so disable it for the duration.
         use std::io::Write as _;
-        print!("\x1b[?2004l");
+        Crust::disable_bracketed_paste();
         let _ = std::io::stdout().flush();
         Crust::cleanup();
         Crust::clear_screen();
@@ -8738,7 +8738,7 @@ impl App {
         // Restore scribe's terminal state and force a full repaint.
         Crust::init();
         Crust::set_app_identity("Scribe");
-        print!("\x1b[?2004h");
+        Crust::enable_bracketed_paste();
         let _ = std::io::stdout().flush();
         let _ = std::fs::remove_file(&tmpfile);
         self.handle_resize();

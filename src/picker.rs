@@ -125,8 +125,11 @@ pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<
     // (POPUP_BG) or the rest of the row renders dark.
     let tab_label = |label: &str, selected: bool| -> String {
         if selected {
-            format!("{}\x1b[48;5;{}m",
-                style::bg_rgb(&style::fg(label, 16), "f74c00"), POPUP_BG)
+            format!(
+                "{}{}",
+                style::bg_rgb(&style::fg(label, 16), "f74c00"),
+                style::set_bg(POPUP_BG as u8)
+            )
         } else {
             style::fg(label, 244)
         }
