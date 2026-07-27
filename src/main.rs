@@ -34,6 +34,34 @@ use std::path::PathBuf;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    // --help and --version answer before the TUI touches the terminal.
+    // A tool that asks what this is — the fe2o3 launcher's ? popup, a
+    // packaging script, a curious shell — should get an answer, not a
+    // screen paint.
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("scribe — Modal text editor for writers (Fe2O3 suite)");
+        println!();
+        println!("Usage: scribe [+LINE] [FILE] [OPTIONS]");
+        println!();
+        println!("  +LINE            open with the cursor on that line");
+        println!("  --col N          ... and that column");
+        println!("  --insert         start in insert mode");
+        println!("  --theme NAME     override the rcfile theme for this session");
+        println!("  --no-spell       start with spellcheck off");
+        println!("  --export FMT     export the file (pdf/html/md/txt/tex) and exit");
+        println!("  --pdf            shorthand for --export pdf");
+        println!("  --headless       export without opening the editor");
+        println!("  --pair           pair-programming mode");
+        println!();
+        println!("Vim-flavoured, soft-wrap, reading mode, registers, HyperList editing with");
+        println!("full hyperlist.vim parity, and Claude Code in the prompt.");
+        return;
+    }
+    if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
+        println!("scribe {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // CLI: scribe [+N] [--col N] [--insert] [--theme NAME] [--no-spell] [path]
     // `+N` opens the file with the cursor on line N (vim convention; used
     // by kastrup's compose flow to jump straight to the message body).
