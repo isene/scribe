@@ -26,6 +26,7 @@ pub const HELP: &[Entry] = &[
     // Operators + text objects
     ("Operator", "d c y > < gq", "delete/change/yank/indent/dedent/format + motion"),
     ("Operator", "dd cc yy >> <<", "linewise (doubled operator)"),
+    ("Operator", "dj dk d<Down>", "vertical motions are linewise: both whole lines"),
     ("Operator", "D C Y", "delete / change / yank to end of line"),
     ("Text-obj", "iw aw  ip ap", "inner/around word, paragraph (after an operator)"),
     ("Text-obj", "i\" a\"  i( a(  i{ a{", "inner/around quotes, brackets, braces (ci\", dap)"),

@@ -3530,7 +3530,11 @@ impl App {
             if let Some(opc) = op {
                 let from = self.cursor_byte();
                 let cap_reg = self.pending.register;
-                if matches!(opc, 'Q' | '>' | '<') {
+                // `>` and `<` are always linewise; so is any vertical
+                // motion, as in vim: `dj` and `d<Down>` take both whole
+                // lines, not the text between the two cursor positions.
+                let vertical = matches!(key, "j" | "k" | "DOWN" | "UP" | "-");
+                if matches!(opc, 'Q' | '>' | '<') || vertical {
                     // Linewise operators: snap motion target to whole-line
                     // range and dispatch via execute_op_linewise.
                     let (l1, _) = self.buf.byte_to_line_col(from);

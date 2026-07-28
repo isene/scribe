@@ -77,7 +77,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 ### Operators + motion
 
-`d c y > < gq` over any motion or text-object. Examples: `5dw`, `d3w`, `cgg`, `yG`, `c$`, `>ap`, `gqap`. Linewise doubling: `dd cc yy >> << gqq`. Linewise shortcuts: `D C Y` (delete / change / yank to end of line). All record `last_change` for `.` repeat.
+`d c y > < gq` over any motion or text-object. Examples: `5dw`, `d3w`, `cgg`, `yG`, `c$`, `>ap`, `gqap`. Linewise doubling: `dd cc yy >> << gqq`. Vertical motions are linewise as in vim, so `dj`, `dk` and `d<Down>` take both whole lines. Linewise shortcuts: `D C Y` (delete / change / yank to end of line). All record `last_change` for `.` repeat.
 
 ### Text objects
 
