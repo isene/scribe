@@ -2815,6 +2815,25 @@ impl App {
         if matches!(self.mode, Mode::Insert | Mode::Replace) { len } else { len.saturating_sub(1) }
     }
 
+    /// Vim's Esc backstep. In Insert the cursor sits BETWEEN two
+    /// characters; in Normal it sits ON one. Leaving Insert has to pick,
+    /// and vim picks the character to the left, so what you just typed is
+    /// what `x`, `r`, `~` and `.` act on. At column 0 there is nothing to
+    /// the left and vim stays put, so this does too.
+    ///
+    /// Steps by character, never by byte, so an emoji or an æ is one step.
+    /// Call BEFORE `clamp_col_to_line`: at end of line the insert column
+    /// sits past the last char, and stepping first lands on it exactly.
+    fn step_back_after_insert(&mut self) {
+        if self.cur_col == 0 { return; }
+        let line = self.buf.line(self.cur_line);
+        let cap = self.cur_col.min(line.len());
+        if let Some((prev, _)) = line[..cap].char_indices().next_back() {
+            self.cur_col = prev;
+            self.want_col = prev;
+        }
+    }
+
     fn clamp_col_to_line(&mut self) {
         let cap = self.col_cap();
         if self.cur_col > cap { self.cur_col = cap; }
@@ -6698,6 +6717,7 @@ impl App {
             "C-R" => { self.insert_reg_prefix = true; return false; }
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
+                self.step_back_after_insert();
                 self.clamp_col_to_line();
                 let block = self.block_insert.take();
                 let mut block_text = String::new();
@@ -6939,6 +6959,7 @@ impl App {
             "INS" => { self.mode = Mode::Insert; return false; }
             "ESC" | "C-[" | "C-C" => {
                 self.mode = Mode::Normal;
+                self.step_back_after_insert();
                 self.clamp_col_to_line();
                 if self.capturing_insert {
                     let captured = std::mem::take(&mut self.captured_insert);
@@ -7156,6 +7177,10 @@ impl App {
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, &text);
                 self.cursor_to_byte(off + text.len());
+                // Land where Esc would have left it, so `.` twice in a
+                // row inserts twice rather than drifting a char right.
+                self.step_back_after_insert();
+                self.clamp_col_to_line();
             }
             LastChange::Replace { c, count } => {
                 for _ in 0..count { self.do_replace_char(c); self.move_right_wrap(); }

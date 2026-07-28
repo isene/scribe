@@ -70,6 +70,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | `I` `A` | insert at line start / end |
 | `o` `O` | open new line below / above |
 | `s` `S` | substitute char (`s`) or line (`S`) and enter Insert |
+| `Esc` | back to Normal. The cursor steps back onto the last character you typed, as in vim, so `x` / `r` / `~` act on it. At column 0 it stays put |
 | Arrows + HOME/END | work in Insert too |
 | `Ctrl-Y` | insert character from the same column on the line above |
 | `Ctrl-E` | insert character from the same column on the line below |

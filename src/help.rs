@@ -23,6 +23,7 @@ pub const HELP: &[Entry] = &[
     ("Insert", "o O", "open new line below / above"),
     ("Insert", "s S", "substitute char / line and enter Insert"),
     ("Insert", "Ctrl-Y Ctrl-E", "insert char from column on line above / below"),
+    ("Insert", "Esc", "back to Normal, cursor on the last char you typed"),
     // Operators + text objects
     ("Operator", "d c y > < gq", "delete/change/yank/indent/dedent/format + motion"),
     ("Operator", "dd cc yy >> <<", "linewise (doubled operator)"),
