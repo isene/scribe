@@ -2060,6 +2060,12 @@ impl App {
 
     // ── Rendering ──────────────────────────────────────────────────────
     fn render_all(&mut self) {
+        // The terminal cursor is parked while the frame is painted.
+        // Without this it rides along with the output and lands at the
+        // end of every repainted row before position_cursor puts it
+        // back, which reads as a flash at the end of the line on every
+        // keystroke.
+        crust::Cursor::hide();
         // Sync fold state with any structural edits since the last
         // frame — closed folds are stored by line index and must move
         // with the text (insert above a collapsed item, undo, paste…).
@@ -2166,9 +2172,9 @@ impl App {
             Mode::Replace                => 4, // underline
             _                            => 2, // block
         };
-        crust::Cursor::show();
         crust::Cursor::shape(shape);
         crust::Cursor::set(col, row);
+        crust::Cursor::show();
     }
 
     fn render_header(&mut self) {
@@ -2590,7 +2596,11 @@ impl App {
             let byte_cap = self.cur_col.min(line.len());
             line[..byte_cap].chars().count()
         };
-        let pos = format!(" {}:{} ", self.cur_line + 1, char_col + 1);
+        // How far in, as vim's ruler counts it: first line 0%, last
+        // line 100%, whatever the scroll position is.
+        let last_line = self.buf.line_count().saturating_sub(1);
+        let pct = if last_line == 0 { 100 } else { self.cur_line * 100 / last_line };
+        let pos = format!(" {}:{}  {:>3}% ", self.cur_line + 1, char_col + 1, pct);
         let right = format!("scribe v{} ", VERSION);
 
         // Persistent stats segment: word count + spell status. Sits to the
@@ -3494,6 +3504,24 @@ impl App {
         if self.presentation && op.is_none() && (key == "UP" || key == "DOWN") {
             self.pending.clear();
             self.presentation_step(if key == "DOWN" { 1 } else { -1 });
+            return false;
+        }
+
+        // Bare arrows move by what you see, the way they do in Insert
+        // mode: on a soft-wrapped paragraph one press is one screen row,
+        // not a jump over the whole wrapped line. `j` / `k` still step
+        // whole lines, and with an operator pending the arrows fall
+        // through to the motion table unchanged, so `d<Down>` covers the
+        // same range it always did.
+        if op.is_none() && (key == "UP" || key == "DOWN") {
+            self.pending.clear();
+            let dir = if key == "DOWN" { 1 } else { -1 };
+            for _ in 0..count.max(1) {
+                match self.visual_step(dir) {
+                    Some(target) => self.cursor_to_byte(target),
+                    None => break,
+                }
+            }
             return false;
         }
 

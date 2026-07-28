@@ -7,7 +7,8 @@ pub type Entry = (&'static str, &'static str, &'static str);
 
 pub const HELP: &[Entry] = &[
     // Motion
-    ("Motion", "h j k l", "left / down / up / right (arrows too)"),
+    ("Motion", "h j k l", "left / down / up / right (whole lines)"),
+    ("Motion", "Up / Down", "one visible row: on a wrapped line, one screen line"),
     ("Motion", "0 ^ $", "line start / first non-blank / line end"),
     ("Motion", "gg G", "first / last line (Home/End too); 12G to line 12"),
     ("Motion", "w b e  W B E", "next/prev word, end of word; CAPS = WORD"),

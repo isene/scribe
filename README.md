@@ -51,7 +51,8 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 | Keys | Action |
 |---|---|
-| `h j k l` (also arrows) | left / down / up / right; arrows wrap across line boundaries in Insert |
+| `h j k l` | left / down / up / right, by whole lines |
+| `↑` / `↓` | one *visible* row: on a soft-wrapped paragraph, one screen line, the same in Normal and Insert |
 | `0` `^` `$` | line start / first non-blank / line end |
 | `gg` `G` (also `HOME` `END`; count: `12G`) | first / last line / line N |
 | `w b e W B` | next/prev word, end of word; capital = WORD (whitespace-delimited) |
@@ -290,7 +291,7 @@ Always shows:
 - Transient status messages or `:` cmdline
 - Word + char count (full buffer normally, **selection live in Visual**)
 - `spell:LANG` (green when on) / `spell:off` (grey)
-- `line:col` position
+- `line:col` position, and how far into the document you are as a percentage (first line 0%, last 100%)
 - `scribe vN.N.N`
 
 ### Quit semantics
