@@ -537,7 +537,10 @@ enum LastChange {
         insert_text: String,
     },
     Replace { c: char, count: usize },
-    Insert { text: String },
+    /// A plain insert. `entry` is the command that started it (`i`, `a`,
+    /// `I`, `A`, `o`, `O`), so `.` can re-run that command rather than
+    /// dropping the text wherever the cursor happens to be.
+    Insert { text: String, entry: char },
     Paste { after: bool, count: usize, register: Option<char> },
     SimpleAction { key: String, count: usize },
 }
@@ -647,6 +650,10 @@ struct App {
     /// change-op for dot-repeat replay.
     capturing_insert: bool,
     captured_insert: String,
+    /// Which command opened the current Insert (`i`, `a`, `I`, `A`, `o`,
+    /// `O`, `R`). Dot-repeat replays that command, so `.` after `A!`
+    /// appends at the end of the line it is on now.
+    insert_entry: char,
     /// Insert-mode `Ctrl-R` register prefix — when set, the next key is
     /// the register name to paste from (or `=` to evaluate an
     /// arithmetic expression and insert the result).
@@ -831,6 +838,7 @@ impl App {
             vblock_cur_vcol: 0,
             last_change: None,
             capturing_insert: false,
+            insert_entry: 'i',
             captured_insert: String::new(),
             insert_reg_prefix: false,
             z_prefix: false,
@@ -3804,45 +3812,16 @@ impl App {
             "C-X" => { self.change_number(-(count as i64)); }
 
             // Enter Insert
-            "i" => self.enter_insert(),
+            "i" => self.enter_insert_as('i'),
             "a" => {
                 let max = self.current_line_len();
                 if self.cur_col < max { self.cur_col += 1; }
-                self.enter_insert();
+                self.enter_insert_as('a');
             }
-            "I" => { self.cur_col = 0; self.enter_insert(); }
-            "A" => { self.cur_col = self.current_line_len(); self.enter_insert(); }
-            "o" => {
-                // Fold-aware: if the cursor sits on a closed-fold
-                // anchor, the new line goes AFTER the entire fold
-                // body, not directly under the anchor (which would
-                // bury it inside the fold and hide it on render).
-                // Indent still inherits from the anchor so the new
-                // line ends up as a sibling, not nested deeper.
-                let target_line = if self.folds.is_closed(self.cur_line) {
-                    let total = self.buf.line_count();
-                    let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
-                    fold::fold_end(self.cur_line, &all)
-                } else {
-                    self.cur_line
-                };
-                let line_len = self.buf.line(target_line).len();
-                let off = self.buf.line_byte_offset(target_line) + line_len;
-                let indent = self.indent_to_inherit();
-                self.buf.apply(off, off, &format!("\n{}", indent));
-                self.cur_line = target_line + 1;
-                self.cur_col = indent.len();
-                self.want_col = self.cur_col;
-                self.enter_insert();
-            }
-            "O" => {
-                let off = self.buf.line_byte_offset(self.cur_line);
-                let indent = self.indent_to_inherit();
-                self.buf.apply(off, off, &format!("{}\n", indent));
-                self.cur_col = indent.len();
-                self.want_col = self.cur_col;
-                self.enter_insert();
-            }
+            "I" => { self.cur_col = 0; self.enter_insert_as('I'); }
+            "A" => { self.cur_col = self.current_line_len(); self.enter_insert_as('A'); }
+            "o" => { self.open_line_below(); self.enter_insert_as('o'); }
+            "O" => { self.open_line_above(); self.enter_insert_as('O'); }
 
             // Edit primitives
             "x" => for _ in 0..count {
@@ -5759,15 +5738,53 @@ impl App {
     }
 
     fn enter_insert(&mut self) {
+        self.enter_insert_as('i');
+    }
+
+    /// Enter Insert, remembering which command got us here so dot-repeat
+    /// can replay the command and not just the keystrokes.
+    fn enter_insert_as(&mut self, entry: char) {
         self.mode = Mode::Insert;
+        self.insert_entry = entry;
         self.capturing_insert = true;
         self.captured_insert.clear();
+    }
+
+    /// `o` — open a line below the cursor and put the cursor on it.
+    /// Fold-aware: on a closed-fold anchor the new line goes after the
+    /// whole fold body rather than getting buried inside it. Indent is
+    /// inherited so the new line is a sibling, not a child.
+    fn open_line_below(&mut self) {
+        let target_line = if self.folds.is_closed(self.cur_line) {
+            let total = self.buf.line_count();
+            let all: Vec<String> = (0..total).map(|i| self.buf.line(i)).collect();
+            fold::fold_end(self.cur_line, &all)
+        } else {
+            self.cur_line
+        };
+        let line_len = self.buf.line(target_line).len();
+        let off = self.buf.line_byte_offset(target_line) + line_len;
+        let indent = self.indent_to_inherit();
+        self.buf.apply(off, off, &format!("\n{}", indent));
+        self.cur_line = target_line + 1;
+        self.cur_col = indent.len();
+        self.want_col = self.cur_col;
+    }
+
+    /// `O` — open a line above the cursor and put the cursor on it.
+    fn open_line_above(&mut self) {
+        let off = self.buf.line_byte_offset(self.cur_line);
+        let indent = self.indent_to_inherit();
+        self.buf.apply(off, off, &format!("{}\n", indent));
+        self.cur_col = indent.len();
+        self.want_col = self.cur_col;
     }
 
     /// `R` from Normal — enter Replace mode. Same captured-keys
     /// machinery as Insert so dot-repeat replays the typed chars.
     fn enter_replace(&mut self) {
         self.mode = Mode::Replace;
+        self.insert_entry = 'R';
         self.capturing_insert = true;
         self.captured_insert.clear();
     }
@@ -6733,6 +6750,7 @@ impl App {
                         // Pure insert (i / a / o / O / I / A) — record on its own.
                         self.last_change = Some(LastChange::Insert {
                             text: captured,
+                            entry: self.insert_entry,
                         });
                     }
                 }
@@ -6967,6 +6985,7 @@ impl App {
                     if !captured.is_empty() {
                         self.last_change = Some(LastChange::Insert {
                             text: captured,
+                            entry: self.insert_entry,
                         });
                     }
                 }
@@ -7173,12 +7192,31 @@ impl App {
                 }
                 self.pending.clear();
             }
-            LastChange::Insert { text, .. } => {
+            LastChange::Insert { text, entry } => {
+                // Put the cursor where the original command put it, then
+                // type. `.` after `A!` appends another `!` at the end of
+                // THIS line; after `o foo` it opens another line.
+                match entry {
+                    'a' => {
+                        let max = self.current_line_len();
+                        if self.cur_col < max { self.cur_col += 1; }
+                    }
+                    'I' => self.cur_col = 0,
+                    'A' => self.cur_col = self.current_line_len(),
+                    'o' => self.open_line_below(),
+                    'O' => self.open_line_above(),
+                    _ => {}
+                }
                 let off = self.cursor_byte();
                 self.buf.apply(off, off, &text);
-                self.cursor_to_byte(off + text.len());
-                // Land where Esc would have left it, so `.` twice in a
-                // row inserts twice rather than drifting a char right.
+                // Land where Esc would have left it. Set the raw
+                // insert-mode position first: cursor_to_byte clamps to
+                // Normal's cap, and stepping back from a clamped column
+                // lands a character short of the text just typed.
+                let (l, c) = self.buf.byte_to_line_col(off + text.len());
+                self.cur_line = l;
+                self.cur_col = c;
+                self.want_col = c;
                 self.step_back_after_insert();
                 self.clamp_col_to_line();
             }

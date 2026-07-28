@@ -95,7 +95,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | `p` `P` | paste after / before |
 | `Ctrl-A` `Ctrl-X` | increment / decrement number under cursor — supports ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (`2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Ctrl-A`). Zero-padding preserved on integers. |
 | `Ctrl-Up` `Ctrl-Down` | swap current line with the one above / below. Counts work (`5 Ctrl-Down`). One compound undo node per swap. |
-| `.` | dot-repeat — replays the last change (operator + motion + inserted text, replace, paste, increment, line move) |
+| `.` | dot-repeat — replays the last change (operator + motion + inserted text, replace, paste, increment, line move). A plain insert replays its command, so `.` after `A!` appends `!` at the end of whatever line you are on, and after `o foo` opens another line |
 
 ### Visual modes
 
