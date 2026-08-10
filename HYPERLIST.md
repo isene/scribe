@@ -254,6 +254,7 @@ Thus - neither this: [?] nor THIS: <Test> - are seen as markup
 | `[2, foo=true]` | 2 times while `foo=true` |
 | `[?]` | Optional |
 | `[? Raining]` | Same as `[Raining]` (the `?` makes it explicit) |
+| `[?!]` | Otherwise — applies when no preceding sibling Qualifier did |
 | `[YYYY-MM-DD]` | Timestamp |
 | `[+YYYY-MM-DD]` | Wait this long before doing |
 | `[<-YYYY-MM-04]` | Less than 4 days before next item |
@@ -261,6 +262,18 @@ Thus - neither this: [?] nor THIS: <Test> - are seen as markup
 | `[Tue,Fri 12.00]` | Noon every Tue & Fri |
 | `[2011-05-01+7 13.00]` | Repeat every 7 days at 1pm |
 | `[_]` `[O]` `[x]` | Unchecked / in-progress / checked |
+
+`[?!]` binds the fallback to the Items above it, so a restated negated
+condition cannot drift out of sync when the original is later edited:
+
+```
+[? Payment received] Ship the order
+[?!] Send a reminder
+```
+
+Valid only as the last Item of such a group. Where the alternatives are simply
+tried in turn until one succeeds, `OR(PRIORITY): ` is clearer, as no condition
+needs stating at all.
 
 **Substitution** — curly braces, value substituted from elsewhere:
 
