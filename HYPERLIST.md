@@ -185,7 +185,7 @@ right below it.
 
 An Item has, in sequence:
 
-1. **Starter** (optional) — Identifier or Multi-line Indicator
+1. **Starter** (optional) — Neutral Starter or Identifier
 2. **Type** (optional) — State or Transition
 3. **Content** — Element and/or Additive
 4. **Separator**
@@ -195,13 +195,19 @@ An Item has, in sequence:
 An **Identifier** is a unique reference handle: `1`, `1.1`, `1.2.3` (numeric
 path) or `1A1A` (alphanumeric, equivalent to `1.1.1.1`).
 
-A **Multi-line Indicator** is a `+` at the start of an item. Use it when a
-single item spans more than one display line — the second line is indented
-to the same level with a leading space:
+A **Neutral Starter** is `+` or `-` followed by a space. It marks where an
+item begins and carries no further meaning.
+
+A Starter is optional, but an item that spans more than one display line must
+have one. Its continuation lines are indented two spaces beyond the item's own
+indent, and one indent level is at least three columns wide, so a continuation
+can never be read as a child. No other item is affected:
 
 ```
-+ If one Item on a certain level/indent is multi-line, all Items
- on the same level/indent must start with a plus sign ("+") or <Identifier>
+- A short item needs no Starter
++ An item that runs past the end of the line takes one, and its following
+  lines are indented two spaces further than the item itself
+- Its siblings are unaffected
 ```
 
 #### 2. Type
@@ -361,8 +367,8 @@ HyperList
     [1+] HyperList Item
         [?] Starter; OR: 
             Identifier (Numbers: Format = "1.1.1.1", Mixed: Format = "1A1A")
-                [? Multi-line Item] The Identifier acts like the plus sign ("+")
-            Multi-line Indicator = "+"
+            Neutral Starter = "+ " or "- "
+                Marks where an Item begins and carries no further meaning
         [?] Type; OR: 
             State = "S:" or "|"
             Transition = "T:" or "/"
@@ -395,7 +401,7 @@ scribe colors HyperList syntax 1:1 with the original `hyperlist.vim`:
 | Element | Color |
 |---|---|
 | Identifier (numbering) | Magenta |
-| Multi-line indicator (`+`) | Red |
+| Neutral Starter (`+` / `-`) | Red |
 | Property (`Name: `) | Red |
 | Operator (`AND:`, `OR:`, …) | Blue |
 | Qualifier (`[…]`) | Green (LimeGreen) |
