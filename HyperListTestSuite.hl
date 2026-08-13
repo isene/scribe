@@ -12,8 +12,10 @@ HyperList Test Suite for scribe; Press '\a' to uncollapse this whole HyperList
 		[? OK] Qualifier in green
 		A #hashtag should be in yellow; And the preceding semicolon in green
 		1. The numbering is an identifier and should appear in magenta
-		+ The multi-line indicator should appear in red
+		+ The "+" Starter should appear in magenta, like the numbering above
 		 and indicates the item runs across more than one line
+		- The "-" Starter should also appear in magenta
+		 and is the neutral Starter introduced in HyperList 2.8
 		This link should be in magenta <link to nowhere>
 		This comment should be in teal with the link inside in magenta (the <link to nowhere>)
 		Quotes are also in "teal" and with "links inside in magenta, <link to nowhere>"
