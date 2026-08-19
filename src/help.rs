@@ -98,6 +98,7 @@ pub const HELP: &[Entry] = &[
     ("HyperList", "\\u", "state / transition underline cycle"),
     ("HyperList", "\\h", "limelight highlight (reading mode)"),
     ("HyperList", "\\r", "reference jump (in-file ref / file path / URL)"),
+    ("HyperList", "\\b", "backlinks: .hl files referencing THIS file"),
     ("HyperList", "\\p", "presentation mode toggle"),
     ("HyperList", "\\c", "complexity report"),
     ("HyperList", "\\g", "calendar add"),

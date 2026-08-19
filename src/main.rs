@@ -607,6 +607,27 @@ impl Pending {
     fn clear(&mut self) { *self = Pending::default(); }
 }
 
+/// Gather .hl files under `dir`, hidden entries skipped, bounded so a
+/// misconfigured backlink root cannot walk half the disk.
+fn collect_hl(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 || out.len() > 2000 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            collect_hl(&p, depth + 1, out);
+        } else if name.ends_with(".hl") {
+            out.push(p);
+        }
+    }
+}
+
 struct App {
     buf: Buffer,
     mode: Mode,
@@ -4541,6 +4562,8 @@ impl App {
             "s" => self.sort_visual_by_indent(),
             // Reference jump — auto-detects in-file ref / file path / URL.
             "r" => self.goto_reference(),
+            // Backlinks: .hl files whose <references> point at THIS file.
+            "b" => self.backlinks(),
             // Calendar.
             "g" => self.calendar_add(),
             // Complexity.
@@ -4973,6 +4996,134 @@ impl App {
     /// the entire file via openssl AES-256-CBC + PBKDF2. Prompts for
     /// password (and confirmation). Doesn't touch the file on disk —
     /// the encrypted text replaces the buffer content; user `:w`s.
+    /// `\b`: backlinks — every `<reference>` in nearby .hl files that
+    /// points at THIS file. On-demand scan, no index kept: the roots are
+    /// the file's own directory, ~/.tasks, and any dirs listed one per
+    /// line in ~/.config/scribe/backlink-roots. ↑↓ selects, Enter opens
+    /// the referencing file, ESC/q closes.
+    fn backlinks(&mut self) {
+        let Some(me) = self.buf.path.clone() else {
+            self.set_status(" no file name — save first", 196);
+            return;
+        };
+        let base = me.file_name().map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = me.file_stem().map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = me.parent() {
+            roots.push(dir.to_path_buf());
+        }
+        roots.push(home.join(".tasks"));
+        if let Ok(txt) = std::fs::read_to_string(
+            home.join(".config/scribe/backlink-roots"))
+        {
+            for l in txt.lines() {
+                let l = l.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    continue;
+                }
+                roots.push(match l.strip_prefix("~/") {
+                    Some(r) => home.join(r),
+                    None => PathBuf::from(l),
+                });
+            }
+        }
+        let mut files: Vec<PathBuf> = Vec::new();
+        for r in &roots {
+            collect_hl(r, 0, &mut files);
+        }
+        files.sort();
+        files.dedup();
+        let mut hits: Vec<(PathBuf, usize, String)> = Vec::new();
+        for f in files {
+            if f == me {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&f) else { continue };
+            for (i, line) in text.lines().enumerate() {
+                let mut rest = line;
+                let mut hit = false;
+                while let Some(a) = rest.find('<') {
+                    let Some(b) = rest[a..].find('>') else { break };
+                    let inner = &rest[a + 1..a + b];
+                    let target = inner.strip_prefix("file:").unwrap_or(inner);
+                    let target = target.split(&[':', '#'][..]).next()
+                        .unwrap_or(target);
+                    if !base.is_empty()
+                        && (target.ends_with(base.as_str())
+                            || target == stem
+                            || target.ends_with(&format!("/{}", stem)))
+                    {
+                        hit = true;
+                        break;
+                    }
+                    rest = &rest[a + b + 1..];
+                }
+                if hit {
+                    hits.push((f.clone(), i + 1, line.trim().to_string()));
+                }
+            }
+        }
+        if hits.is_empty() {
+            self.set_status(&format!(" no backlinks to {} found", base), 244);
+            return;
+        }
+        let homestr = home.to_string_lossy().to_string();
+        let popup_w = (self.cols.saturating_sub(8)).clamp(40, 110);
+        let list_h = hits.len().min(20);
+        let popup_h = (list_h + 4) as u16;
+        let inner_w = popup_w as usize - 4;
+        let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
+        let mut sel = 0usize;
+        Cursor::hide();
+        loop {
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(format!("  {}  {}", style::bold("Backlinks"),
+                style::fg(&format!("{} to {}", hits.len(), base), 244)));
+            lines.push(format!("  {}", style::fg(&"-".repeat(inner_w), 238)));
+            let top = sel.saturating_sub(list_h.saturating_sub(1));
+            for (i, (p, n, t)) in hits.iter().enumerate()
+                .skip(top).take(list_h)
+            {
+                let ps = p.to_string_lossy().replace(&homestr, "~");
+                let row = format!("{}:{}  {}", ps, n, t);
+                let row: String = row.chars().take(inner_w - 2).collect();
+                if i == sel {
+                    lines.push(format!("  {}",
+                        style::styled(&row, None, Some(238), "")));
+                } else {
+                    lines.push(format!("  {}", row));
+                }
+            }
+            popup.pane.set_text(&lines.join("\n"));
+            popup.pane.refresh();
+            match Input::getchr(None).as_deref() {
+                Some("UP") | Some("k") => sel = sel.saturating_sub(1),
+                Some("DOWN") | Some("j") => {
+                    if sel + 1 < hits.len() {
+                        sel += 1;
+                    }
+                }
+                Some("ENTER") => {
+                    let path = hits[sel].0.to_string_lossy().to_string();
+                    popup.dismiss(&mut [&mut self.header, &mut self.main_p,
+                                        &mut self.footer]);
+                    Cursor::show();
+                    self.render_all();
+                    self.open_path_external(&path);
+                    return;
+                }
+                Some("ESC") | Some("q") => break,
+                _ => {}
+            }
+        }
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        Cursor::show();
+        self.render_all();
+    }
+
     fn encrypt_lines(&mut self, whole_file: bool) {
         let pw = match self.prompt_password_confirm("Encrypt password: ") {
             Some(p) => p,
