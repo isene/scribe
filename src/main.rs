@@ -607,6 +607,32 @@ impl Pending {
     fn clear(&mut self) { *self = Pending::default(); }
 }
 
+/// A line reduced to its reference-matchable start: indent, Starters,
+/// State/Transition markers, checkboxes and Identifiers stripped.
+fn hl_match_start(line: &str) -> &str {
+    let mut t = line.trim_start_matches(['\t', ' ', '*']);
+    loop {
+        let before = t;
+        for p in ["- ", "+ ", "S: ", "T: ", "| ", "/ ",
+                  "[_] ", "[ ] ", "[x] ", "[X] ", "[O] "] {
+            if let Some(r) = t.strip_prefix(p) {
+                t = r;
+            }
+        }
+        let id = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').count();
+        if id > 0
+            && t[..id].chars().any(|c| c.is_ascii_digit())
+            && t[id..].starts_with(' ')
+        {
+            t = &t[id + 1..];
+        }
+        if t == before {
+            break;
+        }
+    }
+    t
+}
+
 /// Gather .hl files under `dir`, hidden entries skipped, bounded so a
 /// misconfigured backlink root cannot walk half the disk.
 fn collect_hl(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -4869,22 +4895,27 @@ impl App {
             }
         }
         // Path-style or plain text search. Take the LAST segment after
-        // any `/` and search for it line-by-line, restricting matches
-        // to descendants of the previous segments. Simple version:
-        // search whole buffer for the last segment.
+        // any `/` and search for it line-by-line. A reference matches
+        // the START of an item (heads stripped), never text buried
+        // inside one; a contains-match is only the fallback.
         let target_text = inner.rsplit('/').next().unwrap_or(inner);
-        for i in 0..self.buf.line_count() {
-            if i == self.cur_line { continue; }
+        let found = (0..self.buf.line_count())
+            .filter(|i| *i != self.cur_line)
+            .find(|&i| hl_match_start(&self.buf.line(i)).starts_with(target_text))
+            .or_else(|| {
+                (0..self.buf.line_count())
+                    .filter(|i| *i != self.cur_line)
+                    .find(|&i| self.buf.line(i).contains(target_text))
+            });
+        if let Some(i) = found {
             let line = self.buf.line(i);
-            if line.contains(target_text) {
-                self.cur_line = i;
-                // Land on first non-blank (skip leading TABs / `*`).
-                self.cur_col = line.bytes()
-                    .position(|b| b != b'\t' && b != b' ' && b != b'*')
-                    .unwrap_or(0);
-                self.want_col = self.cur_col;
-                return;
-            }
+            self.cur_line = i;
+            // Land on first non-blank (skip leading TABs / `*`).
+            self.cur_col = line.bytes()
+                .position(|b| b != b'\t' && b != b' ' && b != b'*')
+                .unwrap_or(0);
+            self.want_col = self.cur_col;
+            return;
         }
         self.set_status(&format!(" reference not found: <{}>", inner), 196);
     }
