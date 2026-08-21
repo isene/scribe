@@ -1881,12 +1881,126 @@ fn complete_colon_command(prefix: &str) -> Vec<String> {
         "maps", "mappings", "map",
     ];
     let p = prefix.trim_start_matches(':');  // be forgiving if user typed colon
+    // Past the first space the argument is a path, so `:w ~/no<Tab>`
+    // completes filenames rather than command names.
+    if let Some(sp) = p.rfind(' ') {
+        let (cmd, frag) = p.split_at(sp + 1);
+        return complete_path(frag).into_iter()
+            .map(|c| format!("{}{}", cmd, c))
+            .collect();
+    }
     let mut out: Vec<String> = COMMANDS.iter()
         .filter(|c| c.starts_with(p))
         .map(|c| c.to_string())
         .collect();
     out.sort();
     out
+}
+
+/// Filesystem completions for `frag`, written back in the same shape
+/// the user typed: a `~/` prefix stays `~/`, a relative path stays
+/// relative. Directories get a trailing slash so the next Tab walks
+/// into them. Hidden entries appear only once the fragment asks for
+/// them with a leading dot.
+fn complete_path(frag: &str) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    // A lone `~` completes to `~/`; expanding it here would make the
+    // rebuilt prefix below shorter than the name it matched.
+    if frag == "~" { return vec!["~/".to_string()]; }
+    let expanded = match frag.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", home, rest),
+        None => frag.to_string(),
+    };
+    // Split into "directory to list" and "prefix to match inside it".
+    let (dir, needle) = match expanded.rfind('/') {
+        Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
+        None => ("./".to_string(), expanded.clone()),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&needle) { continue; }
+        if name.starts_with('.') && !needle.starts_with('.') { continue; }
+        let is_dir = e.path().is_dir();  // follows symlinks, unlike file_type()
+        // Rebuild against what the user typed, not the expanded path.
+        let typed_dir = &frag[..frag.len() - needle.len()];
+        out.push(format!("{}{}{}", typed_dir, name, if is_dir { "/" } else { "" }));
+    }
+    out.sort();
+    out
+}
+
+/// Shift-Tab in the colon prompt: walk to a file or directory in
+/// pointer and write the choice back into the command line.
+///
+/// pointer's `--pick` reports the TAGGED entries, so `t` on a file
+/// picks it and a bare `q` in some directory picks nothing; that case
+/// falls back to the directory pointer was standing in, which is what
+/// "walk me to the right place" means for `:w`. The screen handoff is
+/// the same one `pick_font` and `launch_rpnx` use.
+fn pick_path_with_pointer(buf: &str) -> Option<String> {
+    let pid = std::process::id();
+    let pick = format!("/tmp/scribe_pick_{}.txt", pid);
+    let cwd = format!("/tmp/scribe_pickcwd_{}.txt", pid);
+    let _ = std::fs::remove_file(&pick);
+    let _ = std::fs::remove_file(&cwd);
+
+    // Start pointer where the half-typed argument points, so
+    // `:w ~/Main/<Shift-Tab>` opens in ~/Main rather than at home.
+    let (cmd, frag) = match buf.rfind(' ') {
+        Some(i) => (&buf[..i + 1], &buf[i + 1..]),
+        None => (buf, ""),
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let start = match frag.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", home, rest),
+        None if frag == "~" => home.clone(),
+        // No argument yet: start where the editor is, not at home.
+        None if frag.is_empty() => std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| home.clone()),
+        None => frag.to_string(),
+    };
+    let start_dir = std::path::Path::new(&start);
+    let start_dir = if start_dir.is_dir() {
+        start_dir.to_path_buf()
+    } else {
+        start_dir.parent().filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    };
+
+    Crust::cleanup();
+    let status = std::process::Command::new("pointer")
+        .arg(format!("--pick={}", pick))
+        .arg(format!("--emit-cwd={}", cwd))
+        .arg(&start_dir)
+        .status();
+    Crust::init();
+    Crust::clear_screen();
+    if status.is_err() {
+        let _ = std::fs::remove_file(&pick);
+        let _ = std::fs::remove_file(&cwd);
+        return None;
+    }
+
+    let tagged = std::fs::read_to_string(&pick).unwrap_or_default();
+    let landed = std::fs::read_to_string(&cwd).unwrap_or_default();
+    let _ = std::fs::remove_file(&pick);
+    let _ = std::fs::remove_file(&cwd);
+
+    let chosen = tagged.lines().map(str::trim).find(|l| !l.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let d = landed.trim();
+            if d.is_empty() { None } else { Some(format!("{}/", d.trim_end_matches('/'))) }
+        })?;
+    // Write it back the way the user writes paths.
+    let shown = match chosen.strip_prefix(&format!("{}/", home)) {
+        Some(rest) => format!("~/{}", rest),
+        None => chosen,
+    };
+    Some(format!("{}{}", cmd, shown))
 }
 
 fn current_timestamp() -> String {
@@ -7438,8 +7552,14 @@ impl App {
         // after so other footer prompts (search, etc.) don't inherit
         // it.
         self.footer.completer = Some(complete_colon_command);
+        self.footer.picker = Some(pick_path_with_pointer);
         let cmd = self.footer.ask_with_bg(":", "", 17);
         self.footer.completer = None;
+        self.footer.picker = None;
+        // pick_path_with_pointer may have handed the screen to pointer.
+        self.header.invalidate();
+        self.main_p.invalidate();
+        self.footer.invalidate();
         self.render_footer();
         let quit = self.execute_command(cmd.trim());
         if !quit { self.render_all(); }
@@ -7833,6 +7953,8 @@ impl App {
             (":chat",          "launch Claude session"),
             (":set ...",       "runtime settings (spell, lang, theme, …)"),
             (":export <fmt>",  "html / latex / markdown / pdf"),
+            ("  TAB",          "in `:`, complete a command, then a path"),
+            ("  Shift-TAB",    "in `:`, pick a file or folder in pointer"),
         ] { lines.push(row(k, d)); }
         lines.push(String::new());
 
