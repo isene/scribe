@@ -74,6 +74,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | Arrows + HOME/END | work in Insert too |
 | `Ctrl-Y` | insert character from the same column on the line above |
 | `Ctrl-E` | insert character from the same column on the line below |
+| `Ctrl-P` `Ctrl-N` | complete the word you are typing from the rest of the buffer. `Ctrl-P` takes the nearest match above the cursor, `Ctrl-N` the nearest below; press again to walk through the list, and once more past the end to get your own typing back |
 | Bracketed paste | the entire pasted blob is a single undo node — instant on big pastes |
 
 ### Operators + motion

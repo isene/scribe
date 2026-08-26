@@ -705,6 +705,10 @@ struct App {
     /// the register name to paste from (or `=` to evaluate an
     /// arithmetic expression and insert the result).
     insert_reg_prefix: bool,
+    /// Insert-mode word completion in progress (`<C-P>` / `<C-N>`).
+    /// None whenever the last key was anything else, which is what ends
+    /// a completion in vim too.
+    compl: Option<Completion>,
     /// `z` prefix: next key is a spell action (`z=`, `zg`).
     z_prefix: bool,
     /// `]` or `[` prefix: next key is a bracket motion (`]s`, `[s`, …).
@@ -888,6 +892,7 @@ impl App {
             insert_entry: 'i',
             captured_insert: String::new(),
             insert_reg_prefix: false,
+            compl: None,
             z_prefix: false,
             bracket_prefix: None,
             leader_prefix: false,
@@ -1252,6 +1257,61 @@ fn save_abbreviations(map: &std::collections::HashMap<String, String>) {
 /// True if `c` may be part of an abbreviation TRIGGER (e.g. `-g`,
 /// `mvh`, `omg2`). Anything else (whitespace, punctuation other than
 /// `-` / `_`, etc.) is a boundary that fires expansion.
+/// One insert-mode word completion. `cands` ends with the bare prefix, so
+/// cycling past the last match puts back what the user actually typed.
+struct Completion {
+    /// Byte offset where the word being completed starts.
+    start: usize,
+    /// What the user typed before asking for a completion.
+    prefix: String,
+    cands: Vec<String>,
+    idx: usize,
+    /// Length of `captured_insert` before the prefix, so dot-repeat
+    /// replays the completed word rather than the typed stub.
+    cap_base: usize,
+}
+
+/// Every distinct word in `text` that extends `prefix`, ordered the way vim
+/// offers them: for `<C-P>` the nearest match above `start` first and then
+/// the ones below it, for `<C-N>` the other way round. The word at `start`
+/// is the one being typed, so it is left out.
+fn word_candidates(text: &str, start: usize, prefix: &str, back: bool) -> Vec<String> {
+    // Word starts, so a match can be sorted by how far it is from the cursor.
+    let mut hits: Vec<(usize, &str)> = Vec::new();
+    let mut wstart: Option<usize> = None;
+    for (i, ch) in text.char_indices() {
+        if is_word_char(ch) {
+            if wstart.is_none() { wstart = Some(i); }
+            continue;
+        }
+        if let Some(ws) = wstart.take() { hits.push((ws, &text[ws..i])); }
+    }
+    if let Some(ws) = wstart { hits.push((ws, &text[ws..])); }
+
+    let (mut above, mut below): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for (ws, w) in hits {
+        if ws == start || w.len() <= prefix.len() || !w.starts_with(prefix) { continue; }
+        if ws < start { above.push(w) } else { below.push(w) }
+    }
+    above.reverse();
+    let ordered: Vec<&str> = if back {
+        above.into_iter().chain(below).collect()
+    } else {
+        below.into_iter().chain(above).collect()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for w in ordered {
+        if !out.iter().any(|c| c == w) { out.push(w.to_string()); }
+    }
+    out
+}
+
+/// vim's default `iskeyword`: letters, digits, underscore. `is_alphanumeric`
+/// covers æ ø å and every other accented letter without a table.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 fn is_abbrev_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
 }
@@ -7023,6 +7083,7 @@ impl App {
             }
             return false;
         }
+        if key != "C-P" && key != "C-N" { self.compl = None; }
         match key {
             // <Ins> toggles to Replace mode mid-stream (vim parity).
             "INS" => { self.mode = Mode::Replace; return false; }
@@ -7134,6 +7195,11 @@ impl App {
             // (æ, ø, å, emoji) lines up the way the user sees it.
             "C-Y" => { self.copy_char_from(-1); }
             "C-E" => { self.copy_char_from( 1); }
+            // Vim's word completion from the buffer. <C-P> takes the
+            // nearest match above the cursor, <C-N> the nearest below;
+            // pressing either again walks on through the list.
+            "C-P" => { self.complete_word(true); }
+            "C-N" => { self.complete_word(false); }
             // Vim's digraph-input key. Scribe overloads it to launch
             // a browseable picker (digraphs + emoji) rather than
             // strict Ctrl-K X Y two-char entry — the picker has a
@@ -7202,6 +7268,84 @@ impl App {
             }
         }
         false
+    }
+
+    /// Vim's insert-mode word completion. `back` is `<C-P>` (search up
+    /// from the cursor first), `false` is `<C-N>` (search down first).
+    /// The whole buffer is scanned per invocation, which costs a
+    /// millisecond on a book-sized file and happens only on the keypress
+    /// — nothing is cached, so nothing can go stale after an edit.
+    fn complete_word(&mut self, back: bool) {
+        // Already completing: step through the list and swap the word.
+        if let Some(mut c) = self.compl.take() {
+            let n = c.cands.len();
+            if n > 0 {
+                c.idx = if back { (c.idx + 1) % n } else { (c.idx + n - 1) % n };
+                let text = c.cands[c.idx].clone();
+                let (start, cap_base) = (c.start, c.cap_base);
+                self.put_completion(start, cap_base, &text);
+                self.say_match(&c);
+            }
+            self.compl = Some(c);
+            return;
+        }
+
+        // Starting one: the word under the cursor is everything back to
+        // the first non-keyword char.
+        let end = self.cursor_byte();
+        let s = self.buf.rope.to_string();
+        let mut start = end;
+        while start > 0 {
+            let prev = s[..start].chars().next_back().unwrap();
+            if !is_word_char(prev) { break; }
+            start -= prev.len_utf8();
+        }
+        if start == end { return; }
+        let prefix = s[start..end].to_string();
+
+        let mut cands = word_candidates(&s, start, &prefix, back);
+        if cands.is_empty() {
+            self.set_status(&format!(" no match for {}", prefix), 244);
+            return;
+        }
+        // Last stop on the ring is what the user typed, so cycling all the
+        // way round is never destructive.
+        cands.push(prefix.clone());
+
+        let cap_base = self.captured_insert.len().saturating_sub(prefix.len());
+        let text = cands[0].clone();
+        self.put_completion(start, cap_base, &text);
+        let c = Completion { start, prefix, cands, idx: 0, cap_base };
+        self.say_match(&c);
+        self.compl = Some(c);
+    }
+
+    /// Swap whatever sits between `start` and the cursor for `text`, as one
+    /// undo step, and keep the dot-repeat capture in step with it.
+    fn put_completion(&mut self, start: usize, cap_base: usize, text: &str) {
+        let end = self.cursor_byte();
+        self.buf.begin_compound();
+        self.buf.apply(start, end, text);
+        self.buf.end_compound();
+        let (line, col) = self.buf.byte_to_line_col(start + text.len());
+        self.cur_line = line;
+        self.cur_col  = col;
+        self.want_col = self.cur_col;
+        if self.capturing_insert {
+            self.captured_insert.truncate(cap_base.min(self.captured_insert.len()));
+            self.captured_insert.push_str(text);
+        }
+    }
+
+    /// vim's "match 2 of 7" note. The last entry is the typed prefix, so it
+    /// is counted out.
+    fn say_match(&mut self, c: &Completion) {
+        let n = c.cands.len().saturating_sub(1);
+        if c.idx >= n {
+            self.set_status(&format!(" back to {}", c.prefix), 244);
+        } else {
+            self.set_status(&format!(" match {} of {}", c.idx + 1, n), 39);
+        }
     }
 
     /// Insert at cursor from register `name` (Insert-mode `<C-R>{c}`
@@ -9349,5 +9493,51 @@ fn shift_left(line: &str, kind: &FileKind) -> String {
         let n_spaces = line.bytes().take(4).take_while(|&b| b == b' ').count();
         if n_spaces > 0 { return line[n_spaces..].to_string(); }
         line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_candidates;
+
+    #[test]
+    fn ordering_matches_vim() {
+        //            0         1         2         3         4
+        //            0123456789012345678901234567890123456789012345
+        let text = "printer print_job pr printable printout printf";
+        let start = 18; // the bare "pr" the user is typing
+        assert_eq!(&text[start..start + 2], "pr");
+
+        // <C-P>: nearest above the cursor first, then down the rest.
+        assert_eq!(
+            word_candidates(text, start, "pr", true),
+            vec!["print_job", "printer", "printable", "printout", "printf"]
+        );
+        // <C-N>: nearest below first, then wrap up.
+        assert_eq!(
+            word_candidates(text, start, "pr", false),
+            vec!["printable", "printout", "printf", "print_job", "printer"]
+        );
+
+        // Duplicates collapse, keeping the nearest occurrence's place.
+        let dup = "alpha beta alpha al gamma alpha";
+        let s = dup.find(" al ").unwrap() + 1;
+        assert_eq!(word_candidates(dup, s, "al", true), vec!["alpha"]);
+
+        // The word being typed is never offered back to itself.
+        assert!(word_candidates("solo", 0, "solo", true).is_empty());
+        assert!(word_candidates("sol", 0, "sol", true).is_empty());
+
+        // Norwegian letters are word chars, and case is respected.
+        let no = "blåbærsyltetøy blå Blåveis blå";
+        let s = no.find(" blå ").unwrap() + 1;
+        assert_eq!(word_candidates(no, s, "blå", true), vec!["blåbærsyltetøy"]);
+        assert_eq!(word_candidates(no, s, "Blå", true), vec!["Blåveis"]);
+
+        // Underscore counts, punctuation does not.
+        let code = "self.compl compl_state co";
+        let s = code.len() - 2;
+        assert_eq!(word_candidates(code, s, "co", true), vec!["compl_state", "compl"]);
+        println!("all orderings ok");
     }
 }
