@@ -8663,6 +8663,20 @@ impl App {
                 }
                 false
             }
+            // `:spell! [LANG]` — toggle. Off if spell is already on in
+            // that language; otherwise on in it (switching if it was on
+            // in another). One key per language is what an rc wants.
+            other if other == "spell!" || other.starts_with("spell! ") => {
+                let lang = other["spell!".len()..].trim();
+                let lang = if lang.is_empty() { self.spell_lang.clone() } else { lang.to_string() };
+                if self.spell_enabled && self.spell_lang == lang {
+                    self.spell_disable();
+                    self.set_status(" spell off", 244);
+                } else {
+                    self.quick_spell(&lang);
+                }
+                false
+            }
             other if other.starts_with("spell ") => {
                 let lang = other[6..].trim();
                 if lang.is_empty() {

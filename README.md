@@ -163,6 +163,7 @@ Marks are session-local (not persisted).
 | Command / key | Action |
 |---|---|
 | `:set spell` / `:set nospell` | toggle |
+| `:spell LANG` / `:spell! LANG` | switch dictionary and turn spell on / the same as a toggle, off if already on in that language (map a key to it) |
 | `:set spelllang=NAME` (or `:set lang=NAME`) | switch dictionary (`en_US`, `nb_NO`, `nn_NO`, `de_DE`, …); drops + re-spawns hunspell |
 | `:set spellcolor=N` (rcfile only) | xterm-256 palette index for the underline / text color |
 | `]s` / `zn` | next misspelling |
