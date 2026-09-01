@@ -4268,7 +4268,13 @@ impl App {
     /// rewrites itself. Returns true if the editor should quit.
     fn run_keymap_rhs(&mut self, rhs: &str) -> bool {
         if let Some(cmd) = rhs.strip_prefix(':') {
-            return self.execute_command(cmd.trim());
+            // A vim-style `:cmd<CR>` mapping ends in the key that submits
+            // it. That key is not part of the command: `:spell nb_NO<CR>`
+            // was asking hunspell for a dictionary called `nb_NO<CR>`.
+            let cmd = cmd.trim();
+            let cmd = ["<CR>", "<cr>", "<Cr>", "<Enter>", "<enter>"].iter()
+                .find_map(|t| cmd.strip_suffix(t)).unwrap_or(cmd).trim();
+            return self.execute_command(cmd);
         }
         let keys = parse_macro_text(rhs);
         self.map_depth += 1;
