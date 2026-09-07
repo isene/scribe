@@ -89,7 +89,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 | Keys | Action |
 |---|---|
-| `x` `X` | delete char forward / backward |
+| `x` `X` | delete char forward / backward into the register, so `xp` swaps two chars and `.` repeats |
 | `r{c}` | replace char under cursor with `c` |
 | `J` | join with line below |
 | `~` | toggle case under cursor |

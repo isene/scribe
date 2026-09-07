@@ -4044,30 +4044,24 @@ impl App {
             "o" => { self.open_line_below(); self.enter_insert_as('o'); }
             "O" => { self.open_line_above(); self.enter_insert_as('O'); }
 
-            // Edit primitives
-            "x" => for _ in 0..count {
-                let off = self.cursor_byte();
-                let line = self.buf.line(self.cur_line);
-                if self.cur_col < line.len() {
-                    let mut e = self.cur_col + 1;
-                    while e < line.len() && !line.is_char_boundary(e) { e += 1; }
-                    let abs_end = self.buf.line_byte_offset(self.cur_line) + e;
-                    self.buf.apply(off, abs_end, "");
-                    self.clamp_col_to_line();
+            // Edit primitives. `x` is `dl` and `X` is `dh`, exactly as
+            // in vim: one register entry for the whole count (so `xp`
+            // swaps two chars and `3x` cuts three), and `.` replays.
+            "x" | "X" => {
+                let m = if key == "x" { "l" } else { "h" };
+                let from = self.cursor_byte();
+                if let Some(to) = self.parse_motion(m, count) {
+                    let (s, e) = if from <= to { (from, to) } else { (to, from) };
+                    self.execute_op_charwise('d', s, e);
+                    self.last_change = Some(LastChange::Op {
+                        op: 'd',
+                        motion: ChangeMotion::Key(m.to_string()),
+                        count,
+                        register: _reg,
+                        insert_text: String::new(),
+                    });
                 }
-            },
-            "X" => for _ in 0..count {
-                if self.cur_col > 0 {
-                    let line = self.buf.line(self.cur_line);
-                    let mut s = self.cur_col - 1;
-                    while s > 0 && !line.is_char_boundary(s) { s -= 1; }
-                    let abs_s = self.buf.line_byte_offset(self.cur_line) + s;
-                    let abs_e = self.buf.line_byte_offset(self.cur_line) + self.cur_col;
-                    self.buf.apply(abs_s, abs_e, "");
-                    self.cur_col = s;
-                    self.want_col = s;
-                }
-            },
+            }
             // s — substitute `count` chars at cursor (vim equiv. of `cl` with
             // count). Delete the chars then enter Insert. Last_change recorded
             // so dot replays.
