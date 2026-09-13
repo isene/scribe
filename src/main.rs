@@ -3413,6 +3413,8 @@ impl App {
                 "z" => {
                     return self.save_guarded();
                 }
+                // `zq` quits and drops unsaved changes, the same as `Q`.
+                "q" => return true,
                 "n" => self.jump_next_misspelling(),
                 "p" => self.jump_prev_misspelling(),
                 // Per-language quick toggles (`zN`, `zE`, etc.) and the

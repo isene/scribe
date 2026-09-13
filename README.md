@@ -277,6 +277,7 @@ User maps take precedence over scribe's built-in `zr`/`zz`/`zn`/`zp` shortcuts (
 |---|---|
 | `zr` | toggle reading mode |
 | `zz` | save + quit (= `:wq`) |
+| `zq` | quit, **discard** unsaved changes (= `Q`) |
 | `zn` | next misspelling |
 | `zp` | previous misspelling |
 | `z=` | spell suggestions |
@@ -302,7 +303,7 @@ Always shows:
 | Key / command | Behavior |
 |---|---|
 | `q` | quit when buffer is clean; refuses + warns if dirty |
-| `Q` | quit, **discard** unsaved changes |
+| `Q` / `zq` | quit, **discard** unsaved changes |
 | `zz` / `:wq` / `:x` | save + quit |
 | `:q!` | quit without saving |
 
