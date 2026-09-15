@@ -1312,6 +1312,30 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The keyword under or after byte `pos` on `line`, as a byte span (vim's
+/// `*` rule: a cursor on a space or punctuation mark takes the next word).
+/// Steps by chars, so a word with æ ø å never splits a UTF-8 sequence.
+fn word_span(line: &str, pos: usize) -> Option<(usize, usize)> {
+    let mut start = pos.min(line.len());
+    while !line.is_char_boundary(start) { start += 1; }
+    while let Some(c) = line[start..].chars().next() {
+        if is_word_char(c) { break; }
+        start += c.len_utf8();
+    }
+    if start >= line.len() { return None; }
+    let mut s = start;
+    while let Some(c) = line[..s].chars().next_back() {
+        if !is_word_char(c) { break; }
+        s -= c.len_utf8();
+    }
+    let mut e = start;
+    while let Some(c) = line[e..].chars().next() {
+        if !is_word_char(c) { break; }
+        e += c.len_utf8();
+    }
+    Some((s, e))
+}
+
 fn is_abbrev_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
 }
@@ -6991,28 +7015,17 @@ impl App {
         if cur >= s.len() { return; }
         let line = self.buf.rope.byte_to_line(cur);
         let line_start = self.buf.line_byte_offset(line);
-        let line_end = motion::line_end(&self.buf, cur);
-        let line_text = &s[line_start..line_end];
-        let pos_in_line = cur - line_start;
-        // Find word bounds.
-        let bytes = line_text.as_bytes();
-        let mut start = pos_in_line;
-        while start > 0 {
-            let prev_b = bytes[start - 1] as char;
-            if !(prev_b.is_alphanumeric() || prev_b == '_') { break; }
-            start -= 1;
-        }
-        let mut end = pos_in_line;
-        while end < line_text.len() {
-            let c = bytes[end] as char;
-            if !(c.is_alphanumeric() || c == '_') { break; }
-            end += 1;
-        }
-        if start == end { return; }
-        let word = &line_text[start..end];
-        let pattern = format!(r"\b{}\b", regex::escape(word));
+        let line_text = &s[line_start..motion::line_end(&self.buf, cur)];
+        let Some((start, end)) = word_span(line_text, cur - line_start) else {
+            self.set_status(" no word under cursor", 244);
+            return;
+        };
+        let pattern = format!(r"\b{}\b", regex::escape(&line_text[start..end]));
         self.search.set(&pattern, dir);
-        if let Some(byte) = self.search_next(false) { self.cursor_to_byte(byte); }
+        // Search from the far side of the picked word, so the word the
+        // cursor sits on (or just before) is never its own first hit.
+        let from = line_start + if dir == Direction::Forward { end } else { start };
+        if let Some(byte) = self.search_next_at(from, dir) { self.cursor_to_byte(byte); }
     }
 
     // ── Insert mode ────────────────────────────────────────────────────
@@ -9514,6 +9527,18 @@ fn shift_left(line: &str, kind: &FileKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn word_span_steps_by_chars_and_takes_the_next_word() {
+        use super::word_span;
+        let l = "vi går på fjellet";
+        assert_eq!(word_span(l, 4).map(|(s, e)| &l[s..e]), Some("går"));   // inside å
+        assert_eq!(word_span(l, 2).map(|(s, e)| &l[s..e]), Some("går"));   // on the space before it
+        assert_eq!(word_span(l, 0).map(|(s, e)| &l[s..e]), Some("vi"));
+        assert_eq!(word_span("foo_1 bar", 3).map(|(s, e)| s..e), Some(0..5));
+        assert_eq!(word_span("end.", 3), None);
+        assert_eq!(word_span("", 0), None);
+    }
+
     use super::word_candidates;
 
     #[test]
