@@ -88,7 +88,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*/*
           generate_release_notes: true
           body: |
             ## Installation
@@ -109,3 +108,16 @@ jobs:
             - `scribe-linux-aarch64` - Linux (ARM 64-bit, Raspberry Pi)
             - `scribe-macos-x86_64` - macOS (Intel)
             - `scribe-macos-aarch64` - macOS (Apple Silicon)
+
+      - name: Upload the binaries, one at a time
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The upload endpoint answers 500 when several files go up at once.
+          for f in artifacts/*/*; do
+            for try in 1 2 3; do
+              gh release upload "$GITHUB_REF_NAME" "$f" --clobber && break
+              echo "upload of $f failed; waiting 10 s"
+              sleep 10
+            done
+          done
