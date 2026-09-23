@@ -9317,7 +9317,8 @@ impl App {
             .unwrap_or_else(|| "[no name]".into());
         let initial = format!(
             "I'm editing {} in scribe. The current buffer content (including unsaved edits) is in {}. \
-            Help me work with this text — feel free to read the snapshot when you need to. \
+            Help me work with this text — read that file when you need to, and WRITE TO IT to change \
+            my buffer: scribe loads it back when you exit, as one undo step. \
             When you're done, /exit returns me to the editor.",
             path_label, tmpfile
         );
@@ -9340,9 +9341,27 @@ impl App {
         Crust::set_app_identity("Scribe");
         Crust::enable_bracketed_paste();
         let _ = std::io::stdout().flush();
+
+        // What the chat left in the snapshot comes back into the buffer.
+        // Writing to the file is how the chat hands text over; without
+        // this it had to write a file of its own and the buffer stood
+        // still. One undo step, so `u` puts the old text back.
+        let changed = std::fs::read_to_string(&tmpfile).ok().filter(|after| *after != content);
         let _ = std::fs::remove_file(&tmpfile);
-        self.handle_resize();
-        self.set_status(" back from chat", 244);
+        match changed {
+            Some(after) => {
+                let end = self.buf.rope.len_bytes();
+                self.buf.apply(0, end, &after);
+                let at = self.cursor_byte();
+                self.cursor_to_byte(at);
+                self.handle_resize();
+                self.set_status(" the chat rewrote the buffer · u puts it back", 46);
+            }
+            None => {
+                self.handle_resize();
+                self.set_status(" back from chat", 244);
+            }
+        }
     }
 }
 
