@@ -829,6 +829,9 @@ struct App {
     /// concealed on every line except the cursor's, so styled prose reads clean
     /// while the markup stays editable where the cursor sits.
     markup_concealed: bool,
+    /// `pairs = true`: with the cursor on a LaTeX `\begin{x}` or
+    /// `\end{x}`, both ends of the pair get a filled background.
+    pairs: bool,
 }
 
 impl App {
@@ -930,6 +933,7 @@ impl App {
             calendar: rc.calendar.clone(),
             alldates: rc.alldates,
             markup_concealed: false,
+            pairs: rc.pairs,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -1477,6 +1481,8 @@ struct RcConfig {
     calendar: Option<String>,
     /// `alldates = true` — include past events too.
     alldates: bool,
+    /// `pairs = true` — highlight a `\begin{x}` and its `\end{x}`.
+    pairs: bool,
 }
 
 /// Parse the leading number prefix of an HL item (after indentation).
@@ -1844,6 +1850,124 @@ fn expand_tabs_styled(s: &str, tabstop: usize) -> String {
         out.push(c);
         col += 1;
     }
+    out
+}
+
+/// How far `pairs` looks for the other end, in lines either way.
+const PAIR_REACH: usize = 500;
+/// The pair highlight: black on orange, as vim draws a matched pair.
+const PAIR_BG: u8 = 208;
+const PAIR_FG: u8 = 16;
+
+/// A LaTeX `\begin{name}` or `\end{name}` in a line, as a byte range.
+struct EnvTok<'a> {
+    begin: bool,
+    name: &'a str,
+    start: usize,
+    end: usize,
+}
+
+/// The `\begin{…}` and `\end{…}` in a line, left to right. Anything
+/// after an unescaped `%` is a comment and does not count.
+fn env_tokens(line: &str) -> Vec<EnvTok<'_>> {
+    let code = match line.match_indices('%').find(|(i, _)| *i == 0 || line.as_bytes()[i - 1] != b'\\') {
+        Some((i, _)) => &line[..i],
+        None => line,
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(p) = code[i..].find('\\') {
+        let s = i + p;
+        let rest = &code[s..];
+        let kw = if rest.starts_with("\\begin{") { 7 } else if rest.starts_with("\\end{") { 5 } else { i = s + 1; continue };
+        let Some(close) = rest[kw..].find('}') else { break };
+        let end = s + kw + close + 1;
+        out.push(EnvTok { begin: kw == 7, name: &code[s + kw..end - 1], start: s, end });
+        i = end;
+    }
+    out
+}
+
+/// With the cursor on a `\begin{x}` or `\end{x}`, both ends of the pair
+/// as (line, first char, char after the last), counted in chars. Empty
+/// when the cursor is on neither, or the other end is out of reach.
+fn env_pair(lines: &[String], cur_line: usize, cur_col: usize) -> Vec<(usize, usize, usize)> {
+    let Some(here) = lines.get(cur_line) else { return Vec::new() };
+    // The cheap test that runs on every cursor move.
+    if !here.contains("\\begin{") && !here.contains("\\end{") {
+        return Vec::new();
+    }
+    let toks = env_tokens(here);
+    let Some(me) = toks.iter().find(|t| cur_col >= t.start && cur_col < t.end) else { return Vec::new() };
+    let chars = |text: &str, s: usize, e: usize| (text[..s].chars().count(), text[..e].chars().count());
+    let pair = |ln: usize, t: &EnvTok| {
+        let (a, b) = chars(here, me.start, me.end);
+        let (c, d) = chars(&lines[ln], t.start, t.end);
+        vec![(cur_line, a, b), (ln, c, d)]
+    };
+    // Walk away from the keyword, counting nested pairs of the same name:
+    // forward from a `\begin`, back from an `\end`.
+    let mut depth = 0usize;
+    if me.begin {
+        let last = (cur_line + PAIR_REACH).min(lines.len() - 1);
+        for ln in cur_line..=last {
+            for t in env_tokens(&lines[ln]).iter().filter(|t| t.name == me.name) {
+                if ln == cur_line && t.start <= me.start { continue; }
+                if t.begin { depth += 1 } else if depth == 0 { return pair(ln, t) } else { depth -= 1 }
+            }
+        }
+    } else {
+        for ln in (cur_line.saturating_sub(PAIR_REACH)..=cur_line).rev() {
+            for t in env_tokens(&lines[ln]).iter().rev().filter(|t| t.name == me.name) {
+                if ln == cur_line && t.start >= me.start { continue; }
+                if !t.begin { depth += 1 } else if depth == 0 { return pair(ln, t) } else { depth -= 1 }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// The length of the colour code (or other escape) at the start of `s`.
+fn escape_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&0x1b) { return None; }
+    match b.get(1) {
+        Some(b'[') => b[2..].iter().position(|c| (0x40..=0x7e).contains(c)).map(|p| p + 3),
+        Some(b']') => (2..b.len()).find_map(|i| match b[i] {
+            0x07 => Some(i + 1),
+            0x1b if b.get(i + 1) == Some(&b'\\') => Some(i + 2),
+            _ => None,
+        }),
+        _ => Some(1),
+    }
+}
+
+/// Paint chars `a..b` of an already coloured line in the pair colours.
+/// The line's own colour codes inside that stretch would undo the paint,
+/// so it goes back on after each one; after the stretch the line's own
+/// colours come back.
+fn paint_chars(styled: &str, a: usize, b: usize) -> String {
+    let on = format!("{}{}", style::set_bg(PAIR_BG), style::set_fg(PAIR_FG));
+    let mut out = String::with_capacity(styled.len() + 32);
+    let mut own = String::new();
+    let mut n = 0usize;
+    let mut rest = styled;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(len) = escape_len(rest) {
+            let esc = &rest[..len];
+            out.push_str(esc);
+            if esc == style::RESET { own.clear() } else { own.push_str(esc) }
+            if n > a && n < b { out.push_str(&on) }
+            rest = &rest[len..];
+            continue;
+        }
+        if n == a { out.push_str(&on) }
+        out.push(ch);
+        n += 1;
+        if n == b { out.push_str(style::RESET); out.push_str(&own) }
+        rest = &rest[ch.len_utf8()..];
+    }
+    if n > a && n < b { out.push_str(style::RESET) }
     out
 }
 
@@ -2257,6 +2381,7 @@ fn load_scriberc() -> RcConfig {
             "read" | "reading" => cfg.reading_mode = truthy(v),
             "calendar" => if !v.is_empty() { cfg.calendar = Some(v.to_string()); },
             "alldates" => cfg.alldates = truthy(v),
+            "pairs" => cfg.pairs = truthy(v),
             _ => {}
         }
     }
@@ -2607,6 +2732,8 @@ impl App {
         // Cheap on prose-sized files; if a 1MB buffer ever shows up,
         // gate behind `folds.count() > 0` to skip the work.
         let all_lines: Vec<String> = (0..line_count).map(|i| self.buf.line(i)).collect();
+        // `pairs`: both ends of the `\begin{x}` / `\end{x}` under the cursor.
+        let pair_marks = if self.pairs { env_pair(&all_lines, self.cur_line, self.cur_col) } else { Vec::new() };
 
         let mut out = String::new();
         let mut row = 0usize;
@@ -2619,6 +2746,7 @@ impl App {
             }
             let line_idx = line_idx_walk;
             let i = row;
+            let mut text_start = out.len();
             'line: {
             if line_idx < line_count {
                 // Gutter prefix per visible line (line numbers / relative
@@ -2627,6 +2755,7 @@ impl App {
                 if show_numbers {
                     out.push_str(&gutter_cell(line_idx, self.cur_line, line_count, relative_numbers));
                 }
+                text_start = out.len();
                 let line = self.buf.line(line_idx);
                 let line_byte_off = self.buf.line_byte_offset(line_idx);
                 // Per-line fg color when email mode says so. None → default.
@@ -2799,6 +2928,11 @@ impl App {
                 out.push_str(&style::fg("~", 244));
             }
             } // end 'line:
+            if let Some(&(_, a, b)) = pair_marks.iter().find(|m| m.0 == line_idx) {
+                let painted = paint_chars(&out[text_start..], a, b);
+                out.truncate(text_start);
+                out.push_str(&painted);
+            }
             // Closed-fold marker — appended after the line content so
             // any colors emitted above are already reset.
             if line_idx < line_count
@@ -7763,6 +7897,7 @@ impl App {
             lines.push(format!("  {}  Theme:        {}",  key("t"), val(themes[theme_idx])));
             lines.push(format!("  {}  Number col:   {}",  key("n"), on(self.show_numbers)));
             lines.push(format!("  {}  Relative no:  {}",  key("r"), on(self.relative_numbers)));
+            lines.push(format!("  {}  Match pairs:  {}",  key("p"), on(self.pairs)));
             lines.push(String::new());
             lines.push(format!("  {}  Spell:        {}",  key("s"), on(self.spell_enabled)));
             lines.push(format!("  {}  Spell lang:   {}",  key("l"), val(&self.spell_lang)));
@@ -7794,6 +7929,7 @@ impl App {
                     self.relative_numbers = !self.relative_numbers;
                     if self.relative_numbers { self.show_numbers = true; }
                 }
+                "p" => self.pairs = !self.pairs,
                 "s" => {
                     if self.spell_enabled {
                         self.spell_disable();
@@ -7834,7 +7970,7 @@ impl App {
     fn save_scriberc(&mut self) {
         let path = scriberc_path();
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let managed = ["theme", "number", "relativenumber", "spell", "lang", "spellcolor"];
+        let managed = ["theme", "number", "relativenumber", "pairs", "spell", "lang", "spellcolor"];
         let mut out = String::new();
         for line in existing.lines() {
             let stripped = line.split('#').next().unwrap_or("").trim();
@@ -7847,6 +7983,7 @@ impl App {
         out.push_str(&format!("theme = {}\n", self.theme_name));
         out.push_str(&format!("number = {}\n", self.show_numbers));
         out.push_str(&format!("relativenumber = {}\n", self.relative_numbers));
+        out.push_str(&format!("pairs = {}\n", self.pairs));
         out.push_str(&format!("spell = {}\n", self.spell_enabled));
         out.push_str(&format!("lang = {}\n", self.spell_lang));
         out.push_str(&format!("spellcolor = {}\n", highlight::miss_color()));
@@ -9546,6 +9683,35 @@ fn shift_left(line: &str, kind: &FileKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn begin_and_end_find_each_other() {
+        use super::{env_pair, paint_chars};
+        let doc: Vec<String> = [
+            "\\begin{itemize}",                 // 0
+            "  \\item one % \\end{itemize} in a comment",
+            "  \\begin{itemize}\\item nested",   // 2
+            "  \\end{itemize}",                 // 3
+            "  \\item ø and \\begin{enumerate}\\end{enumerate}",
+            "\\end{itemize}",                   // 5
+        ].iter().map(|s| s.to_string()).collect();
+        // On the outer \begin: the outer \end, past the comment and the nested pair.
+        assert_eq!(env_pair(&doc, 0, 3), vec![(0, 0, 15), (5, 0, 13)]);
+        // Back from the outer \end, and from the inner \end to the inner \begin.
+        assert_eq!(env_pair(&doc, 5, 12), vec![(5, 0, 13), (0, 0, 15)]);
+        assert_eq!(env_pair(&doc, 3, 2), vec![(3, 2, 15), (2, 2, 17)]);
+        // Two keywords on one line, counted in chars past the ø.
+        assert_eq!(env_pair(&doc, 4, 15), vec![(4, 14, 31), (4, 31, 46)]);
+        // Off a keyword: nothing.
+        assert!(env_pair(&doc, 1, 2).is_empty());
+        assert!(env_pair(&doc, 0, 15).is_empty());
+        // The paint goes on after the line's own codes and comes off after.
+        use crust::style::{set_bg, set_fg, RESET};
+        let on = format!("{}{}", set_bg(super::PAIR_BG), set_fg(super::PAIR_FG));
+        let blue = set_fg(33);
+        let styled = format!("ab{blue}cd{RESET}ef");
+        assert_eq!(paint_chars(&styled, 1, 3), format!("a{on}b{blue}{on}c{RESET}{blue}d{RESET}ef"));
+    }
+
     #[test]
     fn word_span_steps_by_chars_and_takes_the_next_word() {
         use super::word_span;

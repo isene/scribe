@@ -237,6 +237,7 @@ The styled inner text renders live (colour applied, `<span>` tags dimmed) in Mar
 - `t` cycle theme
 - `n` toggle line numbers
 - `r` toggle relative numbers
+- `p` toggle match pairs: with the cursor on a LaTeX `\begin{x}` or `\end{x}`, both ends get an orange background
 - `s` toggle spell on/off
 - `l` prompt for spell language
 - `c` prompt for spell color (0–255)
@@ -371,6 +372,7 @@ Requires `claude` on `PATH` (both commands).
 theme = dracula              # monokai | solarized | nord | dracula | gruvbox | plain
 number = false               # absolute line numbers in the gutter
 relativenumber = false       # relative line numbers (forces number=true)
+pairs = false                # light up both ends of a LaTeX \begin{x} ... \end{x}
 
 # Spell
 spell = false                # auto-on (email is always on regardless)

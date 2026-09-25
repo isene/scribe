@@ -88,7 +88,8 @@ pub const HELP: &[Entry] = &[
     // Line numbers
     ("Number", ":set number", "line numbers (nu; rnu relative; nonu off)"),
     // Config
-    ("Config", ":config", "config popup: theme / numbers / spell / save"),
+    ("Config", ":config", "config popup: theme / numbers / pairs / spell / save"),
+    ("Config", "pairs = true", "scriberc: light up a LaTeX \\begin{x} and its \\end{x} (:config p)"),
     // HyperList leader bindings
     ("HyperList", "\\0 .. \\9", "fold to level 0..9"),
     ("HyperList", "\\a", "open all folds"),
