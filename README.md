@@ -363,6 +363,8 @@ Use `:claude {prompt}` for surgical one-shot edits where you want the response s
 
 Requires `claude` on `PATH` (both commands).
 
+`K` (or `\w`) explains the word under the cursor, or a selection, as it is used in the text around it, in a popup. `y` there copies the explanation, so `p` pastes it into the document.
+
 ## Configuration
 
 `~/.config/scribe/scriberc` — simple `key = value` per line, `#` comments. Full key reference:

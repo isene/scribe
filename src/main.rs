@@ -9260,7 +9260,8 @@ impl App {
             lines.push(format!("  {}", ln));
         }
         lines.push(String::new());
-        lines.push(format!("  {}  Close", crust::style::fg("ESC / q", 244)));
+        lines.push(format!("  {}  Copy, for p to paste     {}  Close",
+            crust::style::fg("y", 244), crust::style::fg("ESC / q", 244)));
 
         // Hide the terminal cursor while the popup is up. Without
         // this the cursor stays parked at the buffer position behind
@@ -9268,8 +9269,10 @@ impl App {
         // through the popup's interior.
         Cursor::hide();
         popup.show(&lines.join("\n"));
+        let mut copied = false;
         loop {
             let Some(k) = Input::getchr(None) else { break };
+            if k == "y" { copied = true; break; }
             if k == "ESC" || k == "q" || k == "ENTER" { break; }
         }
         popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
@@ -9278,7 +9281,14 @@ impl App {
         // explicit show here covers the (rare) case where rendering
         // is short-circuited by a pending mode change.
         Cursor::show();
-        self.set_status("", 244);
+        if copied {
+            // A yank like any other: p / P paste it, and the desktop
+            // clipboard has it too.
+            self.regs.yank(None, answer, YankKind::Charwise);
+            self.set_status(" definition copied: p pastes it", 46);
+        } else {
+            self.set_status("", 244);
+        }
         self.render_all();
     }
 

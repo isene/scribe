@@ -108,7 +108,7 @@ pub const HELP: &[Entry] = &[
     // Encryption
     ("Crypt", "\\ee \\ed \\ek", "encrypt / decrypt / rekey the buffer"),
     // Word lookup
-    ("Lookup", "\\w  K", "look up the word under the cursor via Claude"),
+    ("Lookup", "\\w  K", "look up the word under the cursor via Claude; y in the popup copies it for p"),
     // Commands
     ("Command", ":w :wq :q :q!", "write / write-quit / quit / force-quit"),
     ("Command", ":e <file>", "open a file in the buffer"),
