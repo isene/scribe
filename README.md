@@ -16,7 +16,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 
 - **Modal core** — `hjkl`, motions, operators, text-objects, registers, marks, macros, dot-repeat, undo tree.
 - **Soft-wrap by default** — long prose lines wrap at the pane edge with a continuation indicator. Live resize via `SIGWINCH`.
-- **Claude integration in the prompt** — `:claude {prompt}` runs `claude -p` over your selection / paragraph / buffer and splices the response back. One `u` reverses an entire turn. `:chat` for full interactive sessions.
+- **Claude integration in the prompt** — `:claude {prompt}` runs `claude -p` over your selection / paragraph / buffer and splices the response back. One `u` reverses an entire turn. `:chat` or `Ctrl-A` for a full interactive session.
 - **Reading mode** — `:read` (or `zr`) for Goyo-style centered text, optional Limelight-style paragraph dim. Prose without chrome.
 - **Email-mode rendering** — `.eml` files and kastrup compose tempfiles get header / quote-level / signature colors that match kastrup's right pane 1-for-1. Inline email addresses + URLs highlighted everywhere.
 - **Syntax highlighting** for ~18 source languages plus dedicated HyperList / Markdown / LaTeX renderers via the shared `highlight` crate. Multi-line block comments and string literals keep their color across line breaks.
@@ -54,6 +54,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | `h j k l` | left / down / up / right, by whole lines |
 | `↑` / `↓` | one *visible* row: on a soft-wrapped paragraph, one screen line, the same in Normal and Insert |
 | `0` `^` `$` | line start / first non-blank / line end |
+| `+` `-` | first non-blank of the next / previous line |
 | `gg` `G` (also `HOME` `END`; count: `12G`) | first / last line / line N |
 | `w b e W B` | next/prev word, end of word; capital = WORD (whitespace-delimited) |
 | `f{c}` `F{c}` `t{c}` `T{c}` | jump on/before next/prev `c` on the current line |
@@ -94,7 +95,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | `J` | join with line below |
 | `~` | toggle case under cursor |
 | `p` `P` | paste after / before |
-| `Ctrl-A` `Ctrl-X` | increment / decrement number under cursor — supports ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (`2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Ctrl-A`). Zero-padding preserved on integers. |
+| `Alt-X` `Ctrl-X` | increment / decrement number under cursor — supports ISO 8601 dates `YYYY-MM-DD` with month-end / leap-year rollover (`2024-02-28` + 1 = `2024-02-29`; `2025-02-28` + 1 = `2025-03-01`). Counts work (`30 Alt-X`). Ctrl-A, vim's increment, is the Claude key here as in every Fe₂O₃ app. Zero-padding preserved on integers. |
 | `Ctrl-Up` `Ctrl-Down` | swap current line with the one above / below. Counts work (`5 Ctrl-Down`). One compound undo node per swap. |
 | `.` | dot-repeat — replays the last change (operator + motion + inserted text, replace, paste, increment, line move). A plain insert replays its command, so `.` after `A!` appends `!` at the end of whatever line you are on, and after `o foo` opens another line |
 

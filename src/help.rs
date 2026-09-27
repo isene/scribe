@@ -10,6 +10,7 @@ pub const HELP: &[Entry] = &[
     ("Motion", "h j k l", "left / down / up / right (whole lines)"),
     ("Motion", "Up / Down", "one visible row: on a wrapped line, one screen line"),
     ("Motion", "0 ^ $", "line start / first non-blank / line end"),
+    ("Motion", "+ -", "first non-blank of the next / previous line"),
     ("Motion", "gg G", "first / last line (Home/End too); 12G to line 12"),
     ("Motion", "w b e  W B E", "next/prev word, end of word; CAPS = WORD"),
     ("Motion", "f F t T {c}", "jump on/before next/prev char on the line"),
@@ -38,7 +39,7 @@ pub const HELP: &[Entry] = &[
     ("Edit", "J", "join line below"),
     ("Edit", "~", "toggle case under cursor"),
     ("Edit", "p P", "paste after / before"),
-    ("Edit", "Ctrl-A Ctrl-X", "increment / decrement number or ISO date"),
+    ("Edit", "Alt-X Ctrl-X", "increment / decrement number or ISO date"),
     ("Edit", "Ctrl-Up Ctrl-Down", "swap current line up / down"),
     ("Edit", ".", "dot-repeat the last change"),
     // Visual
@@ -113,7 +114,7 @@ pub const HELP: &[Entry] = &[
     ("Command", ":w :wq :q :q!", "write / write-quit / quit / force-quit"),
     ("Command", ":e <file>", "open a file in the buffer"),
     ("Command", ":claude {prompt}", "run claude -p over selection / paragraph / buffer"),
-    ("Command", ":chat", "full interactive Claude session"),
+    ("Command", ":chat  Ctrl-A", "full interactive Claude session; Ctrl-A in every Fe2O3 app"),
     ("Command", ":help  :h", "open the bundled README in the buffer"),
     // Quit semantics
     ("Quit", "q", "quit when clean; refuses + warns if dirty"),

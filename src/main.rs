@@ -164,6 +164,7 @@ fn main() {
     Crust::set_app_identity("Scribe");
     use std::io::Write;
     Crust::enable_bracketed_paste();
+    Input::report_alt(true);
     let _ = std::io::stdout().flush();
 
     let mut app = App::new(app_path, cli_theme, no_spell);
@@ -310,18 +311,30 @@ fn main() {
         // active BEFORE dispatch. Suppresses (a) the `M` keystroke that
         // starts/stops recording and (b) the register-name keystroke that
         // follows it. Replayed keys (replay_depth>0) are also skipped.
-        let was_recording = app.recording;
-        let quit = match app.mode {
-            Mode::Normal      => app.handle_normal(&key),
-            Mode::Insert      => app.handle_insert(&key),
-            Mode::Replace     => app.handle_replace(&key),
-            Mode::Command     => app.handle_command(&key),
-            Mode::Visual      |
-            Mode::VisualLine  |
-            Mode::VisualBlock => app.handle_visual(&key),
+        // Alt+X reads as "M-x": the number up, in Normal mode. A fast Esc
+        // then a key reads the same way, so every other Alt key, and Alt+X
+        // in any other mode, is the Esc and the key it always was.
+        let keys: Vec<String> = match key.strip_prefix("M-") {
+            Some("x") if app.mode == Mode::Normal => vec![key.clone()],
+            Some(rest) if !rest.is_empty() => vec!["ESC".to_string(), rest.to_string()],
+            _ => vec![key.clone()],
         };
-        if app.replay_depth == 0 && was_recording.is_some() && was_recording == app.recording {
-            app.recording_buf.push_str(&key_to_macro_text(&key));
+        let mut quit = false;
+        for key in keys {
+            let was_recording = app.recording;
+            quit = match app.mode {
+                Mode::Normal      => app.handle_normal(&key),
+                Mode::Insert      => app.handle_insert(&key),
+                Mode::Replace     => app.handle_replace(&key),
+                Mode::Command     => app.handle_command(&key),
+                Mode::Visual      |
+                Mode::VisualLine  |
+                Mode::VisualBlock => app.handle_visual(&key),
+            };
+            if app.replay_depth == 0 && was_recording.is_some() && was_recording == app.recording {
+                app.recording_buf.push_str(&key_to_macro_text(&key));
+            }
+            if quit { break; }
         }
         if quit { break; }
         app.render_all();
@@ -3941,7 +3954,7 @@ impl App {
                 // `>` and `<` are always linewise; so is any vertical
                 // motion, as in vim: `dj` and `d<Down>` take both whole
                 // lines, not the text between the two cursor positions.
-                let vertical = matches!(key, "j" | "k" | "DOWN" | "UP" | "-");
+                let vertical = matches!(key, "j" | "k" | "DOWN" | "UP" | "-" | "+");
                 if matches!(opc, 'Q' | '>' | '<') || vertical {
                     // Linewise operators: snap motion target to whole-line
                     // range and dispatch via execute_op_linewise.
@@ -4082,13 +4095,17 @@ impl App {
                 self.buf.line_count().saturating_sub(1)
             )),
             "^"          => Some(motion::line_first_nonblank(&self.buf, cur)),
-            // `-` — move to first non-blank of the previous line (vim
-            // linewise motion). With a count, jumps N lines up.
-            // Operator-pending it acts linewise: `d-` deletes the
-            // current line + previous line. Symmetric to `+` (next line)
-            // which scribe doesn't have either yet; add when needed.
-            "-" => {
-                let target_line = self.cur_line.saturating_sub(count.max(1));
+            // `-` and `+` — move to first non-blank of the previous or
+            // next line (vim linewise motions). With a count, N lines.
+            // Operator-pending they act linewise: `d-` deletes the
+            // current line + previous line, `d+` the next one.
+            "-" | "+" => {
+                let last = self.buf.line_count().saturating_sub(1);
+                let target_line = if key == "-" {
+                    self.cur_line.saturating_sub(count.max(1))
+                } else {
+                    (self.cur_line + count.max(1)).min(last)
+                };
                 let off = self.buf.line_byte_offset(target_line);
                 let line = self.buf.line(target_line);
                 let first_nonblank = line.bytes()
@@ -4185,12 +4202,15 @@ impl App {
             "C-UP"   => for _ in 0..count { self.move_line_up(); },
             "C-DOWN" => for _ in 0..count { self.move_line_down(); },
 
-            // Ctrl-A / Ctrl-X — increment / decrement the number under
+            // Alt-X / Ctrl-X — increment / decrement the number under
             // or after the cursor. Recognises plain integers (with
             // optional leading `-`) AND ISO 8601 dates (YYYY-MM-DD)
             // with proper month / leap-year rollover. Replays via dot.
-            "C-A" => { self.change_number(count as i64); }
+            // Ctrl-A is the suite's Claude key, so the increment moved
+            // off vim's Ctrl-A to Alt-X.
+            "M-x" => { self.change_number(count as i64); }
             "C-X" => { self.change_number(-(count as i64)); }
+            "C-A" => { self.run_chat_session(); }
 
             // Enter Insert
             "i" => self.enter_insert_as('i'),
@@ -4702,7 +4722,7 @@ impl App {
             self.cur_col = cs + new.len() - 1;
             self.want_col = self.cur_col;
             self.last_change = Some(LastChange::SimpleAction {
-                key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
+                key: if delta >= 0 { "M-x".into() } else { "C-X".into() },
                 count: delta.unsigned_abs() as usize,
             });
             return;
@@ -4750,7 +4770,7 @@ impl App {
         self.cur_col = start + new_text.len().saturating_sub(1);
         self.want_col = self.cur_col;
         self.last_change = Some(LastChange::SimpleAction {
-            key: if delta >= 0 { "C-A".into() } else { "C-X".into() },
+            key: if delta >= 0 { "M-x".into() } else { "C-X".into() },
             count: delta.unsigned_abs() as usize,
         });
     }
@@ -7819,13 +7839,13 @@ impl App {
                 self.pending.register = saved;
             }
             LastChange::SimpleAction { key, count } => {
-                // Currently only C-A / C-X record a SimpleAction. Replay
+                // Currently only M-x / C-X record a SimpleAction. Replay
                 // by re-dispatching the same signed delta change_number
                 // used by the original keypress (count = magnitude,
                 // sign from the key).
                 let delta = count as i64;
                 match key.as_str() {
-                    "C-A" => self.change_number(delta),
+                    "M-x" => self.change_number(delta),
                     "C-X" => self.change_number(-delta),
                     _ => {}
                 }
