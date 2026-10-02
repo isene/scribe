@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  # Run by hand to build the latest release's binaries again.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,10 +17,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: scribe-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             artifact: scribe-linux-aarch64
           - target: x86_64-apple-darwin
@@ -29,9 +31,20 @@ jobs:
             artifact: scribe-macos-aarch64
 
     steps:
+      - name: Find the release to build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag push builds that tag. A run by hand builds the latest release again.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME
+          else tag=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName); fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v7
         with:
           path: scribe
+          ref: ${{ env.TAG }}
 
       - name: Checkout crust
         uses: actions/checkout@v7
@@ -51,11 +64,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build
         working-directory: scribe
@@ -86,6 +99,7 @@ jobs:
           path: artifacts
 
       - name: Create Release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
@@ -114,9 +128,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # The upload endpoint answers 500 when several files go up at once.
+          tag=$GITHUB_REF_NAME
+          [ "$GITHUB_REF_TYPE" = tag ] || tag=$(gh release view --json tagName -q .tagName)
           for f in artifacts/*/*; do
             for try in 1 2 3; do
-              gh release upload "$GITHUB_REF_NAME" "$f" --clobber && break
+              gh release upload "$tag" "$f" --clobber && break
               echo "upload of $f failed; waiting 10 s"
               sleep 10
             done
