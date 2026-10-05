@@ -18,6 +18,7 @@ mod help;
 mod mode;
 mod motion;
 mod picker;
+mod pics;
 mod register;
 mod search;
 mod spell;
@@ -191,6 +192,7 @@ fn main() {
                     // ESC at the prompt → quit cleanly without
                     // leaking the editor on a half-loaded buffer.
                     save_cmd_history(&app.footer.history);
+                    pics::hide();
                     Crust::cleanup();
                     Crust::clear_screen();
                     return;
@@ -237,6 +239,7 @@ fn main() {
                 app.set_status(" too many failed attempts — quitting", 196);
                 app.render_all();
                 save_cmd_history(&app.footer.history);
+                pics::hide();
                 Crust::cleanup();
                 Crust::clear_screen();
                 eprintln!("scribe: too many failed password attempts for {}", p.display());
@@ -346,6 +349,7 @@ fn main() {
     // editline target; its history is the live list.
     save_cmd_history(&app.footer.history);
     app.save_session();
+    pics::hide();
     Crust::cleanup();
     Crust::clear_screen();
 }
@@ -845,6 +849,9 @@ struct App {
     /// `pairs = true`: with the cursor on a LaTeX `\begin{x}` or
     /// `\end{x}`, both ends of the pair get a filled background.
     pairs: bool,
+    /// `pictures = false` turns this off: in a Markdown note, a line that
+    /// is one picture link shows the picture under it (see `pics`).
+    pictures: bool,
 }
 
 impl App {
@@ -947,6 +954,7 @@ impl App {
             alldates: rc.alldates,
             markup_concealed: false,
             pairs: rc.pairs,
+            pictures: !rc.no_pictures,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -1496,6 +1504,8 @@ struct RcConfig {
     alldates: bool,
     /// `pairs = true` — highlight a `\begin{x}` and its `\end{x}`.
     pairs: bool,
+    /// `pictures = false` — leave picture links as plain lines of text.
+    no_pictures: bool,
 }
 
 /// Parse the leading number prefix of an HL item (after indentation).
@@ -2191,6 +2201,7 @@ fn pick_path_with_pointer(buf: &str) -> Option<String> {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     };
 
+    pics::hide();
     Crust::cleanup();
     let status = std::process::Command::new("pointer")
         .arg(format!("--pick={}", pick))
@@ -2311,6 +2322,7 @@ fn install_panic_hook() {
         use std::io::Write as _;
         Crust::disable_bracketed_paste();
         let _ = std::io::stdout().flush();
+        pics::hide();
         Crust::cleanup();
 
         let payload = info.payload();
@@ -2395,6 +2407,7 @@ fn load_scriberc() -> RcConfig {
             "calendar" => if !v.is_empty() { cfg.calendar = Some(v.to_string()); },
             "alldates" => cfg.alldates = truthy(v),
             "pairs" => cfg.pairs = truthy(v),
+            "pictures" => cfg.no_pictures = !truthy(v),
             _ => {}
         }
     }
@@ -2503,7 +2516,7 @@ impl App {
         for ln in self.scroll..self.cur_line {
             if ln >= total { break; }
             if !self.folds.is_visible(ln, &all) { continue; }
-            visual_row += wrap_row_count(&all[ln], pane_w, gutter_w, ts);
+            visual_row += wrap_row_count(&all[ln], pane_w, gutter_w, ts) + self.picture_rows(&all[ln]);
         }
         let line = self.buf.line(self.cur_line);
         let target_byte = self.cur_col.min(self.current_line_len());
@@ -2600,14 +2613,16 @@ impl App {
         let cur_buf_line = self.buf.line(self.cur_line);
         let cur_target = self.cur_col.min(cur_buf_line.len());
         let (cur_row_in_line, _) = wrap_pos(&cur_buf_line, cur_target, pane_w, gutter_w, ts);
+        // With the cursor on a picture link, the picture stays in view too.
+        let cur_rows = cur_row_in_line + 1 + self.picture_rows(&cur_buf_line);
         loop {
             let mut rows_used: usize = 0;
             for ln in self.scroll..self.cur_line {
                 if !self.folds.is_visible(ln, &all) { continue; }
-                rows_used += wrap_row_count(&all[ln], pane_w, gutter_w, ts);
+                rows_used += wrap_row_count(&all[ln], pane_w, gutter_w, ts) + self.picture_rows(&all[ln]);
                 if rows_used >= pane_h { break; }
             }
-            if rows_used + cur_row_in_line + 1 <= pane_h { break; }
+            if rows_used + cur_rows <= pane_h { break; }
             // Cursor lives past the pane bottom — advance scroll to
             // the next VISIBLE line.
             let mut next_scroll = self.scroll + 1;
@@ -2751,6 +2766,9 @@ impl App {
         let mut out = String::new();
         let mut row = 0usize;
         let mut line_idx_walk = self.scroll;
+        // The last picture link drawn, if any: the pictures are placed
+        // once the text is on screen.
+        let mut last_picture: Option<usize> = None;
         while row < pane_h {
             while line_idx_walk < line_count
                 && !self.folds.is_visible(line_idx_walk, &all_lines)
@@ -2955,8 +2973,13 @@ impl App {
                 let count = fold::fold_end(line_idx, &all_lines).saturating_sub(line_idx);
                 out.push_str(&style::fg(&format!("  ▸ {}", count), 244));
             }
+            let picture_rows = if line_idx < line_count { self.picture_rows(&all_lines[line_idx]) } else { 0 };
+            if picture_rows > 0 {
+                last_picture = Some(line_idx);
+                for _ in 0..picture_rows { out.push('\n'); }
+            }
             if i + 1 < pane_h { out.push('\n'); }
-            row += 1;
+            row += 1 + picture_rows;
             line_idx_walk += 1;
         }
         // Expand tabs in the styled output to the buffer's tabstop
@@ -2965,6 +2988,58 @@ impl App {
         let out = expand_tabs_styled(&out, self.tabstop());
         self.main_p.set_text(&out);
         self.main_p.refresh();
+        if self.pictures { self.place_pictures(last_picture, &all_lines); }
+    }
+
+    /// The picture a line shows under itself: its file, and the columns
+    /// and rows it takes. `None` for every line but a picture link in a
+    /// Markdown note, with `pictures` on, in a terminal that shows them.
+    fn picture_of(&self, line: &str) -> Option<(String, u16, u16)> {
+        if !self.pictures || !line.trim_start().starts_with("![") { return None; }
+        if !matches!(&self.buf.kind, FileKind::Source(k) if k == "md" || k == "markdown") { return None; }
+        // A path in a note is counted from the folder the note is in.
+        let file = self.buf.path.as_ref()?.parent()?.join(pics::link(line)?);
+        let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode) as u16;
+        let max_cols = self.main_p.w.saturating_sub(gutter_w);
+        let max_rows = (self.main_p.h / 2).max(3);
+        let (cols, rows) = pics::size(file.to_str()?, max_cols, max_rows)?;
+        Some((file.to_string_lossy().into_owned(), cols, rows))
+    }
+
+    fn picture_rows(&self, line: &str) -> usize {
+        self.picture_of(line).map_or(0, |(_, _, rows)| rows as usize)
+    }
+
+    /// Show the picture of each picture link in view, right under its
+    /// line, and take away those that left the view. `last` is the last
+    /// picture link the frame drew; with none, the rows are not counted.
+    fn place_pictures(&self, last: Option<usize>, all: &[String]) {
+        let mut now: Vec<pics::Shown> = Vec::new();
+        if let Some(last) = last {
+            let pane_h = self.main_p.h as usize;
+            let pane_w = self.main_p.w as usize;
+            let gutter_w = gutter_width(all.len(), self.show_numbers && !self.reading_mode);
+            let ts = self.tabstop();
+            let mut top = 0usize;
+            for ln in self.scroll..=last {
+                if top >= pane_h { break; }
+                if !self.folds.is_visible(ln, all) { continue; }
+                top += wrap_row_count(&all[ln], pane_w, gutter_w, ts);
+                let Some((path, _, rows)) = self.picture_of(&all[ln]) else { continue };
+                if top < pane_h {
+                    now.push(pics::Shown {
+                        path,
+                        x: self.main_p.x + gutter_w as u16,
+                        y: self.main_p.y + top as u16,
+                        cols: (pane_w - gutter_w) as u16,
+                        rows,
+                        visible: rows.min((pane_h - top) as u16),
+                    });
+                }
+                top += rows as usize;
+            }
+        }
+        pics::place(now);
     }
 
     fn render_footer(&mut self) {
@@ -5068,6 +5143,7 @@ impl App {
             if c.len() <= w { s.to_string() }
             else { c[..w.saturating_sub(1)].iter().collect::<String>() + "…" }
         };
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         let mut filter = init.to_string();
         let mut top = 0usize;
@@ -5460,6 +5536,7 @@ impl App {
         let list_h = hits.len().min(20);
         let popup_h = (list_h + 4) as u16;
         let inner_w = popup_w as usize - 4;
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         let mut sel = 0usize;
         Cursor::hide();
@@ -5951,6 +6028,7 @@ impl App {
     fn pick_color_prism(&mut self) -> Option<(String, String)> {
         let outfile = format!("/tmp/scribe_pick_{}.txt", std::process::id());
         let _ = std::fs::remove_file(&outfile);
+        pics::hide();
         Crust::cleanup();
         let status = std::process::Command::new("prism")
             .arg("--pair")
@@ -6046,6 +6124,7 @@ impl App {
     fn pick_font(&mut self) -> Option<(String, u32)> {
         let outfile = format!("/tmp/scribe_font_{}.txt", std::process::id());
         let _ = std::fs::remove_file(&outfile);
+        pics::hide();
         Crust::cleanup();
         let status = std::process::Command::new("fonts")
             .arg(format!("--out={}", outfile))
@@ -6076,6 +6155,7 @@ impl App {
     fn launch_rpnx(&mut self) {
         let outfile = format!("/tmp/scribe_rpnx_{}.txt", std::process::id());
         let _ = std::fs::remove_file(&outfile);
+        pics::hide();
         Crust::cleanup();
         let status = std::process::Command::new("rpnx")
             .arg("--emit-file")
@@ -6354,6 +6434,7 @@ impl App {
         } else {
             (1, cols)
         };
+        pics::hide();
         Crust::clear_screen();
         self.header = Pane::new(1, 1, cols, 1, 255, 236);
         self.header.wrap = false; self.header.scroll = false;
@@ -7897,6 +7978,7 @@ impl App {
         let themes = highlight::available_themes();
         let popup_w = 60u16;
         let popup_h = 18u16;
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
 
         // Hide the terminal cursor — otherwise it stays parked on the
@@ -7918,6 +8000,7 @@ impl App {
             lines.push(format!("  {}  Number col:   {}",  key("n"), on(self.show_numbers)));
             lines.push(format!("  {}  Relative no:  {}",  key("r"), on(self.relative_numbers)));
             lines.push(format!("  {}  Match pairs:  {}",  key("p"), on(self.pairs)));
+            lines.push(format!("  {}  Pictures:     {}",  key("i"), on(self.pictures)));
             lines.push(String::new());
             lines.push(format!("  {}  Spell:        {}",  key("s"), on(self.spell_enabled)));
             lines.push(format!("  {}  Spell lang:   {}",  key("l"), val(&self.spell_lang)));
@@ -7950,6 +8033,7 @@ impl App {
                     if self.relative_numbers { self.show_numbers = true; }
                 }
                 "p" => self.pairs = !self.pairs,
+                "i" => self.pictures = !self.pictures,
                 "s" => {
                     if self.spell_enabled {
                         self.spell_disable();
@@ -7990,7 +8074,7 @@ impl App {
     fn save_scriberc(&mut self) {
         let path = scriberc_path();
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let managed = ["theme", "number", "relativenumber", "pairs", "spell", "lang", "spellcolor"];
+        let managed = ["theme", "number", "relativenumber", "pairs", "pictures", "spell", "lang", "spellcolor"];
         let mut out = String::new();
         for line in existing.lines() {
             let stripped = line.split('#').next().unwrap_or("").trim();
@@ -8004,6 +8088,7 @@ impl App {
         out.push_str(&format!("number = {}\n", self.show_numbers));
         out.push_str(&format!("relativenumber = {}\n", self.relative_numbers));
         out.push_str(&format!("pairs = {}\n", self.pairs));
+        out.push_str(&format!("pictures = {}\n", self.pictures));
         out.push_str(&format!("spell = {}\n", self.spell_enabled));
         out.push_str(&format!("lang = {}\n", self.spell_lang));
         out.push_str(&format!("spellcolor = {}\n", highlight::miss_color()));
@@ -8042,6 +8127,7 @@ impl App {
         // sit immediately below the header (otherwise the two visually
         // "melt" together).
         let popup_h = (rows.saturating_sub(6)).max(12);
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         popup.pane.y = popup.pane.y.saturating_add(1);
 
@@ -8089,6 +8175,7 @@ impl App {
         // sit immediately below the header (otherwise the two visually
         // "melt" together).
         let popup_h = (rows.saturating_sub(6)).max(12);
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         popup.pane.y = popup.pane.y.saturating_add(1);
 
@@ -8316,6 +8403,7 @@ impl App {
         let (cols, rows) = Crust::terminal_size();
         let popup_w = (cols.saturating_sub(2)).min(100).max(50);
         let popup_h = (rows.saturating_sub(6)).max(12);
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         popup.pane.y = popup.pane.y.saturating_add(1);
 
@@ -8424,6 +8512,7 @@ impl App {
     fn show_reg_popup(&mut self) {
         let popup_w = 70u16;
         let popup_h = 22u16;
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
 
         let mut keys: Vec<char> = vec!['"', '0'];
@@ -8520,20 +8609,67 @@ impl App {
                 return;
             }
         };
-        // Ensure inserted content ends with a newline so the read file's
-        // last line doesn't merge with the buffer's next line.
+        let inserted_lines = self.insert_below(text.split_off(0));
+        self.set_status(
+            &format!(" \"{}\"  {}L read", path.display(), inserted_lines),
+            244,
+        );
+    }
+
+    /// `:img file` — copy a picture into `img/` beside the note and put a
+    /// link to it on a new line below the cursor. A picture that is in
+    /// that folder already is linked where it is.
+    fn add_picture(&mut self, raw_path: &str) {
+        let Some(dir) = self.buf.path.as_ref().and_then(|p| p.parent()).map(|d| d.join("img")) else {
+            self.set_status(" :img needs a note with a file name (:w name.md)", 196);
+            return;
+        };
+        let source: PathBuf = match raw_path.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
+            None => PathBuf::from(raw_path),
+        };
+        if !source.is_file() {
+            self.set_status(" :img needs a picture file", 196);
+            return;
+        }
+        // A name the link can carry: no spaces, no brackets.
+        let name: String = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            .chars().map(|c| if c.is_whitespace() || "()[]".contains(c) { '-' } else { c }).collect();
+        let same = |a: &std::path::Path, b: &std::path::Path|
+            a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b);
+        let mut target = dir.join(&name);
+        if !same(&source, &target) {
+            // Never write over another picture of the same name.
+            let (stem, ext) = name.rsplit_once('.').unwrap_or((name.as_str(), ""));
+            let mut n = 1;
+            while target.exists() {
+                n += 1;
+                target = dir.join(if ext.is_empty() { format!("{stem}-{n}") } else { format!("{stem}-{n}.{ext}") });
+            }
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&source, &target)) {
+                self.set_status(&format!(" :img failed: {}", e), 196);
+                return;
+            }
+        }
+        let link = format!("![](img/{})", target.file_name().unwrap_or_default().to_string_lossy());
+        self.insert_below(link.clone());
+        self.set_status(&format!(" {}", link), 244);
+    }
+
+    /// Put `text` in as new lines below the cursor's line and move the
+    /// cursor to the first of them. Returns the number of lines put in.
+    fn insert_below(&mut self, mut text: String) -> usize {
+        // Ensure inserted content ends with a newline so its last line
+        // doesn't merge with the buffer's next line.
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
 
-        // Insertion point: byte just past line N's trailing newline
-        // (i.e. start of line N+1), so the file content lands as
-        // brand-new lines immediately below the cursor's line. ropey's
-        // line(N).len_bytes() includes the trailing \n when present.
+        // Insertion point: the start of line N+1, so the text lands as
+        // brand-new lines immediately below the cursor's line. Past the
+        // last line that is the end of the buffer.
         let cur_line = self.cur_line;
-        let line_start = self.buf.line_byte_offset(cur_line);
-        let line_len_bytes = self.buf.line(cur_line).len();
-        let mut insert_pos = line_start + line_len_bytes;
+        let mut insert_pos = self.buf.line_byte_offset(cur_line + 1);
 
         // If we're at the last line and the buffer doesn't end with a
         // newline, the insertion point sits flush with the last char —
@@ -8562,10 +8698,7 @@ impl App {
         let target_line = (cur_line + 1).min(self.buf.line_count().saturating_sub(1));
         self.cur_line = target_line;
         self.cur_col = 0;
-        self.set_status(
-            &format!(" \"{}\"  {}L read", path.display(), inserted_lines),
-            244,
-        );
+        inserted_lines
     }
 
     fn execute_command(&mut self, cmd: &str) -> bool {
@@ -8734,6 +8867,10 @@ impl App {
                           else if let Some(rest) = other.strip_prefix("r ") { rest }
                           else { other.strip_prefix("read!").unwrap_or("") };
                 self.read_file_into_buffer(arg.trim());
+                false
+            }
+            other if other == "img" || other.starts_with("img ") => {
+                self.add_picture(other[3..].trim());
                 false
             }
             "ab" | "abbrev" => {
@@ -9271,6 +9408,7 @@ impl App {
         let inner_w = (popup_w as usize).saturating_sub(4).max(20);
         let wrapped = wrap_to_width(&answer, inner_w);
         let popup_h = (wrapped.len() as u16 + 6).min(rows.saturating_sub(pad)).max(8);
+        pics::hide();
         let mut popup = Popup::centered(popup_w, popup_h, 252, 236);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
@@ -9496,6 +9634,7 @@ impl App {
         use std::io::Write as _;
         Crust::disable_bracketed_paste();
         let _ = std::io::stdout().flush();
+        pics::hide();
         Crust::cleanup();
         Crust::clear_screen();
 

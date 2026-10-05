@@ -27,6 +27,12 @@ jobs:
           repository: isene/highlight
           path: highlight
 
+      - name: Checkout glow
+        uses: actions/checkout@v7
+        with:
+          repository: isene/glow
+          path: glow
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build

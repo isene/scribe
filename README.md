@@ -223,6 +223,22 @@ Per-span styling is stored as inline HTML, so it lives in the text (a Markdown /
 
 The styled inner text renders live (colour applied, `<span>` tags dimmed) in Markdown, HTML, and plain-text buffers alike. `\C` / `\F` each launch their picker full-screen, then return to scribe with the choice wrapped around the selection.
 
+### Pictures
+
+In a Markdown note, a line that is one picture link and nothing else shows the picture under it:
+
+```
+![](img/cat.jpg)
+```
+
+- The path counts from the folder the note is in.
+- `:img <file>` copies a picture into `img/` beside the note and puts the link on a new line below the cursor. Shift-Tab in the prompt picks the file in [pointer](https://github.com/isene/pointer).
+- A picture takes at most half the height of the text, and is never enlarged.
+- It needs a terminal with the kitty graphics protocol (glass, kitty, WezTerm) and ImageMagick. Anywhere else the link stays a line of text.
+- `pictures = false` in scriberc, or `i` in `:config`, turns it off.
+
+The [nomad](https://github.com/isene/nomad) scribe app for Android writes its notes the same way, so a folder of notes shared with Syncthing reads the same on the phone and here.
+
 ### Line numbers + gutter
 
 | Command | Action |
@@ -239,6 +255,7 @@ The styled inner text renders live (colour applied, `<span>` tags dimmed) in Mar
 - `n` toggle line numbers
 - `r` toggle relative numbers
 - `p` toggle match pairs: with the cursor on a LaTeX `\begin{x}` or `\end{x}`, both ends get an orange background
+- `i` toggle pictures in Markdown notes
 - `s` toggle spell on/off
 - `l` prompt for spell language
 - `c` prompt for spell color (0–255)
@@ -376,6 +393,7 @@ theme = dracula              # monokai | solarized | nord | dracula | gruvbox | 
 number = false               # absolute line numbers in the gutter
 relativenumber = false       # relative line numbers (forces number=true)
 pairs = false                # light up both ends of a LaTeX \begin{x} ... \end{x}
+pictures = true              # show the picture under a picture link in a Markdown note
 
 # Spell
 spell = false                # auto-on (email is always on regardless)

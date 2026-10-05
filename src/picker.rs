@@ -108,6 +108,7 @@ fn matches(entry: &Entry, query: &str) -> bool {
 pub fn pick(initial_tab: InitialTab, refresh_panes: &mut [&mut Pane]) -> Option<String> {
     let popup_w: u16 = 72;
     let popup_h: u16 = 22;
+    crate::pics::hide();
     let mut popup = Popup::centered(popup_w, popup_h, 252, POPUP_BG);
 
     let mut tab: Tab = match initial_tab {
