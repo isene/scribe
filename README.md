@@ -239,6 +239,17 @@ In a Markdown note, a line that is one picture link and nothing else shows the p
 
 The [nomad](https://github.com/isene/nomad) scribe app for Android writes its notes the same way, so a folder of notes shared with Syncthing reads the same on the phone and here.
 
+### Overview
+
+`go` shows the text files in the folder of the file you are in, as cards: the name, the first lines, the tags and the first picture.
+
+- `h` `j` `k` `l` or the arrows move. `g` and `G` go to the first and the last card.
+- `Enter` opens the card. `q` or `Esc` goes back to the file you were in.
+- `/` keeps the cards with that text in the name or the note, so `/#work` keeps one tag. `Esc` shows them all again.
+- `:overview` (or `:ov`) does the same as `go`, and `:ov ~/notes` shows another folder. So does `scribe ~/notes`.
+- Notes tagged `#pinned` come first, then the newest. Hidden files and files that are not text get no card.
+- The folder is read once, when the overview opens. Nothing runs while it waits for a key.
+
 ### Line numbers + gutter
 
 | Command | Action |

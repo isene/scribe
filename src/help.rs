@@ -116,6 +116,8 @@ pub const HELP: &[Entry] = &[
     // Commands
     ("Command", ":w :wq :q :q!", "write / write-quit / quit / force-quit"),
     ("Command", ":e <file>", "open a file in the buffer"),
+    ("Overview", "go  :overview  :ov", "this folder's text files as cards; Enter opens one, / finds, q goes back"),
+    ("Overview", ":overview DIR  scribe DIR", "the overview of another folder"),
     ("Command", ":claude {prompt}", "run claude -p over selection / paragraph / buffer"),
     ("Command", ":chat  Ctrl-A", "full interactive Claude session; Ctrl-A in every Fe2O3 app"),
     ("Command", ":help  :h", "open the bundled README in the buffer"),

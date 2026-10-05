@@ -18,6 +18,7 @@ mod help;
 mod mode;
 mod motion;
 mod picker;
+mod overview;
 mod pics;
 mod register;
 mod search;
@@ -159,7 +160,9 @@ fn main() {
     let encrypted_path: Option<PathBuf> = path.as_ref()
         .filter(|p| buffer::is_encrypted_dotfile(p) && p.exists())
         .cloned();
-    let app_path = if encrypted_path.is_some() { None } else { path.clone() };
+    // A folder is not a file to edit: it opens as an overview of its files.
+    let folder: Option<PathBuf> = path.as_ref().filter(|p| p.is_dir()).cloned();
+    let app_path = if encrypted_path.is_some() || folder.is_some() { None } else { path.clone() };
 
     Crust::init();
     Crust::set_app_identity("Scribe");
@@ -272,6 +275,10 @@ fn main() {
         app.mode = Mode::Insert;
     }
     app.render_all();
+    if folder.is_some() {
+        app.overview(folder);
+        app.render_all();
+    }
 
     loop {
         let Some(key) = Input::getchr(None) else { continue };
@@ -2098,6 +2105,8 @@ fn complete_colon_command(prefix: &str) -> Vec<String> {
         "w", "wq", "x", "q",
         // Reload
         "e", "edit", "e!", "edit!",
+        // Folder overview
+        "overview", "ov",
         // Help / keys
         "help", "keys", "keybindings", "cheat",
         // AI
@@ -3888,6 +3897,11 @@ impl App {
                     // `g?` — searchable help index.
                     self.pending.clear();
                     self.help_index("");
+                }
+                "o" => {
+                    // `go` — the overview of this file's folder.
+                    self.pending.clear();
+                    self.overview(None);
                 }
                 "q" => {
                     // Enter `gq` operator-pending. Don't clear pending — count
@@ -8586,6 +8600,42 @@ impl App {
     /// current line. Each line in the file becomes a new buffer line;
     /// the cursor moves to the first inserted line. Goes through
     /// `buf.apply` so the read is a single undo step.
+    /// Put another file in the buffer, at the place it was left.
+    fn edit_path(&mut self, p: PathBuf) {
+        if buffer::is_encrypted_dotfile(&p) && p.exists() {
+            self.set_status(
+                " encrypted dotfile — open from command line so password prompt works",
+                196);
+        } else if let Ok(b) = Buffer::from_path(p) {
+            self.buf = b;
+            self.cur_line = 0;
+            self.cur_col = 0;
+            self.scroll = 0;
+            self.folds.clear();
+            self.restore_session();
+        } else {
+            self.set_status(" open failed", 196);
+        }
+    }
+
+    /// The text files of a folder as cards; Enter puts one in the buffer.
+    /// With no folder named, it is the folder of the file in the buffer.
+    fn overview(&mut self, dir: Option<PathBuf>) {
+        let dir = dir.unwrap_or_else(|| {
+            let here = self.buf.path.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty());
+            here.map_or_else(|| PathBuf::from("."), |d| d.to_path_buf())
+        });
+        let Some(path) = overview::pick(self, &dir) else { return };
+        let open = self.buf.path.as_ref().and_then(|p| p.canonicalize().ok());
+        if open.is_some() && open == path.canonicalize().ok() { return; }
+        if self.buf.dirty {
+            self.set_status(" unsaved changes (:w first)", 196);
+            return;
+        }
+        self.save_session();
+        self.edit_path(path);
+    }
+
     fn read_file_into_buffer(&mut self, raw_path: &str) {
         if raw_path.is_empty() {
             self.set_status(" :r needs a filename", 196);
@@ -8834,23 +8884,19 @@ impl App {
             }
             other if other.starts_with("e ") => {
                 let path = other[2..].trim();
-                if !path.is_empty() {
-                    let p = PathBuf::from(path);
-                    if buffer::is_encrypted_dotfile(&p) && p.exists() {
-                        self.set_status(
-                            " encrypted dotfile — open from command line so password prompt works",
-                            196);
-                    } else if let Ok(b) = Buffer::from_path(p) {
-                        self.buf = b;
-                        self.cur_line = 0;
-                        self.cur_col = 0;
-                        self.scroll = 0;
-                        self.folds.clear();
-                        self.restore_session();
-                    } else {
-                        self.set_status(" open failed", 196);
-                    }
-                }
+                if !path.is_empty() { self.edit_path(PathBuf::from(path)); }
+                false
+            }
+            // The text files of a folder as cards: this file's folder,
+            // or the one named.
+            "ov" | "overview" => { self.overview(None); false }
+            other if other.starts_with("ov ") || other.starts_with("overview ") => {
+                let dir = other.split_once(' ').map_or("", |(_, d)| d.trim());
+                let dir = match (dir.strip_prefix("~/"), std::env::var("HOME")) {
+                    (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
+                    _ => PathBuf::from(dir),
+                };
+                if dir.is_dir() { self.overview(Some(dir)); } else { self.set_status(" not a folder", 196); }
                 false
             }
             // Vim's `:r filename` — read the contents of a file and
