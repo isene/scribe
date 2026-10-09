@@ -384,9 +384,9 @@ impl Buffer {
 ///     the file content actually starts with `ENC:`. A freshly-created
 ///     dotfile that has no `ENC:` header is treated as plaintext.
 ///   * any file whose first non-empty line starts with `ENC:` is
-///     auto-decrypted regardless of name. This makes `.p2.hl` work
-///     when stored at `/home/.safe/.p2.hl` and lets users put
-///     encrypted blocks anywhere they like.
+///     auto-decrypted regardless of name. This makes an encrypted
+///     file work in any folder and lets users put encrypted blocks
+///     anywhere they like.
 pub fn is_encrypted_dotfile(path: &PathBuf) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else { return false };
     let dotfile_hl = name.starts_with('.')
