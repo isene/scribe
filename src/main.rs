@@ -20,6 +20,7 @@ mod motion;
 mod picker;
 mod overview;
 mod pics;
+mod recover;
 mod register;
 mod search;
 mod spell;
@@ -278,10 +279,19 @@ fn main() {
     if folder.is_some() {
         app.overview(folder);
         app.render_all();
+    } else {
+        app.offer_recovery();
     }
 
     loop {
-        let Some(key) = Input::getchr(None) else { continue };
+        // With text that is not in the recovery file yet, wait for a pause
+        // in the typing and write it then. With nothing to write, the wait
+        // has no end: an idle scribe never wakes.
+        let pause = if app.recovery_behind() > 0 { Some(RECOVERY_PAUSE_SECS) } else { None };
+        let Some(key) = Input::getchr(pause) else {
+            app.recovery_tick(true);
+            continue;
+        };
         // External-change check. Runs on every keystroke (one stat()
         // per key — sub-microsecond). When another writer touched the
         // file (kastrup triage appending to a hyperlist, git checkout,
@@ -347,9 +357,12 @@ fn main() {
             if quit { break; }
         }
         if quit { break; }
+        app.recovery_tick(false);
         app.render_all();
     }
 
+    // A quit is a choice, with `:q!` too: the text is saved or given up.
+    app.drop_recovery();
     Crust::disable_bracketed_paste();
     let _ = std::io::stdout().flush();
     // Persist `:` command history across runs. The footer pane was the
@@ -360,6 +373,11 @@ fn main() {
     Crust::cleanup();
     Crust::clear_screen();
 }
+
+/// Unsaved text goes to the recovery file after this long with no key,
+/// or after `RECOVERY_EDITS` changes with no such pause. Vim's numbers.
+const RECOVERY_PAUSE_SECS: u64 = 4;
+const RECOVERY_EDITS: u64 = 200;
 
 /// Encode an input-layer key string ("h", "ESC", "C-UP", "ENTER", …) as
 /// vim-style macro text (`h`, `<Esc>`, `<C-Up>`, `<CR>`, …). The result
@@ -859,6 +877,13 @@ struct App {
     /// `pictures = false` turns this off: in a Markdown note, a line that
     /// is one picture link shows the picture under it (see `pics`).
     pictures: bool,
+    /// `recover = false` turns this off: unsaved text is written to a
+    /// recovery file when the typing pauses (see `recover`).
+    recover: bool,
+    /// The recovery file this session wrote, to remove on a save or a quit.
+    recovery_file: Option<PathBuf>,
+    /// The buffer's change count when the recovery file was last written.
+    recovery_edits: u64,
 }
 
 impl App {
@@ -962,6 +987,9 @@ impl App {
             markup_concealed: false,
             pairs: rc.pairs,
             pictures: !rc.no_pictures,
+            recover: !rc.no_recover,
+            recovery_file: None,
+            recovery_edits: 0,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -1513,6 +1541,8 @@ struct RcConfig {
     pairs: bool,
     /// `pictures = false` — leave picture links as plain lines of text.
     no_pictures: bool,
+    /// `recover = false` — write no recovery file for unsaved text.
+    no_recover: bool,
 }
 
 /// Parse the leading number prefix of an HL item (after indentation).
@@ -2417,6 +2447,7 @@ fn load_scriberc() -> RcConfig {
             "alldates" => cfg.alldates = truthy(v),
             "pairs" => cfg.pairs = truthy(v),
             "pictures" => cfg.no_pictures = !truthy(v),
+            "recover" => cfg.no_recover = !truthy(v),
             _ => {}
         }
     }
@@ -8600,6 +8631,108 @@ impl App {
     /// current line. Each line in the file becomes a new buffer line;
     /// the cursor moves to the first inserted line. Goes through
     /// `buf.apply` so the read is a single undo step.
+    /// How many changes the recovery file is behind the buffer. Zero when
+    /// there is nothing to write: the text is saved, or `recover` is off.
+    fn recovery_behind(&self) -> u64 {
+        if !self.recover || !self.buf.dirty {
+            return 0;
+        }
+        self.buf.edits.wrapping_sub(self.recovery_edits)
+    }
+
+    /// Keep the recovery file in step with the buffer. Runs after every
+    /// key (two compares when there is nothing to do) and when the typing
+    /// pauses. A saved buffer needs no recovery file, so it goes.
+    fn recovery_tick(&mut self, paused: bool) {
+        if !self.buf.dirty {
+            self.drop_recovery();
+            self.recovery_edits = self.buf.edits;
+            return;
+        }
+        let behind = self.recovery_behind();
+        if behind == 0 || (!paused && behind < RECOVERY_EDITS) {
+            return;
+        }
+        let path = recover::path_for(self.buf.path.as_deref());
+        if self.recovery_file.is_none() {
+            recover::sweep();
+        }
+        // A failed write is tried again at the next pause, so it says
+        // nothing: a full disk must not put a warning on every pause.
+        if self.buf.disk_text().and_then(|text| recover::write(&path, &text)).is_ok() {
+            // The buffer got another name since the last write: `:w new`.
+            if self.recovery_file.as_ref().is_some_and(|old| *old != path) {
+                self.drop_recovery();
+            }
+            self.recovery_file = Some(path);
+        }
+        self.recovery_edits = self.buf.edits;
+    }
+
+    fn drop_recovery(&mut self) {
+        if let Some(old) = self.recovery_file.take() {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+
+    /// At start, and after `:e`: offer back the text of a scribe that
+    /// went down with unsaved changes to this file. With no file named,
+    /// it is the newest text that had no file.
+    fn offer_recovery(&mut self) {
+        if !self.recover {
+            return;
+        }
+        let path = match self.buf.path.as_deref() {
+            Some(file) => recover::path_for(Some(file)),
+            None => match recover::newest_unnamed() {
+                Some(path) => path,
+                None => return,
+            },
+        };
+        let Ok(found) = std::fs::read_to_string(&path) else { return };
+        let text = if self.buf.encrypted {
+            let password = self.buf.password.clone().unwrap_or_default();
+            match buffer::decrypt(&found, &password) {
+                Ok(text) => text,
+                Err(_) => {
+                    self.set_status(&format!(
+                        " unsaved text found, but this password does not open it: {}", path.display()), 196);
+                    return;
+                }
+            }
+        } else {
+            found
+        };
+        if text == self.buf.text() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        self.set_status(&format!(
+            " Unsaved text from {} ago.  r: take it back   d: delete it   other key: decide later",
+            recover::age(&path)), 220);
+        self.render_all();
+        match Input::getchr(None).as_deref() {
+            Some("r") => {
+                // One edit, so `u` goes back to the file as it is on disk.
+                let end = self.buf.rope.len_bytes();
+                self.buf.apply(0, end, &text);
+                self.folds.clear();
+                self.cur_line = self.cur_line.min(self.buf.line_count().saturating_sub(1));
+                self.clamp_col_to_line();
+                // The file stays until this text is saved or given up.
+                self.recovery_file = Some(path);
+                self.recovery_edits = self.buf.edits;
+                self.set_status(" unsaved text is back; u returns to the saved file, :w keeps it", 46);
+            }
+            Some("d") => {
+                let _ = std::fs::remove_file(&path);
+                self.set_status(" unsaved text deleted", 46);
+            }
+            _ => self.set_status(" left as it is; it is offered again next time", 244),
+        }
+        self.render_all();
+    }
+
     /// Put another file in the buffer, at the place it was left.
     fn edit_path(&mut self, p: PathBuf) {
         if buffer::is_encrypted_dotfile(&p) && p.exists() {
@@ -8607,12 +8740,23 @@ impl App {
                 " encrypted dotfile — open from command line so password prompt works",
                 196);
         } else if let Ok(b) = Buffer::from_path(p) {
+            // A buffer left with unsaved changes keeps its recovery file,
+            // written now: the text is offered when the file is next
+            // opened. `:e` asks no question before it drops a buffer.
+            if self.buf.dirty {
+                self.recovery_tick(true);
+                self.recovery_file = None;
+            } else {
+                self.drop_recovery();
+            }
             self.buf = b;
+            self.recovery_edits = 0;
             self.cur_line = 0;
             self.cur_col = 0;
             self.scroll = 0;
             self.folds.clear();
             self.restore_session();
+            self.offer_recovery();
         } else {
             self.set_status(" open failed", 196);
         }

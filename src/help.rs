@@ -91,6 +91,7 @@ pub const HELP: &[Entry] = &[
     // Config
     ("Config", ":config", "config popup: theme / numbers / pairs / pictures / spell / save"),
     ("Config", "pairs = true", "scriberc: light up a LaTeX \\begin{x} and its \\end{x} (:config p)"),
+    ("Config", "recover = false", "scriberc: keep no recovery file for unsaved text (~/.config/scribe/recover/)"),
     // Pictures
     ("Pictures", ":img FILE", "copy a picture into img/ beside the note, link it below the cursor"),
     ("Pictures", "pictures = false", "scriberc: leave picture links in Markdown as plain text (:config i)"),

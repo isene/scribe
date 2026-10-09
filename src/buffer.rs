@@ -74,6 +74,9 @@ pub struct Buffer {
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// Counts every change to the text: an edit, an undo, a redo. The
+    /// recovery file is behind the buffer while its own count differs.
+    pub edits: u64,
     pub kind: FileKind,
     /// Snapshot of the file's mtime at last load / save. Used by the
     /// main-loop external-change check: if the on-disk mtime no longer
@@ -110,7 +113,7 @@ impl Buffer {
     pub fn empty() -> Self {
         Self {
             rope: Rope::new(),
-            path: None, dirty: false, kind: FileKind::Plain,
+            path: None, dirty: false, edits: 0, kind: FileKind::Plain,
             last_mtime: None,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
@@ -131,7 +134,7 @@ impl Buffer {
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(Self {
             rope: Rope::from_str(&s),
-            path: Some(path), dirty: false, kind,
+            path: Some(path), dirty: false, edits: 0, kind,
             last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
@@ -153,7 +156,7 @@ impl Buffer {
         let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Self {
             rope: Rope::from_str(&plaintext),
-            path: Some(path), dirty: false, kind,
+            path: Some(path), dirty: false, edits: 0, kind,
             last_mtime,
             nodes: Vec::new(), head: None,
             compound_depth: 0, pending_compound: Vec::new(),
@@ -235,29 +238,40 @@ impl Buffer {
             bak.push(".scribe-bak");
             let _ = std::fs::copy(&path, std::path::PathBuf::from(bak));
         }
-        let mut s = String::new();
-        for chunk in self.rope.chunks() { s.push_str(chunk); }
-        if self.encrypted {
-            let pw = self.password.clone()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other,
-                    "encrypted but no cached password — re-open the file"))?;
-            // Preserve the on-disk envelope: openssl `Salted__` (vim plugin)
-            // or scribe's `ENC:`. Converting silently would lock out the other
-            // tool that owns the file.
-            let cipher = if self.openssl_format {
-                encrypt_openssl(&s, &pw)?
-            } else {
-                encrypt(&s, &pw)?
-            };
-            std::fs::write(&path, cipher)?;
-        } else {
-            std::fs::write(&path, s)?;
-        }
+        std::fs::write(&path, self.disk_text()?)?;
         self.dirty = false;
         // Refresh the cached mtime so the external-change check after
         // our own save doesn't fire as a false positive.
         self.last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         Ok(())
+    }
+
+    /// The whole text.
+    pub fn text(&self) -> String {
+        let mut s = String::with_capacity(self.rope.len_bytes());
+        for chunk in self.rope.chunks() { s.push_str(chunk); }
+        s
+    }
+
+    /// The text as it goes to disk: encrypted when the buffer is. The save
+    /// writes this, and so does the recovery file, so the clear text of an
+    /// encrypted file never lands on disk.
+    pub fn disk_text(&self) -> std::io::Result<String> {
+        let s = self.text();
+        if !self.encrypted {
+            return Ok(s);
+        }
+        let pw = self.password.clone()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other,
+                "encrypted but no cached password — re-open the file"))?;
+        // Preserve the on-disk envelope: openssl `Salted__` (vim plugin)
+        // or scribe's `ENC:`. Converting silently would lock out the other
+        // tool that owns the file.
+        if self.openssl_format {
+            encrypt_openssl(&s, &pw)
+        } else {
+            encrypt(&s, &pw)
+        }
     }
 
     /// Apply an edit and record it on the undo tree. When inside a compound
@@ -295,6 +309,7 @@ impl Buffer {
         self.rope.remove(start_char..end_char);
         self.rope.insert(start_char, replacement);
         self.dirty = true;
+        self.edits += 1;
         if self.compound_depth > 0 {
             self.pending_compound.push(edit);
         } else {
@@ -327,6 +342,7 @@ impl Buffer {
         }
         self.head = node.parent;
         self.dirty = true;
+        self.edits += 1;
         Some(node.edits.first().map(|e| e.start).unwrap_or(0))
     }
 
@@ -353,6 +369,7 @@ impl Buffer {
         }
         self.head = Some(target);
         self.dirty = true;
+        self.edits += 1;
         Some(node.edits.last().map(|e| e.start + e.replacement.len()).unwrap_or(0))
     }
 
@@ -584,6 +601,25 @@ fn derive_key_iv(password: &str, salt: &[u8]) -> ([u8; 32], [u8; 16]) {
 #[cfg(test)]
 mod crypto_tests {
     use super::*;
+
+    #[test]
+    fn every_change_counts_and_an_encrypted_buffer_never_gives_clear_text_for_disk() {
+        let mut b = Buffer::empty();
+        b.apply(0, 0, "one");
+        b.apply(3, 3, " two");
+        assert_eq!((b.edits, b.text().as_str()), (2, "one two"));
+        b.undo();
+        b.redo();
+        assert_eq!((b.edits, b.text().as_str()), (4, "one two"));
+        assert_eq!(b.disk_text().unwrap(), "one two");
+
+        b.encrypted = true;
+        assert!(b.disk_text().is_err(), "no password, so nothing is written");
+        b.password = Some("pw".into());
+        let sealed = b.disk_text().unwrap();
+        assert!(!sealed.contains("one two"));
+        assert_eq!(decrypt(&sealed, "pw").unwrap(), "one two");
+    }
 
     #[test]
     fn enc_roundtrip() {

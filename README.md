@@ -283,6 +283,24 @@ The [nomad](https://github.com/isene/nomad) scribe app for Android writes its no
 
 Cursor position + scroll for every file you edit are saved to `~/.config/scribe/sessions.json` on quit and restored next time you open the same path. CLI `+N` overrides the saved position. The store is capped at 200 entries.
 
+### Unsaved text survives a crash
+
+Text you have typed and not saved is written to a recovery file when you
+stop typing for four seconds, or after 200 changes in one go. A crash, a
+closed terminal or a dead battery then costs a few seconds of typing.
+
+- The next time you open the file, scribe says it has unsaved text for it:
+  `r` takes it back, `d` deletes it, any other key leaves it for later.
+- After `r`, `u` returns to the file as it is on disk, and `:w` keeps the
+  recovered text.
+- A scribe started with no file offers the newest text that never had one.
+- A save or a quit removes the recovery file, `:q!` too.
+- The files are in `~/.config/scribe/recover/`, readable by you alone, and
+  never beside your file. An encrypted file gets an encrypted recovery file.
+- An idle scribe does no work for this: with nothing new to write, it waits
+  for the next key and nothing else.
+- `recover = false` in scriberc turns it off.
+
 ### Custom keymaps
 
 Drop a `[keymap]` section into scriberc to define your own bindings. Format per line: `MODE LHS RHS`.
@@ -405,6 +423,7 @@ number = false               # absolute line numbers in the gutter
 relativenumber = false       # relative line numbers (forces number=true)
 pairs = false                # light up both ends of a LaTeX \begin{x} ... \end{x}
 pictures = true              # show the picture under a picture link in a Markdown note
+recover = true               # keep unsaved text in a recovery file while you type
 
 # Spell
 spell = false                # auto-on (email is always on regardless)
@@ -430,6 +449,7 @@ paragraphdim = true          # Limelight-style dim of non-current paragraphs
 | `~/.config/scribe/spell.add` | personal dictionary for `zg` |
 | `~/.config/scribe/scribe.log` | error log (panics + backtraces) |
 | `<file>.scribe-bak` | one-step backup written before every save |
+| `~/.config/scribe/recover/` | unsaved text, kept until it is saved or given up |
 | `/tmp/scribe-chat-<pid>.txt` | buffer snapshot during `:chat` |
 
 ## Install
@@ -475,7 +495,6 @@ Run scribe on the bundled [`HyperListTestSuite.hl`](HyperListTestSuite.hl) to le
 ## Roadmap
 
 - HyperList Tab fold/unfold via Tab key (currently SPACE) — minor ergonomics tweak.
-- **General `:map` system** — user-defined keymaps in scriberc instead of hardcoded built-ins.
 - **`:earlier 5m`** — time-based undo navigation.
 
 ## Philosophy
