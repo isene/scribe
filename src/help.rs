@@ -117,6 +117,9 @@ pub const HELP: &[Entry] = &[
     // Commands
     ("Command", ":w :wq :q :q!", "write / write-quit / quit / force-quit"),
     ("Command", ":e <file>", "open a file in the buffer"),
+    ("Two files", ":vs <file>", "open a second file in the right half (also: scribe FILE FILE2)"),
+    ("Two files", "Ctrl-W w", "go to the other file (Ctrl-W h / l: the left / the right one)"),
+    ("Two files", ":only  Ctrl-W o", "close the other file; q closes the one you are in"),
     ("Overview", "go  :overview  :ov", "this folder's text files as cards; Enter opens one, / finds, q goes back"),
     ("Overview", ":overview DIR  scribe DIR", "the overview of another folder"),
     ("Command", ":claude {prompt}", "run claude -p over selection / paragraph / buffer"),

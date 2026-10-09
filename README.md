@@ -283,6 +283,27 @@ The [nomad](https://github.com/isene/nomad) scribe app for Android writes its no
 
 Cursor position + scroll for every file you edit are saved to `~/.config/scribe/sessions.json` on quit and restored next time you open the same path. CLI `+N` overrides the saved position. The store is capped at 200 entries.
 
+### Two files side by side
+
+`scribe a.md b.md` opens two files, each in its own half of the screen.
+In a running scribe, `:vs FILE` opens a second file to the right of yours.
+
+| Key / command | Does |
+|---|---|
+| `:vs FILE` (or `:vsplit`) | open FILE in the right half and go to it |
+| `Ctrl-W w` (or `Ctrl-W Ctrl-W`) | go to the other file |
+| `Ctrl-W h` / `Ctrl-W l` | go to the left / the right file |
+| `q`, `:wq`, `Q` | close the file you are in; the other gets the whole screen |
+| `:only` / `Ctrl-W o` | close the other file and keep this one |
+
+- Yank in one file and paste in the other: the registers are shared.
+- Each file has its own undo, folds, marks, cursor and recovery file.
+- The header names both files, with the one you are in in bold.
+- Two files is the limit, and one file cannot be open in both halves.
+- Pictures in Markdown notes are not shown while two files are open.
+- The file you are not in is drawn once and left alone until the screen
+  is cleared or resized, so typing costs the same as with one file.
+
 ### Unsaved text survives a crash
 
 Text you have typed and not saved is written to a recovery file when you

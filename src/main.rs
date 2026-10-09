@@ -44,8 +44,9 @@ fn main() {
     if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
         println!("scribe — Modal text editor for writers (Fe2O3 suite)");
         println!();
-        println!("Usage: scribe [+LINE] [FILE] [OPTIONS]");
+        println!("Usage: scribe [+LINE] [FILE] [FILE2] [OPTIONS]");
         println!();
+        println!("  FILE2            a second file, opened beside the first");
         println!("  +LINE            open with the cursor on that line");
         println!("  --col N          ... and that column");
         println!("  --insert         start in insert mode");
@@ -78,6 +79,7 @@ fn main() {
     let mut start_col: Option<usize> = None;
     let mut start_insert = false;
     let mut path: Option<PathBuf> = None;
+    let mut second: Option<PathBuf> = None;
     let mut cli_theme: Option<String> = None;
     let mut no_spell = false;
     let mut export_fmt: Option<String> = None;
@@ -122,6 +124,8 @@ fn main() {
             path = Some(PathBuf::from(arg));
             i += 1;
         } else {
+            // A second file opens beside the first.
+            if second.is_none() && !arg.starts_with('-') { second = Some(PathBuf::from(arg)); }
             i += 1;
         }
     }
@@ -281,6 +285,10 @@ fn main() {
         app.render_all();
     } else {
         app.offer_recovery();
+        if let Some(second) = second {
+            app.open_side(second);
+            app.render_all();
+        }
     }
 
     loop {
@@ -356,7 +364,11 @@ fn main() {
             }
             if quit { break; }
         }
-        if quit { break; }
+        if quit {
+            // With two files open, a quit closes the one being edited.
+            if app.side.is_none() { break; }
+            app.close_window();
+        }
         app.recovery_tick(false);
         app.render_all();
     }
@@ -696,6 +708,87 @@ fn collect_hl(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The file that is not being edited, when two files are side by side.
+/// It has what belongs to a file and not to the editor: the text, the
+/// place in it, its folds, marks and spelling, and its recovery file.
+struct Win {
+    buf: Buffer,
+    cur_line: usize,
+    cur_col: usize,
+    want_col: usize,
+    scroll: usize,
+    folds: fold::Folds,
+    showhide: Option<(String, bool)>,
+    marks: std::collections::HashMap<char, usize>,
+    misspellings: Vec<spell::MisspellRange>,
+    recovery_file: Option<PathBuf>,
+    recovery_edits: u64,
+}
+
+impl Win {
+    fn empty() -> Self {
+        Self {
+            buf: Buffer::empty(),
+            cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
+            folds: fold::Folds::new(),
+            showhide: None,
+            marks: std::collections::HashMap::new(),
+            misspellings: Vec::new(),
+            recovery_file: None,
+            recovery_edits: 0,
+        }
+    }
+}
+
+/// A pane with no rows: it draws nothing. It stands in for the second
+/// file's pane while one file is open, so the lists of panes to repaint
+/// after a popup are the same with one file and with two.
+fn idle_pane() -> Pane {
+    let mut pane = Pane::new(1, 1, 1, 0, 231, 0);
+    pane.wrap = false;
+    pane.scroll = false;
+    pane
+}
+
+/// Where two files side by side go: the first column and the width of
+/// the left half and of the right half. The one column between them is
+/// the line that parts them.
+fn halves(cols: u16) -> ((u16, u16), (u16, u16)) {
+    let left = cols.saturating_sub(1) / 2;
+    ((1, left), (left + 2, cols.saturating_sub(left + 1)))
+}
+
+/// True when two paths name one file. A file that does not exist yet is
+/// compared by its path.
+fn same_file(a: Option<&std::path::Path>, b: &std::path::Path) -> bool {
+    let Some(a) = a else { return false };
+    let whole = |p: &std::path::Path| {
+        p.canonicalize().or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf())
+    };
+    whole(a) == whole(b)
+}
+
+/// The header's words for a file: its name, a star when it has unsaved
+/// changes, its line count. A path too long for `room` gives way to the
+/// file name alone, and that is cut when it is still too long.
+fn header_label(buf: &Buffer, room: usize) -> String {
+    let dirty = if buf.dirty { " *" } else { "" };
+    let tail = format!("{dirty}  ({} lines)", buf.line_count());
+    let full = buf.path.as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[no name]".into());
+    let label = format!(" {full}{tail}");
+    if crust::display_width(&label) <= room {
+        return label;
+    }
+    let short = buf.path.as_ref()
+        .and_then(|p| p.file_name())
+        .map_or(full, |n| n.to_string_lossy().into_owned());
+    let mut cut = format!(" {short}{tail}");
+    while crust::display_width(&cut) > room && cut.pop().is_some() {}
+    cut
+}
+
 struct App {
     buf: Buffer,
     mode: Mode,
@@ -884,6 +977,19 @@ struct App {
     recovery_file: Option<PathBuf>,
     /// The buffer's change count when the recovery file was last written.
     recovery_edits: u64,
+    /// Two files side by side: the one that is not being edited. Its
+    /// text is in `side_p`, and `rule_p` is the line between the two.
+    side: Option<Win>,
+    side_p: Pane,
+    rule_p: Pane,
+    /// The file being edited is the one on the right.
+    on_right: bool,
+    /// The screen was cleared or resized, so the other file is drawn
+    /// again at the next frame. At no other time: its text cannot change
+    /// while it is not the one being edited.
+    side_stale: bool,
+    /// Ctrl-W was pressed: the next key says what to do with the two files.
+    win_prefix: bool,
 }
 
 impl App {
@@ -990,6 +1096,12 @@ impl App {
             recover: !rc.no_recover,
             recovery_file: None,
             recovery_edits: 0,
+            side: None,
+            side_p: idle_pane(),
+            rule_p: idle_pane(),
+            on_right: false,
+            side_stale: false,
+            win_prefix: false,
         };
         if auto_spell { app.spell_enable(); }
         if app.reading_mode { app.apply_layout(); }
@@ -2135,6 +2247,8 @@ fn complete_colon_command(prefix: &str) -> Vec<String> {
         "w", "wq", "x", "q",
         // Reload
         "e", "edit", "e!", "edit!",
+        // Two files side by side
+        "vs", "vsplit", "only",
         // Folder overview
         "overview", "ov",
         // Help / keys
@@ -2519,6 +2633,10 @@ impl App {
         }
         self.render_header();
         self.render_main();
+        if self.side_stale {
+            self.side_stale = false;
+            self.render_side();
+        }
         self.render_footer();
         self.position_cursor();
     }
@@ -2628,13 +2746,25 @@ impl App {
             self.header.say(&style::fg(&" ".repeat(self.cols as usize), 240));
             return;
         }
-        let name = self.buf.path.as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[no name]".into());
-        let dirty = if self.buf.dirty { " *" } else { "" };
-        let lines = self.buf.line_count();
-        let info = format!(" {}{}  ({} lines)", name, dirty, lines);
-        self.header.say(&style::bold(&info));
+        let Some(side) = self.side.as_ref() else {
+            self.header.say(&style::bold(&header_label(&self.buf, usize::MAX)));
+            return;
+        };
+        // Two files: each name above its own half, the one being edited
+        // in bold.
+        let (left, right) = halves(self.cols);
+        let (left_buf, right_buf) = if self.on_right { (&side.buf, &self.buf) } else { (&self.buf, &side.buf) };
+        let cell = |buf: &Buffer, w: u16, edited: bool| {
+            let label = header_label(buf, w as usize);
+            let pad = (w as usize).saturating_sub(crust::display_width(&label));
+            let text = format!("{label}{}", " ".repeat(pad));
+            if edited { style::bold(&text) } else { style::fg(&text, 245) }
+        };
+        let line = format!("{}{}{}",
+            cell(left_buf, left.1, !self.on_right),
+            style::fg("│", 240),
+            cell(right_buf, right.1, self.on_right));
+        self.header.say(&line);
     }
 
     fn render_main(&mut self) {
@@ -3028,14 +3158,16 @@ impl App {
         let out = expand_tabs_styled(&out, self.tabstop());
         self.main_p.set_text(&out);
         self.main_p.refresh();
-        if self.pictures { self.place_pictures(last_picture, &all_lines); }
+        if self.pictures && self.side.is_none() { self.place_pictures(last_picture, &all_lines); }
     }
 
     /// The picture a line shows under itself: its file, and the columns
     /// and rows it takes. `None` for every line but a picture link in a
     /// Markdown note, with `pictures` on, in a terminal that shows them.
     fn picture_of(&self, line: &str) -> Option<(String, u16, u16)> {
-        if !self.pictures || !line.trim_start().starts_with("![") { return None; }
+        // Two files side by side show no pictures: each half is narrow,
+        // and one set of pictures is on screen at a time.
+        if !self.pictures || self.side.is_some() || !line.trim_start().starts_with("![") { return None; }
         if !matches!(&self.buf.kind, FileKind::Source(k) if k == "md" || k == "markdown") { return None; }
         // A path in a note is counted from the folder the note is in.
         let file = self.buf.path.as_ref()?.parent()?.join(pics::link(line)?);
@@ -3487,6 +3619,24 @@ impl App {
     fn handle_normal(&mut self, key: &str) -> bool {
         if let Some(q) = self.try_keymap("normal", key) { return q; }
         self.status = None;
+
+        // Ctrl-W, then a key: the two files side by side.
+        if self.win_prefix {
+            self.win_prefix = false;
+            match key {
+                "w" | "C-W" => self.switch_window(),
+                "h" | "LEFT" => if self.on_right { self.switch_window(); },
+                "l" | "RIGHT" => if !self.on_right { self.switch_window(); },
+                "o" => self.close_side(),
+                _ => {}
+            }
+            return false;
+        }
+        if key == "C-W" && self.pending.operator.is_none() {
+            self.pending.clear();
+            self.win_prefix = true;
+            return false;
+        }
 
         // Ctrl-y in Normal mode: yank the whole buffer to the system
         // clipboard. Equivalent to `ggVG"+y` in vim and obeys the same
@@ -5239,7 +5389,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -5615,7 +5765,7 @@ impl App {
                 }
                 Some("ENTER") => {
                     let path = hits[sel].0.to_string_lossy().to_string();
-                    popup.dismiss(&mut [&mut self.header, &mut self.main_p,
+                    popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p,
                                         &mut self.footer]);
                     Cursor::show();
                     self.render_all();
@@ -5626,7 +5776,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -6084,7 +6234,7 @@ impl App {
         Crust::init();
         Crust::clear_screen();
         self.header.invalidate();
-        self.main_p.invalidate();
+        self.main_p.invalidate(); self.side_p.invalidate(); self.side_stale = true;
         self.footer.invalidate();
         if status.is_err() { let _ = std::fs::remove_file(&outfile); return None; }
         let mut fg = "#000000".to_string();
@@ -6158,7 +6308,7 @@ impl App {
         } else {
             self.set_status(" markup shown (\\M)", 244);
         }
-        self.main_p.invalidate();
+        self.main_p.invalidate(); self.side_p.invalidate(); self.side_stale = true;
         self.render_all();
     }
 
@@ -6177,7 +6327,7 @@ impl App {
         Crust::init();
         Crust::clear_screen();
         self.header.invalidate();
-        self.main_p.invalidate();
+        self.main_p.invalidate(); self.side_p.invalidate(); self.side_stale = true;
         self.footer.invalidate();
         if status.is_err() { let _ = std::fs::remove_file(&outfile); return None; }
         // A cancelled picker exits non-zero and writes nothing.
@@ -6209,7 +6359,7 @@ impl App {
         Crust::init();
         Crust::clear_screen();
         self.header.invalidate();
-        self.main_p.invalidate();
+        self.main_p.invalidate(); self.side_p.invalidate(); self.side_stale = true;
         self.footer.invalidate();
         if status.is_err() {
             let _ = std::fs::remove_file(&outfile);
@@ -6470,15 +6620,13 @@ impl App {
     fn apply_layout(&mut self) {
         let cols = self.cols;
         let rows = self.rows;
-        let (main_x, main_w) = if self.reading_mode && self.reading_width > 0
-            && (self.reading_width as u16) < cols
-        {
-            let w = self.reading_width as u16;
-            let x = ((cols - w) / 2).max(1);
-            (x, w)
-        } else {
-            (1, cols)
+        let (left, right) = halves(cols);
+        let (mine, theirs) = match (self.side.is_some(), self.on_right) {
+            (false, _) => ((1, cols), (1, 0)),
+            (true, false) => (left, right),
+            (true, true) => (right, left),
         };
+        let (main_x, main_w) = self.text_column(mine);
         pics::hide();
         Crust::clear_screen();
         self.header = Pane::new(1, 1, cols, 1, 255, 236);
@@ -6486,6 +6634,21 @@ impl App {
         self.main_p = Pane::new(main_x, 2, main_w, rows.saturating_sub(2), 231, 0);
         self.main_p.wrap = true;
         self.main_p.scroll = false; // scribe owns its viewport — no crust scroll markers
+        if self.side.is_some() {
+            let (x, w) = self.text_column(theirs);
+            let h = rows.saturating_sub(2);
+            self.side_p = Pane::new(x, 2, w, h, 231, 0);
+            self.side_p.wrap = true;
+            self.side_p.scroll = false;
+            self.rule_p = Pane::new(left.1 + 1, 2, 1, h, 240, 0);
+            self.rule_p.wrap = false;
+            self.rule_p.scroll = false;
+            self.rule_p.set_text(&vec!["│"; h as usize].join("\n"));
+            self.side_stale = true;
+        } else {
+            self.side_p = idle_pane();
+            self.rule_p = idle_pane();
+        }
         // Preserve record + history across layout recompute — recreating
         // the footer would otherwise blow them away on every `:read`
         // toggle, killing command-line Up/Down recall.
@@ -6494,6 +6657,114 @@ impl App {
         self.footer.wrap = false; self.footer.scroll = false;
         self.footer.record = true;
         self.footer.history = saved_history;
+    }
+
+    /// The columns the text takes inside an area of the screen: all of
+    /// it, or a centred column of `reading_width` in reading mode.
+    fn text_column(&self, (x, w): (u16, u16)) -> (u16, u16) {
+        if self.reading_mode && self.reading_width > 0 && (self.reading_width as u16) < w {
+            let text_w = self.reading_width as u16;
+            (x - 1 + ((w - text_w) / 2).max(1), text_w)
+        } else {
+            (x, w)
+        }
+    }
+
+    // ── Two files side by side ─────────────────────────────────────────
+
+    /// Trade places: the file being edited and the other one, each with
+    /// its pane. Twice gives back what was there.
+    fn swap_side(&mut self) {
+        let Some(w) = self.side.as_mut() else { return };
+        std::mem::swap(&mut self.buf, &mut w.buf);
+        std::mem::swap(&mut self.cur_line, &mut w.cur_line);
+        std::mem::swap(&mut self.cur_col, &mut w.cur_col);
+        std::mem::swap(&mut self.want_col, &mut w.want_col);
+        std::mem::swap(&mut self.scroll, &mut w.scroll);
+        std::mem::swap(&mut self.folds, &mut w.folds);
+        std::mem::swap(&mut self.showhide, &mut w.showhide);
+        std::mem::swap(&mut self.marks, &mut w.marks);
+        std::mem::swap(&mut self.misspellings, &mut w.misspellings);
+        std::mem::swap(&mut self.recovery_file, &mut w.recovery_file);
+        std::mem::swap(&mut self.recovery_edits, &mut w.recovery_edits);
+        std::mem::swap(&mut self.main_p, &mut self.side_p);
+        self.on_right = !self.on_right;
+    }
+
+    /// Draw the file that is not being edited, and the line between the
+    /// two. This walks the whole file, so it runs after the screen was
+    /// cleared or resized and at no other time.
+    fn render_side(&mut self) {
+        if self.side.is_none() { return; }
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        self.swap_side();
+        self.render_main();
+        self.swap_side();
+        self.mode = mode;
+        self.rule_p.full_refresh();
+    }
+
+    /// Ctrl-W w: go to the other file.
+    fn switch_window(&mut self) {
+        if self.side.is_none() {
+            self.set_status(" one file is open; :vs FILE opens a second beside it", 244);
+            return;
+        }
+        // The pause timer watches the file being edited alone, so the
+        // one left behind gets its recovery file now.
+        self.recovery_tick(true);
+        self.pending.clear();
+        self.swap_side();
+    }
+
+    /// `:vs FILE`: open a second file to the right of this one, and go
+    /// to it.
+    fn open_side(&mut self, p: PathBuf) {
+        if self.side.is_some() {
+            self.set_status(" two files are open already; q closes this one", 196);
+        } else if self.cols < 60 {
+            self.set_status(" the terminal is too narrow for two files", 196);
+        } else if same_file(self.buf.path.as_deref(), &p) {
+            self.set_status(" that file is open already", 196);
+        } else if buffer::is_encrypted_dotfile(&p) && p.exists() {
+            self.set_status(
+                " encrypted dotfile — open from command line so password prompt works",
+                196);
+        } else if let Ok(b) = Buffer::from_path(p) {
+            self.recovery_tick(true);
+            self.side = Some(Win::empty());
+            self.on_right = false;
+            self.apply_layout();
+            self.swap_side();
+            self.show_buffer(b);
+        } else {
+            self.set_status(" open failed", 196);
+        }
+    }
+
+    /// The file being edited closes, and the other one gets the whole
+    /// screen. The caller has made sure nothing unsaved is lost.
+    fn close_window(&mut self) {
+        self.save_session();
+        self.drop_recovery();
+        self.swap_side();
+        self.side = None;
+        self.on_right = false;
+        self.apply_layout();
+    }
+
+    /// `:only` and Ctrl-W o: close the other file and keep this one.
+    fn close_side(&mut self) {
+        match self.side.as_ref() {
+            None => {}
+            Some(w) if w.buf.dirty => {
+                self.set_status(" the other file has unsaved changes", 196);
+            }
+            Some(_) => {
+                self.swap_side();
+                self.close_window();
+            }
+        }
     }
 
     /// Inclusive line range of the paragraph the cursor is in.
@@ -7502,7 +7773,7 @@ impl App {
             "C-K" => {
                 let glyph = picker::pick(
                     picker::InitialTab::All,
-                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                    &mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer],
                 );
                 if let Some(g) = glyph {
                     self.insert_text_at_cursor(&g);
@@ -7997,7 +8268,7 @@ impl App {
         self.footer.picker = None;
         // pick_path_with_pointer may have handed the screen to pointer.
         self.header.invalidate();
-        self.main_p.invalidate();
+        self.main_p.invalidate(); self.side_p.invalidate(); self.side_stale = true;
         self.footer.invalidate();
         self.render_footer();
         let quit = self.execute_command(cmd.trim());
@@ -8108,7 +8379,7 @@ impl App {
             }
         }
         // Wipe the popup, repaint everything underneath.
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -8203,7 +8474,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -8433,7 +8704,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -8544,7 +8815,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -8613,7 +8884,7 @@ impl App {
                 _ => {}
             }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         Cursor::show();
         self.render_all();
     }
@@ -8735,31 +9006,39 @@ impl App {
 
     /// Put another file in the buffer, at the place it was left.
     fn edit_path(&mut self, p: PathBuf) {
-        if buffer::is_encrypted_dotfile(&p) && p.exists() {
+        if self.side.as_ref().is_some_and(|w| same_file(w.buf.path.as_deref(), &p)) {
+            self.set_status(" that file is open in the other half", 196);
+        } else if buffer::is_encrypted_dotfile(&p) && p.exists() {
             self.set_status(
                 " encrypted dotfile — open from command line so password prompt works",
                 196);
         } else if let Ok(b) = Buffer::from_path(p) {
-            // A buffer left with unsaved changes keeps its recovery file,
-            // written now: the text is offered when the file is next
-            // opened. `:e` asks no question before it drops a buffer.
-            if self.buf.dirty {
-                self.recovery_tick(true);
-                self.recovery_file = None;
-            } else {
-                self.drop_recovery();
-            }
-            self.buf = b;
-            self.recovery_edits = 0;
-            self.cur_line = 0;
-            self.cur_col = 0;
-            self.scroll = 0;
-            self.folds.clear();
-            self.restore_session();
-            self.offer_recovery();
+            self.show_buffer(b);
         } else {
             self.set_status(" open failed", 196);
         }
+    }
+
+    /// A file that was read from disk takes the place of the one being
+    /// edited, at the place it was left.
+    fn show_buffer(&mut self, b: Buffer) {
+        // A buffer left with unsaved changes keeps its recovery file,
+        // written now: the text is offered when the file is next
+        // opened. `:e` asks no question before it drops a buffer.
+        if self.buf.dirty {
+            self.recovery_tick(true);
+            self.recovery_file = None;
+        } else {
+            self.drop_recovery();
+        }
+        self.buf = b;
+        self.recovery_edits = 0;
+        self.cur_line = 0;
+        self.cur_col = 0;
+        self.scroll = 0;
+        self.folds.clear();
+        self.restore_session();
+        self.offer_recovery();
     }
 
     /// The text files of a folder as cards; Enter puts one in the buffer.
@@ -8906,7 +9185,7 @@ impl App {
             "digraphs" | "dig" => {
                 let glyph = picker::pick(
                     picker::InitialTab::Digraphs,
-                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                    &mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer],
                 );
                 if let Some(g) = glyph {
                     self.insert_text_at_cursor(&g);
@@ -8917,7 +9196,7 @@ impl App {
             "emoji" => {
                 let glyph = picker::pick(
                     picker::InitialTab::Emoji,
-                    &mut [&mut self.header, &mut self.main_p, &mut self.footer],
+                    &mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer],
                 );
                 if let Some(g) = glyph {
                     self.insert_text_at_cursor(&g);
@@ -9024,6 +9303,24 @@ impl App {
                 } else {
                     self.set_status(" no file to reload", 196);
                 }
+                false
+            }
+            // Two files side by side.
+            other if other.starts_with("vs ") || other.starts_with("vsplit ") => {
+                let raw = other.split_once(' ').map_or("", |(_, rest)| rest.trim());
+                let path = match (raw.strip_prefix("~/"), std::env::var_os("HOME")) {
+                    (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+                    _ => PathBuf::from(raw),
+                };
+                self.open_side(path);
+                false
+            }
+            "vs" | "vsplit" => {
+                self.set_status(" :vs needs a file name", 196);
+                false
+            }
+            "only" => {
+                self.close_side();
                 false
             }
             other if other.starts_with("e ") => {
@@ -9623,7 +9920,7 @@ impl App {
             if k == "y" { copied = true; break; }
             if k == "ESC" || k == "q" || k == "ENTER" { break; }
         }
-        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.footer]);
+        popup.dismiss(&mut [&mut self.header, &mut self.main_p, &mut self.side_p, &mut self.rule_p, &mut self.footer]);
         // Show the cursor again. `render_all` repositions it via
         // `position_cursor` which also emits `\x1b[?25h`, but the
         // explicit show here covers the (rare) case where rendering
@@ -10042,6 +10339,44 @@ fn shift_left(line: &str, kind: &FileKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_files_share_the_screen_with_one_column_between_them() {
+        use super::halves;
+        assert_eq!(halves(120), ((1, 59), (61, 60)));
+        assert_eq!(halves(121), ((1, 60), (62, 60)));
+        for cols in 60..200u16 {
+            let ((left_x, left_w), (right_x, right_w)) = halves(cols);
+            assert_eq!(left_x, 1);
+            assert_eq!(right_x, left_w + 2, "one column for the line between them");
+            assert_eq!(right_x + right_w - 1, cols, "the right half ends at the last column");
+        }
+    }
+
+    #[test]
+    fn a_header_name_too_long_for_its_half_gives_way_to_the_file_name() {
+        use super::{header_label, Buffer};
+        let mut b = Buffer::empty();
+        b.path = Some("/a/long/folder/that/takes/room/notes.md".into());
+        let lines = b.line_count();
+        assert_eq!(header_label(&b, 200), format!(" /a/long/folder/that/takes/room/notes.md  ({lines} lines)"));
+        assert_eq!(header_label(&b, 30), format!(" notes.md  ({lines} lines)"));
+        assert!(crust::display_width(&header_label(&b, 12)) <= 12);
+        b.dirty = true;
+        assert!(header_label(&b, 30).starts_with(" notes.md *"));
+    }
+
+    #[test]
+    fn one_file_by_two_paths_is_one_file() {
+        use super::same_file;
+        let dir = std::env::temp_dir().join(format!("scribe-same-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        assert!(same_file(Some(&dir.join("a.txt")), &dir.join("sub/../a.txt")));
+        assert!(!same_file(Some(&dir.join("a.txt")), &dir.join("b.txt")));
+        assert!(!same_file(None, &dir.join("a.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn begin_and_end_find_each_other() {
         use super::{env_pair, paint_chars};
