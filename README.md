@@ -112,6 +112,8 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 | `"0` | last yank only (delete doesn't touch it) |
 | `"+` `"*` | system clipboard via OSC 52 |
 
+**The system clipboard.** A yank or delete of a visual selection goes to the system clipboard as well, and so does a yank into `"+` or `"*`. `Ctrl-y` copies the whole file there. A plain `x`, `dw`, `dd` or `yy` in Normal mode stays in scribe's own registers. A deleted letter never replaces what you copied in another program. Changing a selection with `c`, or pasting over it with `p`, leaves the clipboard alone too.
+
 **Persistent.** Named slots are written to `~/.config/scribe/registers.json` on every yank / cut. They survive restarts AND share live across concurrent scribe sessions: yank in scribe A, `"ap` in scribe B without going through the OS clipboard. The system-clipboard slots (`"+`, `"*`) are not persisted.
 
 **Yank/cut feedback.** Status line confirms every register write: `5 lines yanked`, `23 chars yanked into "a`, `3 lines deleted`. Yank green, cut/change orange.

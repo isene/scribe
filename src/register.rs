@@ -2,6 +2,12 @@
 //! - Unnamed `""` — last yank/delete (default for p/P).
 //! - Named `"a` … `"z` — explicitly addressed.
 //! - System `"+` and `"*` — clipboard via OSC 52 on yank.
+//!
+//! The system clipboard gets a yank or delete only when it was made on a
+//! visual selection, or into `"+` / `"*`. A plain `x`, `dw` or `yy` in
+//! Normal mode stays in scribe's own registers. Before, every deleted
+//! letter replaced what the desktop had on its clipboard, and a
+//! clipboard history filled up with them.
 //! - Last yank `"0` — yank populates "" AND "0; delete only "".
 //!
 //! Each register stores text + a kind (charwise vs linewise) so paste places
@@ -109,26 +115,55 @@ impl Registers {
         self.save();
     }
 
-    /// Yank semantics: write "", "0, optional named, and broadcast to system
-    /// clipboard via OSC 52.
-    pub fn yank(&mut self, name: Option<char>, text: String, kind: YankKind) {
+    /// Yank semantics: write "", "0, optional named. With `clip`, or into
+    /// "+ or "*, the text goes to the system clipboard as well.
+    pub fn yank(&mut self, name: Option<char>, text: String, kind: YankKind, clip: bool) {
         let y = Yank { text: text.clone(), kind };
         self.slots.insert('"', y.clone());
         self.slots.insert('0', y.clone());
         if let Some(n) = name { self.slots.insert(n, y.clone()); }
-        // OSC 52 to system clipboard.
-        crust::clipboard_copy(&text, "c");
-        crust::clipboard_copy(&text, "p");
+        broadcast(name, &text, clip);
         self.save();
     }
 
     /// Delete semantics: write "" and optional named. Does not touch "0.
-    pub fn cut(&mut self, name: Option<char>, text: String, kind: YankKind) {
+    /// The system clipboard gets it by the same rule as a yank.
+    pub fn cut(&mut self, name: Option<char>, text: String, kind: YankKind, clip: bool) {
         let y = Yank { text: text.clone(), kind };
         self.slots.insert('"', y.clone());
         if let Some(n) = name { self.slots.insert(n, y.clone()); }
-        crust::clipboard_copy(&text, "c");
-        crust::clipboard_copy(&text, "p");
+        broadcast(name, &text, clip);
         self.save();
+    }
+}
+
+/// Whether a yank or delete goes to the system clipboard too: when the
+/// caller asks for it (a visual selection), or when it is made into the
+/// "+ or "* register.
+pub fn to_clipboard(name: Option<char>, asked: bool) -> bool {
+    asked || matches!(name, Some('+') | Some('*'))
+}
+
+/// OSC 52 to the system clipboard, for the yanks and deletes that go there.
+/// One call: the two there were ("c" and "p") both named the clipboard to
+/// crust, which knows "clipboard" and "primary", so every copy was made
+/// twice.
+fn broadcast(name: Option<char>, text: &str, clip: bool) {
+    if to_clipboard(name, clip) {
+        crust::clipboard_copy(text, "clipboard");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_clipboard;
+
+    #[test]
+    fn only_a_visual_selection_or_the_plus_register_reaches_the_system_clipboard() {
+        assert!(!to_clipboard(None, false), "x, dw, dd and yy in Normal mode stay in scribe");
+        assert!(!to_clipboard(Some('a'), false), "and so does a named register");
+        assert!(to_clipboard(None, true), "a yank or delete of a visual selection");
+        assert!(to_clipboard(Some('+'), false), "\"+yy asks for the clipboard by name");
+        assert!(to_clipboard(Some('*'), false));
     }
 }

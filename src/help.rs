@@ -47,6 +47,7 @@ pub const HELP: &[Entry] = &[
     // Registers
     ("Register", "\"a..\"z  \"0-\"9", "named registers; \"ay$ yanks into a"),
     ("Register", "\"+ \"*", "system clipboard via OSC 52"),
+    ("Register", "v..y  v..d", "a visual yank or delete goes to the system clipboard too"),
     ("Register", ":reg", "register inspector popup (also :registers)"),
     // Search + substitute
     ("Search", "/pat  ?pat", "regex search forward / backward"),

@@ -806,6 +806,10 @@ struct App {
     footer: Pane,
     pending: Pending,
     regs: Registers,
+    /// True while a yank or delete of a visual selection runs, and for
+    /// Ctrl-y: the text goes to the system clipboard as well. A plain
+    /// x, dw or yy in Normal mode leaves it false.
+    clip: bool,
     search: SearchState,
     /// Anchor byte offset for Visual mode selection (Visual / VisualLine).
     /// In VisualBlock the anchor is (line, col).
@@ -1040,6 +1044,7 @@ impl App {
             cols, rows, header, main_p, footer,
             pending: Pending::default(),
             regs: Registers::load(),
+            clip: false,
             search: SearchState::new(),
             visual_anchor: 0,
             block_insert: None,
@@ -3649,7 +3654,9 @@ impl App {
         if key == "C-Y" && self.pending.operator.is_none() {
             self.pending.clear();
             let last = self.buf.line_count().saturating_sub(1);
+            self.clip = true;
             self.execute_op_linewise_yank(0, last);
+            self.clip = false;
             return false;
         }
 
@@ -6887,8 +6894,14 @@ impl App {
 
         // Operator (d/c/y) or shortcut (x/X/D/C/Y/~) acts on the selection.
         match key {
+            // A delete or a yank of the selection goes to the system
+            // clipboard too. A change (c) and a paste over the selection
+            // (p) do not: they would replace what was copied elsewhere
+            // just before it is pasted here.
             "d" | "x" | "X" | "D" => {
+                self.clip = true;
                 self.apply_visual_op('d');
+                self.clip = false;
                 return false;
             }
             "c" | "C" | "s" => {
@@ -6902,7 +6915,9 @@ impl App {
                 return false;
             }
             "y" | "Y" => {
+                self.clip = true;
                 self.apply_visual_op('y');
+                self.clip = false;
                 return false;
             }
             // `<` / `>` shift the selection. In vim these are always
@@ -7134,8 +7149,8 @@ impl App {
         let reg = self.pending.register;
         let combined_for_msg = combined.clone();
         match op {
-            'y' => self.regs.yank(reg, combined, YankKind::Block),
-            _   => self.regs.cut(reg, combined, YankKind::Block),
+            'y' => self.regs.yank(reg, combined, YankKind::Block, self.clip),
+            _   => self.regs.cut(reg, combined, YankKind::Block, self.clip),
         }
         let verb = if op == 'y' { "yanked" } else if op == 'c' { "changed" } else { "deleted" };
         self.say_yank(verb, reg, YankKind::Block, &combined_for_msg);
@@ -7239,13 +7254,13 @@ impl App {
         let verb;
         match op {
             'd' => {
-                self.regs.cut(reg_name, text, YankKind::Charwise);
+                self.regs.cut(reg_name, text, YankKind::Charwise, self.clip);
                 self.buf.apply(start, end, "");
                 self.cursor_to_byte(start);
                 verb = Some("deleted");
             }
             'c' => {
-                self.regs.cut(reg_name, text, YankKind::Charwise);
+                self.regs.cut(reg_name, text, YankKind::Charwise, self.clip);
                 self.buf.apply(start, end, "");
                 // Enter insert FIRST so col_cap allows landing one past
                 // the last char. Otherwise `C` on "TEST" with cursor on
@@ -7257,7 +7272,7 @@ impl App {
                 verb = Some("changed");
             }
             'y' => {
-                self.regs.yank(reg_name, text, YankKind::Charwise);
+                self.regs.yank(reg_name, text, YankKind::Charwise, self.clip);
                 verb = Some("yanked");
             }
             _ => { verb = None; }
@@ -7285,7 +7300,7 @@ impl App {
         let msg_text = text.clone();
         match op {
             'd' => {
-                self.regs.cut(reg_name, text, YankKind::Linewise);
+                self.regs.cut(reg_name, text, YankKind::Linewise, self.clip);
                 self.buf.apply(start, end, "");
                 let new_line = from.min(self.buf.line_count().saturating_sub(1));
                 self.cur_line = new_line;
@@ -7294,7 +7309,7 @@ impl App {
                 self.say_yank("deleted", reg_name, YankKind::Linewise, &msg_text);
             }
             'c' => {
-                self.regs.cut(reg_name, text, YankKind::Linewise);
+                self.regs.cut(reg_name, text, YankKind::Linewise, self.clip);
                 // Replace the lines with one empty line so we can insert into it.
                 self.buf.apply(start, end, "\n");
                 self.cur_line = from;
@@ -7304,7 +7319,7 @@ impl App {
                 self.say_yank("changed", reg_name, YankKind::Linewise, &msg_text);
             }
             'y' => {
-                self.regs.yank(reg_name, text, YankKind::Linewise);
+                self.regs.yank(reg_name, text, YankKind::Linewise, self.clip);
                 self.say_yank("yanked", reg_name, YankKind::Linewise, &msg_text);
             }
             'Q' => {
@@ -7366,7 +7381,7 @@ impl App {
         if !text.ends_with('\n') { text.push('\n'); }
         let reg = self.pending.register;
         let msg_text = text.clone();
-        self.regs.yank(reg, text, YankKind::Linewise);
+        self.regs.yank(reg, text, YankKind::Linewise, self.clip);
         self.say_yank("yanked", reg, YankKind::Linewise, &msg_text);
     }
 
@@ -9929,7 +9944,7 @@ impl App {
         if copied {
             // A yank like any other: p / P paste it, and the desktop
             // clipboard has it too.
-            self.regs.yank(None, answer, YankKind::Charwise);
+            self.regs.yank(None, answer, YankKind::Charwise, true);
             self.set_status(" definition copied: p pastes it", 46);
         } else {
             self.set_status("", 244);
