@@ -195,19 +195,22 @@ An Item has, in sequence:
 An **Identifier** is a unique reference handle: `1`, `1.1`, `1.2.3` (numeric
 path) or `1A1A` (alphanumeric, equivalent to `1.1.1.1`).
 
-A **Neutral Starter** is `+` or `-` followed by a space. It marks where an
-item begins and carries no further meaning.
+A **Neutral Starter** is `+` followed by a space. It marks where an item
+begins and carries no further meaning. A line that begins with `- ` is plain
+text.
 
 A Starter is optional, but an item that spans more than one display line must
 have one. Its continuation lines are indented two spaces beyond the item's own
 indent, and one indent level is at least three columns wide, so a continuation
-can never be read as a child. No other item is affected:
+can never be read as a child. When one item in a group spans more than one
+line, every item in that group takes a Starter. A group is the items at the
+same indent under the same parent:
 
 ```
-- A short item needs no Starter
++ A short item takes a Starter when a sibling needs one
 + An item that runs past the end of the line takes one, and its following
   lines are indented two spaces further than the item itself
-- Its siblings are unaffected
++ So the whole group lines up
 ```
 
 #### 2. Type
@@ -367,7 +370,7 @@ HyperList
     [1+] HyperList Item
         [?] Starter; OR: 
             Identifier (Numbers: Format = "1.1.1.1", Mixed: Format = "1A1A")
-            Neutral Starter = "+ " or "- "
+            Neutral Starter = "+ "
                 Marks where an Item begins and carries no further meaning
         [?] Type; OR: 
             State = "S:" or "|"
@@ -401,7 +404,7 @@ scribe colors HyperList syntax 1:1 with the original `hyperlist.vim`:
 | Element | Color |
 |---|---|
 | Identifier (numbering) | Magenta |
-| Neutral Starter (`+` / `-`) | Red |
+| Neutral Starter (`+`) | Magenta |
 | Property (`Name: `) | Red |
 | Operator (`AND:`, `OR:`, …) | Blue |
 | Qualifier (`[…]`) | Green (LimeGreen) |

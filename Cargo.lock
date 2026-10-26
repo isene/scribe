@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.64"
+version = "0.1.68"
 dependencies = [
  "crossterm",
  "libc",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-highlight"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fe2o3-crust",
  "regex",

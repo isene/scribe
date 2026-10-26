@@ -14,8 +14,7 @@ HyperList Test Suite for scribe; Press '\a' to uncollapse this whole HyperList
 		1. The numbering is an identifier and should appear in magenta
 		+ The "+" Starter should appear in magenta, like the numbering above
 		 and indicates the item runs across more than one line
-		- The "-" Starter should also appear in magenta
-		 and is the neutral Starter introduced in HyperList 2.8
+		- This line begins with "-", which is plain text and stays uncoloured
 		This link should be in magenta <link to nowhere>
 		This comment should be in teal with the link inside in magenta (the <link to nowhere>)
 		Quotes are also in "teal" and with "links inside in magenta, <link to nowhere>"
