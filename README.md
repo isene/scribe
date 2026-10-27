@@ -23,6 +23,7 @@ Vim has a thousand features. A writer needs about thirty of them. Scribe is "vim
 - **Inline colour, font + office export** — `\C` colours a Visual selection (prism picks fg/bg) and `\F` sets its font + size (the `fonts` picker), both stored as live HTML spans; `\M` conceals the span markup (revealing it only on the cursor's line) so styled prose reads clean. `\xd` / `\xo` export the buffer to **docx** / **odt** via LibreOffice with colour, highlight, font and size preserved. The styling lives in the text, so a Markdown / HTML / plain save keeps it.
 - **Spellcheck** via hunspell — auto-on for email mode, opt-in elsewhere via `:set spell`. Configurable language and underline color. `]s` / `[s` navigation, `z=` suggestions, `zg` to add to personal dict.
 - **Persistent registers** — yanks and macros live in `~/.config/scribe/registers.json` and update on every yank, so they survive restarts AND share live across concurrent scribe sessions.
+- **A library too** — the scribe program is `scribe::run`, and other apps open the same editor with `scribe::App::open` ([gluon](https://github.com/isene/gluon) does, in its Tasks tab).
 - **No LSP / debugger / quickfix / `:make`** — writers don't compile.
 - **Block paste that actually pastes a block** — `Ctrl-v` selection lays each row at the same column on consecutive lines. One `u` reverses the whole thing.
 
