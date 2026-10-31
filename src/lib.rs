@@ -878,6 +878,10 @@ pub struct App {
     cur_line: usize,
     cur_col: usize,
     want_col: usize,
+    /// The screen column Up and Down aim for, and the cursor byte where
+    /// it was set: a run of Up/Down keeps the column through short lines,
+    /// as in vim. usize::MAX after `$` means the end of every line.
+    goal: Option<(usize, usize)>,
     scroll: usize,
     cmdline: String,
     status: Option<(String, u8)>,
@@ -1122,7 +1126,7 @@ impl App {
         let mut app = Self {
             running: true, tab_line: None,
             buf, mode: Mode::Normal,
-            cur_line: 0, cur_col: 0, want_col: 0, scroll: 0,
+            cur_line: 0, cur_col: 0, want_col: 0, goal: None, scroll: 0,
             cmdline: String::new(), status: None,
             cols, rows, header, main_p, footer,
             pending: Pending::default(),
@@ -3630,52 +3634,75 @@ impl App {
     }
 
     fn move_up(&mut self) {
-        if let Some(target) = self.visual_step(-1) {
-            self.cursor_to_byte(target);
-        }
+        self.vertical_move(-1);
     }
 
     fn move_down(&mut self) {
-        if let Some(target) = self.visual_step(1) {
-            self.cursor_to_byte(target);
-        }
+        self.vertical_move(1);
     }
 
-    /// One visual-row step in `dir` (-1 = up, +1 = down). Returns the
-    /// target byte offset, or `None` if already at the buffer edge.
-    /// On a soft-wrapped line this moves between visual rows of the
-    /// SAME logical line; at the line edge it crosses into the next /
-    /// previous line's first / last visual row.
-    fn visual_step(&self, dir: i32) -> Option<usize> {
+    /// One Up (-1) or Down (+1). A run of them aims at the column the run
+    /// started in, so a short line on the way does not pull the cursor
+    /// left for good; after `$` each line is entered at its end. Any
+    /// other move leaves the cursor somewhere else and starts afresh.
+    /// False at the edge of the buffer.
+    fn vertical_move(&mut self, dir: i32) -> bool {
+        let goal = match self.goal {
+            Some((at, col)) if at == self.cursor_byte() => Some(col),
+            _ => None,
+        };
+        let Some((target, col)) = self.visual_step(dir, goal) else { return false };
+        self.cursor_to_byte(target);
+        self.goal = Some((self.cursor_byte(), col));
+        true
+    }
+
+    /// One visual-row step in `dir` (-1 = up, +1 = down), aiming at
+    /// screen column `goal` (None: the cursor's own). Returns the target
+    /// byte offset and the column aimed at, or `None` if already at the
+    /// buffer edge. On a soft-wrapped line this moves between visual
+    /// rows of the SAME logical line; at the line edge it crosses into
+    /// the next / previous line's first / last visual row. A goal of
+    /// usize::MAX steps whole lines and lands at the end.
+    fn visual_step(&self, dir: i32, goal: Option<usize>) -> Option<(usize, usize)> {
         let pane_w = self.main_p.w as usize;
         let gutter_w = gutter_width(self.buf.line_count(), self.show_numbers && !self.reading_mode);
         let ts = self.tabstop();
         let line = self.buf.line(self.cur_line);
         let cur_byte = self.cur_col.min(line.len());
-        let (cur_row, want_col) = wrap_pos(&line, cur_byte, pane_w, gutter_w, ts);
+        let (cur_row, here) = wrap_pos(&line, cur_byte, pane_w, gutter_w, ts);
+        let want_col = goal.unwrap_or(here);
+        if want_col == usize::MAX {
+            let to = if dir > 0 {
+                self.next_visible_line_down(self.cur_line, 1)
+            } else if self.cur_line == 0 {
+                return None;
+            } else {
+                self.next_visible_line_up(self.cur_line, 1)
+            };
+            if to == self.cur_line { return None; }
+            return Some((self.buf.line_byte_offset(to) + self.buf.line(to).len(), want_col));
+        }
+        let at = |line_no: usize, nb: usize| Some((self.buf.line_byte_offset(line_no) + nb, want_col));
         if dir > 0 {
             let total_rows = wrap_row_count(&line, pane_w, gutter_w, ts);
             if cur_row + 1 < total_rows {
-                let nb = visual_to_byte(&line, cur_row + 1, want_col, pane_w, gutter_w, ts);
-                return Some(self.buf.line_byte_offset(self.cur_line) + nb);
+                return at(self.cur_line, visual_to_byte(&line, cur_row + 1, want_col, pane_w, gutter_w, ts));
             }
             let next_line = self.next_visible_line_down(self.cur_line, 1);
             if next_line == self.cur_line { return None; }
             let nl = self.buf.line(next_line);
-            let nb = visual_to_byte(&nl, 0, want_col, pane_w, gutter_w, ts);
-            Some(self.buf.line_byte_offset(next_line) + nb)
+            at(next_line, visual_to_byte(&nl, 0, want_col, pane_w, gutter_w, ts))
         } else {
             if cur_row > 0 {
-                let nb = visual_to_byte(&line, cur_row - 1, want_col, pane_w, gutter_w, ts);
-                return Some(self.buf.line_byte_offset(self.cur_line) + nb);
+                return at(self.cur_line, visual_to_byte(&line, cur_row - 1, want_col, pane_w, gutter_w, ts));
             }
             if self.cur_line == 0 { return None; }
             let prev_line = self.next_visible_line_up(self.cur_line, 1);
             if prev_line == self.cur_line { return None; }
             let pl = self.buf.line(prev_line);
             let last_row = wrap_row_count(&pl, pane_w, gutter_w, ts).saturating_sub(1);
-            let nb = visual_to_byte(&pl, last_row, want_col, pane_w, gutter_w, ts);
-            Some(self.buf.line_byte_offset(prev_line) + nb)
+            at(prev_line, visual_to_byte(&pl, last_row, want_col, pane_w, gutter_w, ts))
         }
     }
 
@@ -4305,10 +4332,7 @@ impl App {
             self.pending.clear();
             let dir = if key == "DOWN" { 1 } else { -1 };
             for _ in 0..count.max(1) {
-                match self.visual_step(dir) {
-                    Some(target) => self.cursor_to_byte(target),
-                    None => break,
-                }
+                if !self.vertical_move(dir) { break; }
             }
             return false;
         }
@@ -4320,8 +4344,9 @@ impl App {
                 let cap_reg = self.pending.register;
                 // `>` and `<` are always linewise; so is any vertical
                 // motion, as in vim: `dj` and `d<Down>` take both whole
-                // lines, not the text between the two cursor positions.
-                let vertical = matches!(key, "j" | "k" | "DOWN" | "UP" | "-" | "+");
+                // lines, not the text between the two cursor positions,
+                // and `dG` takes the last line too.
+                let vertical = matches!(key, "j" | "k" | "DOWN" | "UP" | "-" | "+" | "G");
                 if matches!(opc, 'Q' | '>' | '<') || vertical {
                     // Linewise operators: snap motion target to whole-line
                     // range and dispatch via execute_op_linewise.
@@ -4357,6 +4382,7 @@ impl App {
                     self.marks.insert('\'', self.cursor_byte());
                 }
                 self.cursor_to_byte(target_byte);
+                if key == "$" { self.goal = Some((self.cursor_byte(), usize::MAX)); }
             }
             self.pending.clear();
             return false;
@@ -7821,7 +7847,11 @@ impl App {
             "C-UP"   => self.move_line_up(),
             "C-DOWN" => self.move_line_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
-            "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
+            "END"   => {
+                self.cur_col = self.col_cap();
+                self.want_col = self.cur_col;
+                self.goal = Some((self.cursor_byte(), usize::MAX));
+            }
             // Ctrl-Home / Ctrl-End — first / last line of file, vim's
             // `gg` / `G` accessible without leaving the current mode.
             "C-HOME" => {
@@ -8107,7 +8137,11 @@ impl App {
             "UP"    => self.move_up(),
             "DOWN"  => self.move_down(),
             "HOME"  => { self.cur_col = 0; self.want_col = 0; }
-            "END"   => { self.cur_col = self.col_cap(); self.want_col = self.cur_col; }
+            "END"   => {
+                self.cur_col = self.col_cap();
+                self.want_col = self.cur_col;
+                self.goal = Some((self.cursor_byte(), usize::MAX));
+            }
             // Ctrl-Home / Ctrl-End — first / last line of file, vim's
             // `gg` / `G` accessible without leaving the current mode.
             "C-HOME" => {
@@ -10444,6 +10478,50 @@ fn shift_left(line: &str, kind: &FileKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// scribe on a scratch file holding `text`, 200 columns wide, with
+    /// `keys` pressed in Normal mode. Returns it and the file to remove.
+    fn press(name: &str, text: &str, at: (usize, usize), keys: &[&str]) -> (super::App, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("scribe-keys-{}-{name}.txt", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let mut app = super::App::new(Some(path.clone()), None, true);
+        app.main_p.w = 200;
+        (app.cur_line, app.cur_col) = at;
+        for k in keys { app.handle_normal(k); }
+        (app, path)
+    }
+
+    const LINES: &str = "the first line is long, far past the forty-third letter\nshort\nthe third line is long too, well past letter forty-three\n";
+
+    #[test]
+    fn up_and_down_keep_the_column_through_a_short_line() {
+        let (app, path) = press("col", LINES, (0, 43), &["DOWN"]);
+        assert_eq!((app.cur_line, app.cur_col), (1, 4), "on the last letter of the short line");
+        let (app, _) = press("col", LINES, (0, 43), &["DOWN", "DOWN"]);
+        assert_eq!((app.cur_line, app.cur_col), (2, 43));
+        let (app, _) = press("col", LINES, (0, 43), &["DOWN", "DOWN", "UP", "UP"]);
+        assert_eq!((app.cur_line, app.cur_col), (0, 43));
+        let (app, _) = press("col", LINES, (0, 43), &["DOWN", "LEFT", "DOWN"]);
+        assert_eq!((app.cur_line, app.cur_col), (2, 3), "another move starts afresh");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn after_dollar_up_and_down_land_at_each_line_end() {
+        let (app, path) = press("end", LINES, (0, 0), &["$", "DOWN"]);
+        assert_eq!((app.cur_line, app.cur_col), (1, 4));
+        let (app, _) = press("end", LINES, (0, 0), &["$", "DOWN", "DOWN"]);
+        let third = LINES.lines().nth(2).unwrap().len();
+        assert_eq!((app.cur_line, app.cur_col), (2, third - 1));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn dg_deletes_the_last_line_too() {
+        let (app, path) = press("dg", "one\ntwo\nthree\n", (1, 1), &["d", "G"]);
+        assert_eq!(app.buf.rope.to_string(), "one\n");
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn two_files_share_the_screen_with_one_column_between_them() {
         use super::halves;

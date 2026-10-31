@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-glow"
-version = "0.1.49"
+version = "0.1.52"
 dependencies = [
  "base64",
  "image",
@@ -563,7 +563,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scribe"
-version = "0.1.97"
+version = "0.1.98"
 dependencies = [
  "aes",
  "base64",
