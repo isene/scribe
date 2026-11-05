@@ -298,3 +298,16 @@ pub enum InitialTab {
     Digraphs,
     Emoji,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_whole_unicode_list_is_there() {
+        let found: Vec<&str> = entries_for(Tab::All).iter().filter(|e| matches(e, "fireworks")).map(|e| e.glyph).collect();
+        assert_eq!(found, ["🎆"]);
+        assert!(EMOJI_CATEGORIES.iter().any(|c| c.name == "Activities"));
+        assert!(entries_for(Tab::All).iter().any(|e| matches(e, "rofl")), "an old short label still finds its emoji");
+    }
+}
