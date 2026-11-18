@@ -3347,7 +3347,7 @@ impl App {
         let last_line = self.buf.line_count().saturating_sub(1);
         let pct = if last_line == 0 { 100 } else { self.cur_line * 100 / last_line };
         let pos = format!(" {}:{}  {:>3}% ", self.cur_line + 1, char_col + 1, pct);
-        let right = format!("scribe v{} ", VERSION);
+        let right = crust::version_tag("scribe", VERSION);
 
         // Persistent stats segment: word count + spell status. Sits to the
         // left of the position indicator so the status message in the
